@@ -152,6 +152,7 @@ export function StudioWorkspace({
     nodeId?: string;
     edgeId?: string;
     nonce: number;
+    stageLink?: boolean;
   } | null>(null);
 
   const scopedVariables = useMemo(
@@ -193,6 +194,8 @@ export function StudioWorkspace({
   });
 
   // Live Play -> Design Board synchronized highlighting
+  const [stageEditingCardIds, setStageEditingCardIds] = useState<string[]>([]);
+  const [returnToStage, setReturnToStage] = useState(false);
   const [activePlayNodeIds, setActivePlayNodeIds] = useState<string[]>([]);
   const [activePlayEdgeId, setActivePlayEdgeId] = useState<string | null>(null);
 
@@ -1208,6 +1211,7 @@ export function StudioWorkspace({
               focusTarget={boardFocusTarget}
               selectedNodeId={selectedNodeId}
               autoFocusNodeId={autoFocusNodeId}
+              stageEditingCardIds={stageEditingCardIds}
               activePlayNodeIds={activePlayNodeIds}
               activePlayEdgeId={activePlayEdgeId}
               onSelectNode={setSelectedNodeId}
@@ -1243,6 +1247,10 @@ export function StudioWorkspace({
           </div>
         </div>
 
+        {returnToStage && <button type="button" className="absolute bottom-4 right-14 z-30 rounded-lg border border-teal-300 bg-white px-3 py-2 text-xs font-semibold text-teal-900 shadow"
+          onClick={() => { setReturnToStage(false); setRightOpen(true); }}>
+          {lang === 'zh' ? '返回舞台编辑' : 'Back to stage editing'}
+        </button>}
         {/* Right Vertical Drag Splitter */}
         {rightOpen && (
           <div
@@ -1272,12 +1280,21 @@ export function StudioWorkspace({
           assetItems={assetItems}
           scopedVariables={scopedVariables}
           selectedNodeId={selectedNodeId}
-          onToggle={() => setRightOpen((v) => !v)}
-          onLocateCard={id => {
-            setSelectedNodeId(id);
-            handleLocateBoardReference({ nodeId: id });
+          onToggle={() => {
+            if (rightOpen) setStageEditingCardIds([]);
+            setReturnToStage(false);
+            setRightOpen(!rightOpen);
           }}
-          onSelectStageCard={setSelectedNodeId}
+          onLocateCard={id => {
+            if (window.matchMedia('(max-width: 767px)').matches) {
+              setReturnToStage(true);
+              setRightOpen(false);
+              requestAnimationFrame(() => setBoardFocusTarget({ nodeId: id, nonce: Date.now(), stageLink: true }));
+            } else {
+              setBoardFocusTarget({ nodeId: id, nonce: Date.now(), stageLink: true });
+            }
+          }}
+          onStageCardsChange={setStageEditingCardIds}
           appearanceReset={appearanceReset}
           onOpenAsset={id => {
             setLeftOpen(true);

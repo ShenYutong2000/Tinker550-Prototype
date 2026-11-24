@@ -43,7 +43,6 @@ interface Props {
   onRemove: (id: string) => void;
   onUndo: () => void;
   canUndo: boolean;
-  onLocateCard: (id: string) => void;
   onOpenAsset: (id: string) => void;
   cardName: (id: string) => string;
   backgroundName?: string;
@@ -210,10 +209,6 @@ export function StagePlacementEditor(props: Props) {
         {label('Open the linked card to see what appears on stage.', '查看关联卡片，确认它在舞台上会显示什么。')}
       </p>}
       {selected ? <>
-        {selected.cardId && <p className="break-words text-xs text-slate-600">
-          {label('From card: ', '来自卡片：')}
-          {props.cardName(selected.cardId)}
-        </p>}
         {selected.group === 'decoration' && <p className="text-xs text-slate-600">
           {label('Visual only', '只布置画面')}
         </p>}
@@ -315,9 +310,6 @@ export function StagePlacementEditor(props: Props) {
         <label>{label('Full value','满格值')}<input className={tool} type="number" min="1" value={overlayStyle.ui.maximum} onChange={e=>{if(Number.isFinite(e.target.valueAsNumber)) props.onUpdate(selected.id,{ui:{...overlayStyle.ui!,maximum:Math.max(1,e.target.valueAsNumber)}});}} /></label></>}
         {overlayStyle.ui.usage==='button' && <label>{label('On click','点击操作')}<select className={tool} value={overlayStyle.ui.action} onChange={e=>props.onUpdate(selected.id,{ui:{...overlayStyle.ui!,action:e.target.value as 'start'}})}>{['start','advance','restart'].map((v,i)=><option key={v} value={v}>{label(['Start','Continue dialogue','Restart'][i],['开始游戏','继续对话','重新试玩'][i])}</option>)}</select></label>}
       </div>}
-      {props.section === 'card' && activeCard && <button type="button" className={tool} onClick={() => props.onLocateCard(activeCard.id)}>
-        {label('Find card', '查看关联卡片')}
-      </button>}
       {props.section === 'decoration' && <label className="grid gap-1 text-xs">{label('+ Add decoration', '＋ 添加装饰')}
         <select className={tool} value="" onChange={e => { if (e.target.value) props.onAddDecoration(e.target.value); }}>
           <option value="">{label('Choose an asset', '选择素材')}</option>

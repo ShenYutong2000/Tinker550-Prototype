@@ -64,9 +64,10 @@ interface DesignBoardProps {
   assetItems: AssetItem[];
   scopedVariables: ScopedStateVariable[];
   stateManagerOpen: boolean;
-  focusTarget: { nodeId?: string; edgeId?: string; nonce: number } | null;
+  focusTarget: { nodeId?: string; edgeId?: string; nonce: number; stageLink?: boolean } | null;
   selectedNodeId: string | null;
   autoFocusNodeId: string | null;
+  stageEditingCardIds: string[];
   activePlayNodeIds: string[];
   activePlayEdgeId: string | null;
   onSelectNode: (id: string | null) => void;
@@ -259,6 +260,7 @@ export function DesignBoard({
   focusTarget,
   selectedNodeId,
   autoFocusNodeId,
+  stageEditingCardIds,
   activePlayNodeIds,
   activePlayEdgeId,
   onSelectNode,
@@ -375,7 +377,7 @@ export function DesignBoard({
         const dim = getNodeDimensions(targetNode);
         worldCx = targetNode.x + dim.width / 2;
         worldCy = targetNode.y + dim.height / 2;
-        onSelectNode(targetNode.id);
+        if (!focusTarget.stageLink) onSelectNode(targetNode.id);
         setHighlightedNodeId(targetNode.id);
       }
     } else if (focusTarget.edgeId) {
@@ -393,7 +395,7 @@ export function DesignBoard({
     }
 
     if (worldCx !== null && worldCy !== null) {
-      const targetZoom = Math.max(0.88, zoom);
+      const targetZoom = focusTarget.stageLink ? zoom : Math.max(0.88, zoom);
       setZoom(targetZoom);
       setPan({
         x: Math.round(rect.width / 2 - worldCx * targetZoom),
@@ -840,6 +842,7 @@ export function DesignBoard({
     const isDraft = !meta.isPlayable;
     const isSelected = selectedNodeId === node.id;
     const isPlaying = activePlaySet.has(node.id);
+    const isStageEditing = stageEditingCardIds.includes(node.id);
     const isEditingDraft = isDraft && editingNodeId === node.id;
     const isExpanded = meta.isPlayable && expandedNodeId === node.id;
     const isDragging = draggingNodeId === node.id;
@@ -898,6 +901,8 @@ export function DesignBoard({
           minHeight: `${dim.height}px`,
           backgroundColor: meta.surfaceBg,
           borderColor: activeBorderColor,
+          outline: isStageEditing ? '2px solid #0F766E' : undefined,
+          outlineOffset: isStageEditing ? 3 : undefined,
         }}
         className={`pointer-events-auto absolute ${meta.shapeClass} ${
           isDraft ? 'border border-dashed' : 'border-2'
@@ -936,6 +941,9 @@ export function DesignBoard({
           </div>
 
           <div className="flex items-center gap-0.5 shrink-0">
+            {isStageEditing && <span className="mr-1 whitespace-nowrap rounded bg-teal-100 px-1 text-[10px] font-bold text-teal-900">
+              {lang === 'zh' ? '正在改画面' : 'Editing stage visual'}
+            </span>}
             {isPlaying && (
               <span className="text-[10px] font-bold text-[#B45309] mr-1 whitespace-nowrap">
                 · {t.playingNow}

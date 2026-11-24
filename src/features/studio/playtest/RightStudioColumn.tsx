@@ -106,7 +106,7 @@ interface RightStudioColumnProps {
   selectedNodeId: string | null;
   onToggle: () => void;
   onLocateCard: (id: string) => void;
-  onSelectStageCard: (id: string) => void;
+  onStageCardsChange: (ids: string[]) => void;
   onOpenAsset: (id: string) => void;
   appearanceReset: { target: string } | null;
   onActivePlayChange: (nodeIds: string[], edgeId: string | null) => void;
@@ -659,14 +659,14 @@ export function RightStudioColumn({
   edges,
   assetItems,
   scopedVariables,
-  selectedNodeId,
+  selectedNodeId: boardSelectionId,
   onToggle,
   onActivePlayChange,
   onUserTestedInPlay,
   onUpdatePlayValue,
   onResetPlayValues,
   onLocateCard,
-  onSelectStageCard,
+  onStageCardsChange,
   onOpenAsset,
   appearanceReset,
 }: RightStudioColumnProps) {
@@ -720,6 +720,11 @@ export function RightStudioColumn({
   const [layoutSelection, setLayoutSelection] = useState('');
   const [editorSection, setEditorSection] = useState<StageEditorSection>('card');
   const [editorCard, setEditorCard] = useState<string | null>(null);
+  const selectedNodeId = editorCard ?? boardSelectionId;
+  useEffect(() => {
+    setEditorCard(null);
+    setLayoutSelection('');
+  }, [boardSelectionId]);
   const [runChallengeId, setRunChallengeId] = useState<string | null>(null);
   const [draft, setDraft] = useState<{ id: string; pose: Partial<StagePose> } | null>(null);
   const [trialHistory, setTrialHistory] = useState<TrialSnapshot & { undo: TrialSnapshot[] }>({
@@ -2824,34 +2829,6 @@ export function RightStudioColumn({
     return () => window.cancelAnimationFrame(rafId);
   }, [resolveActionOutcome, spawnParticles]);
 
-  if (!isOpen) {
-    return (
-      <aside className="relative h-full w-11 shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col items-center py-3 gap-3 z-20">
-        {isDimmed && (
-          <div
-            aria-hidden="true"
-            className="absolute inset-0 bg-[#0F172A]/24 pointer-events-none"
-          />
-        )}
-        <button
-          type="button"
-          onClick={onToggle}
-          title={t.expand}
-          aria-label={t.expand}
-          className="relative w-8 h-8 rounded-lg text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
-        >
-          <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
-        </button>
-        <div
-          className="relative text-[11px] font-bold tracking-wider uppercase text-[#64748B] select-none"
-          style={{ writingMode: 'vertical-rl' }}
-        >
-          {t.title}
-        </div>
-      </aside>
-    );
-  }
-
   const activeDialogueNode =
     playMode === 'playing'
       ? phase === 'overlay' && primaryNode?.kind === 'dialogue'
@@ -2963,13 +2940,15 @@ export function RightStudioColumn({
       playableNodes.find(card => card.kind === 'action' &&
         Boolean(getAssetVisualBinding(card.promptInput?.actorAssetId) ||
           getNodeVisualBindingByCategories(card, ['characters'], true)));
+  let actorChallengeId: string | undefined;
   if (actorCard) {
     const parents = challengesForAction(actorCard.id);
     const isCurrentAction = !playing || actorCard.id === primaryNode?.id ||
       Boolean(runChallengeId && parents.includes(runChallengeId));
-    const challenge = playing && runChallengeId && parents.includes(runChallengeId)
-      ? runChallengeId : !playing ? previewSnapshot.challenge?.id : parents.length === 1 ? parents[0] : undefined;
-    const inherited = challengeRole(challenge).actorId;
+    actorChallengeId = playing && runChallengeId && parents.includes(runChallengeId)
+      ? runChallengeId : !playing && previewSnapshot.challenge && parents.includes(previewSnapshot.challenge.id)
+        ? previewSnapshot.challenge.id : parents.length === 1 ? parents[0] : undefined;
+    const inherited = challengeRole(actorChallengeId).actorId;
     const boundActor = getAssetVisualBinding(inherited ?? actorCard.promptInput?.actorAssetId) ??
       getNodeVisualBindingByCategories(actorCard, ['characters'], true);
     const appearance = boundActor && isCurrentAction ? characterBinding ?? boundActor : boundActor;
@@ -2997,16 +2976,22 @@ export function RightStudioColumn({
     setEditorSection('card');
     setLayoutSelection('');
     setDraft(null);
-    if (playing) setEditorCard(id);
-    else onSelectStageCard(id);
+    setEditorCard(id);
   };
   const selectStageElement = (id: string) => {
     const item = stageItems.find(element => element.id === id);
     if (id === 'hero' && !item) return;
-    if (item?.cardId) selectEditorCard(item.cardId);
-    else setEditorSection(item?.group === 'decoration' ? 'decoration' : 'background');
+    if (item?.group === 'interface' || item?.group === 'effect') {
+      setEditorSection(item.group);
+      setEditTab(item.group === 'interface' ? 'interface' : 'effects');
+    } else if (item?.cardId && !(editorSection === 'interface' && item.group === 'base')) {
+      selectEditorCard(item.cardId);
+      setEditTab('arrange');
+    } else if (item?.group !== 'base' || editorSection !== 'interface') {
+      setEditorSection(item?.group === 'decoration' ? 'decoration' : 'background');
+      setEditTab('arrange');
+    }
     setLayoutSelection(id);
-    setEditTab('arrange');
   };
   const getOverlayStyle = (id: string | null | undefined) => {
     if (!id) return {};
@@ -3073,10 +3058,70 @@ export function RightStudioColumn({
     }
   };
 
+  const selectedItem = editorItems.find(item => item.id === selectedLayoutItem);
+  const placement = selectedItem && layout.placements[selectedItem.id];
+  const relatesToCard = Boolean(selectedItem?.cardId || placement?.ui?.cardId || placement?.effect?.cardId);
+  const actorRole = challengeRole(actorChallengeId);
+  const sharedActionIds = selectedItem?.group === 'actor'
+    ? actorRole.actions.filter(action => {
+      const assetId = action.promptInput?.actorAssetId ??
+        getNodeAssetIds(action).find(id => assetMap.get(id)?.categoryId === 'characters') ?? actorRole.actorId;
+      return assetId === selectedItem.assetId;
+    }).map(action => action.id)
+    : [];
+  const scopedCardId = placement?.ui?.cardId ?? placement?.effect?.cardId;
+  const backgroundOwner = editorSection === 'background' && !layout.background.assetId && !layout.background.color
+    ? cardBackgroundSource?.id : undefined;
+  const referencedCardIds = [...new Set([
+    ...sharedActionIds,
+    ...[selectedItem?.cardId, scopedCardId, backgroundOwner].filter((id): id is string => Boolean(id)),
+  ])];
+  const visibleRelationIds = referencedCardIds.filter(id => playableMap.has(id));
+  const editingPlacement = editing && editTab !== 'moments';
+  const relationKey = editingPlacement ? JSON.stringify(visibleRelationIds) : '[]';
+  useEffect(() => {
+    if (isOpen) onStageCardsChange(JSON.parse(relationKey));
+  }, [isOpen, onStageCardsChange, relationKey]);
+  const relationLabel = sharedActionIds.length > 1 ? (zh ? '共用角色' : 'Shared character')
+    : placement?.effect && scopedCardId ? (zh ? '受此卡片触发限制' : 'Trigger limited to this card')
+    : placement?.ui && scopedCardId ? (zh ? '在此卡片出现' : 'Shown on this card')
+    : selectedItem?.group === 'gameplay' ? (zh ? '来自挑战卡' : 'From challenge card')
+    : relatesToCard || backgroundOwner ? (zh ? '来自卡片' : 'From card')
+    : selectedItem?.group === 'decoration' ? (zh ? '舞台装饰' : 'Stage decoration')
+    : (zh ? '整局使用' : 'Used throughout the game');
+
+  if (!isOpen) {
+    return (
+      <aside className="relative h-full w-11 shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col items-center py-3 gap-3 z-20">
+        {isDimmed && (
+          <div
+            aria-hidden="true"
+            className="absolute inset-0 bg-[#0F172A]/24 pointer-events-none"
+          />
+        )}
+        <button
+          type="button"
+          onClick={onToggle}
+          title={t.expand}
+          aria-label={t.expand}
+          className="relative w-8 h-8 rounded-lg text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
+        >
+          <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
+        </button>
+        <div
+          className="relative text-[11px] font-bold tracking-wider uppercase text-[#64748B] select-none"
+          style={{ writingMode: 'vertical-rl' }}
+        >
+          {t.title}
+        </div>
+      </aside>
+    );
+  }
+
   return (
     <aside
       style={{ width: `${width}px` }}
-      className={`relative h-full shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col min-h-0 overflow-hidden transition-shadow duration-300 ${
+      className={`relative h-full shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col min-h-0 overflow-hidden transition-shadow duration-300 max-[767px]:absolute max-[767px]:inset-0 max-[767px]:!w-full ${
         isSpotlighted ? 'z-30 ring-2 ring-inset ring-[#FBC53D]/85' : 'z-10'
       }`}
     >
@@ -3710,7 +3755,7 @@ export function RightStudioColumn({
           {savedNotice && <span role="status" className="text-emerald-700">{zh ? '已保存到下次试玩' : 'Saved for next play'}</span>}
         </div>}
         {editing && <div className="flex flex-wrap gap-2" aria-label={zh ? '舞台编辑' : 'Stage editor'}>
-          <button type="button" aria-pressed={editTab === 'arrange'} onClick={() => setEditTab('arrange')}
+          <button type="button" aria-pressed={editTab === 'arrange'} onClick={() => { setEditTab('arrange'); setEditorSection('card'); setLayoutSelection(''); }}
             className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs aria-pressed:bg-sky-100">
             {zh ? '布置' : 'Arrange'}
           </button>
@@ -3739,6 +3784,16 @@ export function RightStudioColumn({
           onDelete={id => setMoments(prev => prev.filter(moment => moment.id !== id))}
           onRestart={handleStartPlay} canPlay={canPlay && !loadingBackgrounds}
         />}
+        {editingPlacement && (selectedItem || editorSection === 'background') && <section
+          aria-label={zh ? '画板关联' : 'Design Board links'} className="grid gap-2 rounded-xl border border-teal-200 bg-teal-50 p-3 text-xs">
+          <p className="break-words"><strong>{selectedItem?.label ?? (zh ? '背景' : 'Background')}</strong> · {relationLabel}</p>
+          {referencedCardIds.map(id => playableMap.has(id)
+            ? <button key={id} type="button" onClick={() => onLocateCard(id)}
+                className="justify-self-start rounded border border-teal-300 bg-white px-2 py-1 text-left text-teal-900">
+                {zh ? '查看卡片' : 'View card'} · {cardName(id)}
+              </button>
+            : <span key={id} className="text-amber-800">{zh ? '关联卡片已移除' : 'Linked card was removed'}</span>)}
+        </section>}
         {editing && (editTab === 'arrange' || editTab === 'interface' || editTab === 'effects') && <StagePlacementEditor lang={lang} items={stageItems} editorItems={editorItems}
           selection={selectedLayoutItem} onSelect={selectStageElement} layout={layout}
           section={editorSection} onSection={section => { setEditorSection(section); setLayoutSelection(''); }}
@@ -3754,7 +3809,7 @@ export function RightStudioColumn({
           assets={assetItems.filter(asset => Boolean(getAssetVisualBinding(asset.id)))}
           canUndo={(playing ? trialHistory.undo : layoutHistory.undo).length > 0}
           onUndo={undoLayout}
-          onLocateCard={onLocateCard} onOpenAsset={onOpenAsset}
+          onOpenAsset={onOpenAsset}
           cardName={cardName} backgroundName={assetMap.get(backgroundBinding?.assetId ?? '')?.name}
           onUpdate={updatePlacement} onPreview={(id, pose) => setDraft(pose ? { id, pose } : null)}
           onBackground={background => {
