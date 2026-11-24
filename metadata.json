@@ -1,0 +1,6 @@
+{
+  "name": "Tinker 550",
+  "description": "An interactive game design learning studio for ages 13+ built around the Build-Test-Revise tinkering loop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

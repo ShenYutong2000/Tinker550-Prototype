@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Fredoka", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans: "Plus Jakarta Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-ink: #14244B;
+  --color-ink-muted: #475569;
+  --color-canvas: #F8FAFC;
+  --color-surface: #FFFFFF;
+  --color-hairline: #E2E8F0;
+
+  --color-block-coral: #F05440;
+  --color-block-sky: #4E9AE3;
+  --color-block-gold: #FBC53D;
+  --color-block-mint: #48B5A3;
+  --color-block-pink: #F58596;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background-color: var(--color-canvas);
+  }
+
+  h1,
+  h2,
+  .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.studio-dot-grid {
+  background-color: #F8FAFC;
+  background-image: radial-gradient(#CBD5E1 1.25px, transparent 1.25px);
+  background-size: 26px 26px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

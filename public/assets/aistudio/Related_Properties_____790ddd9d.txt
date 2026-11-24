@@ -1,0 +1,38 @@
+1. Number（数字）— 4 种
+- Set Value（赋值）：直接设定一个新数值。
+  - 例：Health = 5
+- Formula（公式）：通过加、减、乘、除及已有数值计算新值。
+  - 例：Health = Health - 1
+  - 例：Damage = Attack - Defense
+  - 允许引用当前可访问的 Number States 和数值型 Parameters，而不要求它们属于同一对象。
+- Random Value（随机数值）：在指定范围内随机生成数值。
+  - 例：Reward = Random(1, 5)
+- Reset（重置）：恢复到该 State 的初始值。
+  - 例：Health = InitialHealth
+2. Boolean（Yes / No）— 4 种
+- Set Value（赋值）：设置为 True 或 False。
+  - 例：IsOpen = True
+- Toggle（反转）：将当前值反转。
+  - 例：IsOpen = NOT IsOpen
+- Formula（逻辑表达式）：通过 AND、OR、NOT 等运算，并引用已有的 Boolean States 或返回布尔值的条件。
+  - 例：CanOpen = HasKey AND IsNearDoor
+  - 例：CanAttack = Ammo > 0 AND IsAlive
+- Reset（重置）：恢复初始 True / False。
+3. Choice（有限选项）— 4 种
+- Set Choice（指定选项）：从预先定义的选项中指定一个。
+  - 例：MonsterMode = Chasing
+- Random Choice（随机选项）：从已有选项中随机选择一个。
+  - 例：Weather = Random(Sunny, Rainy, Snowy)
+- Reset（重置）：恢复到初始选项。
+- Previous / Next（上一个 / 下一个）：沿着预先定义的选项顺序切换。
+  - 例：TimeOfDay: Morning → Afternoon → Night
+  - 需要明确切到最后一个选项后，是停留还是回到第一个选项。
+这里的 Choice 不必作为真正的 Array 暴露给孩子。它只是一个预先定义的选项列表；只有存在明确顺序时，才启用 Previous / Next。
+4. Text（文字）— 4 种
+- Set Text（替换文本）：设置一段新的文字。
+  - 例：Message = "Welcome!"
+- Clear（清空）：将内容设为空文本。
+  - 例：Message = ""
+- Reset（重置）：恢复初始文字。
+- Append Text（追加文本）：在当前文字后添加新内容。
+  - 例：Message = Message + "!"

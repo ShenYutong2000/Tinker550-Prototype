@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for per-state Visual Effects post-processing in the Asset Library Editor (Figma-style additive stack across 5 categories with progressive Advanced disclosures, live preview + dynamic replay button, and full sync to the right-hand 2D Play stage).",
+  "updatedAt":  "2026-11-23T02:50:28.898961002Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
