@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useRef,
   useState,
   type DragEvent as ReactDragEvent,
 } from 'react';
@@ -49,6 +50,7 @@ interface AssetsPanelProps {
   items: AssetItem[];
   unlockedCategories: Record<AssetCategoryId, boolean>;
   selectedAssetId: string | null;
+  pickingForStage?: boolean;
   aiNotice: AiPlacedNotice | null;
   onToggle: () => void;
   onSelectAsset: (assetId: string) => void;
@@ -80,6 +82,7 @@ export function AssetsPanel({
   items,
   unlockedCategories,
   selectedAssetId,
+  pickingForStage,
   aiNotice,
   onToggle,
   onSelectAsset,
@@ -91,6 +94,10 @@ export function AssetsPanel({
   onDismissAiNotice,
 }: AssetsPanelProps) {
   const t = COPY[lang].studio.assets;
+  const stagePickHint = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (pickingForStage && isOpen) stagePickHint.current?.focus();
+  }, [isOpen, pickingForStage]);
 
   const [expandedCategories, setExpandedCategories] = useState<
     Record<AssetCategoryId, boolean>
@@ -446,6 +453,9 @@ export function AssetsPanel({
         </button>
       </div>
 
+      {pickingForStage && <p ref={stagePickHint} tabIndex={-1} className="mx-3 my-2 rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-900">
+        {lang === 'zh' ? '选择一个素材放到舞台' : 'Choose an asset to place on stage'}
+      </p>}
       {/* Idea-Triggered AI Auto-Placement Reveal Notice (Shown only when an idea creates an asset) */}
       {aiNotice && (
         <div className="mx-2.5 mt-2.5 px-3 py-2 rounded-xl bg-[#EFF6FF] border border-[#BFDBFE] text-[11px] text-[#1E3A8A] flex items-start justify-between gap-2 shrink-0">

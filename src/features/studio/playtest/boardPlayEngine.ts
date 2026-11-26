@@ -1,4 +1,13 @@
 import {
+  getEventSpec,
+  getSimulatedEventKey,
+  normalizeEventId,
+  type EdgeConditionClause,
+  type EdgeConditionGroup,
+  type EventConditionClause,
+  type PropertyConditionClause,
+} from '../design-board/arrowConditionModel';
+import {
   NODE_CATALOG,
   extractSpeakerFromText,
   formatActionControlKey,
@@ -17,7 +26,11 @@ import {
   type SceneTheme,
   type SubtitlePosition,
 } from '../design-board/studioModel';
-import type { NumericFormulaSymbol, ScopedStateVariable } from '../properties/stateModel';
+import {
+  evaluateNumberFormula,
+  type NumericFormulaSymbol,
+  type ScopedStateVariable,
+} from '../properties/stateModel';
 
 export interface PlayStats {
   hp: number;
@@ -29,10 +42,55 @@ export const INITIAL_PLAY_STATS: PlayStats = {
   score: 0,
 };
 
+export interface PlaySpatialSnapshot {
+  heroX: number;
+  heroY: number;
+  groundY: number;
+  heroVx: number;
+  heroVy: number;
+  onGround: boolean;
+  shieldTimer: number;
+  dodgeTimer: number;
+  hasHazard: boolean;
+  hazardX: number;
+  hazardY: number;
+  hazardVx: number;
+  hazardVy: number;
+  hazardKind?: ChallengePattern;
+  hazardResolved?: boolean;
+}
+
+export interface RuntimeEventRecord {
+  eventId: string;
+  subjectInstanceId?: string;
+  targetInstanceId?: string;
+  subjectAssetId?: string;
+  subjectRole?: 'hero' | 'hazard' | 'projectile' | 'timer';
+  targetAssetId?: string;
+  targetRole?: 'hero' | 'hazard' | 'projectile' | 'timer';
+}
+
+export interface PlayRuntimeContext {
+  /** Automatic gameplay/physics events triggered during the active step */
+  runtimeEvents?: Set<string>;
+  /** Entity-scoped runtime event records triggered during the active step */
+  eventRecords?: RuntimeEventRecord[];
+  /** Bound Asset ID of the current player/hero sprite on stage */
+  heroAssetId?: string;
+  /** Bound Asset ID of the current challenge hazard/collectible on stage */
+  hazardAssetId?: string;
+  /** Simulated custom event toggles flipped by the player in Play sidebar */
+  simulatedEvents?: Record<string, boolean>;
+  /** Current 2D spatial/physics snapshot for continuous spatial events */
+  spatial?: PlaySpatialSnapshot;
+  /** Numeric card parameters available for formula evaluation */
+  numericParameters?: NumericFormulaSymbol[];
+}
+
 export interface ConditionEvaluation {
   hasCondition: boolean;
   raw: string;
-  kind: 'none' | 'numeric' | 'variable' | 'flag';
+  kind: 'none' | 'numeric' | 'variable' | 'flag' | 'structured';
   passed: boolean;
   metric?: 'hp' | 'score';
   matchedVariableId?: string;
@@ -126,13 +184,260 @@ function matchScopedVariable(
   return null;
 }
 
+function evaluatePropertyClause(
+  clause: PropertyConditionClause,
+  scopedVariables: ScopedStateVariable[],
+  numericParameters: NumericFormulaSymbol[],
+): boolean {
+  const entry = scopedVariables.find((v) => v.variable.id === clause.propertyId);
+  if (!entry) return false;
+  const { variable, playValue } = entry;
+
+  if (variable.type === 'number') {
+    const actual = Number(playValue);
+    let threshold: number | null = null;
+    if (clause.valueMode === 'property' && clause.comparePropertyId) {
+      const rhsEntry = scopedVariables.find((v) => v.variable.id === clause.comparePropertyId);
+      if (rhsEntry && rhsEntry.variable.type === 'number') {
+        threshold = Number(rhsEntry.playValue);
+      }
+    } else if (clause.valueMode === 'formula') {
+      const res = evaluateNumberFormula(
+        clause.formulaExpression ?? '',
+        scopedVariables,
+        numericParameters,
+      );
+      if (res.ok) threshold = res.value;
+    } else {
+      const rawNum = Number(clause.literalValue);
+      if ((clause.literalValue ?? '').trim() !== '' && Number.isFinite(rawNum)) {
+        threshold = rawNum;
+      }
+    }
+    if (threshold === null || !Number.isFinite(actual)) return false;
+    switch (clause.comparator) {
+      case '=':
+        return actual === threshold;
+      case '!=':
+        return actual !== threshold;
+      case '>':
+        return actual > threshold;
+      case '<':
+        return actual < threshold;
+      case '>=':
+        return actual >= threshold;
+      case '<=':
+        return actual <= threshold;
+      default:
+        return false;
+    }
+  }
+
+  if (variable.type === 'boolean') {
+    const actual = Boolean(playValue);
+    if (clause.comparator === 'is_yes') return actual === true;
+    if (clause.comparator === 'is_no') return actual === false;
+    return false;
+  }
+
+  if (variable.type === 'choice') {
+    const actual = String(playValue ?? '').trim().toLowerCase();
+    let expected = String(clause.literalValue ?? '').trim().toLowerCase();
+    if (clause.valueMode === 'property' && clause.comparePropertyId) {
+      const rhsEntry = scopedVariables.find((v) => v.variable.id === clause.comparePropertyId);
+      expected = String(rhsEntry?.playValue ?? '').trim().toLowerCase();
+    }
+    if (clause.comparator === '!=') return actual !== expected;
+    return actual === expected;
+  }
+
+  // Text variable
+  const actualRaw = String(playValue ?? '');
+  const actual = actualRaw.trim().toLowerCase();
+  if (clause.comparator === 'is_empty') {
+    return actual.length === 0;
+  }
+  let expected = String(clause.literalValue ?? '').trim().toLowerCase();
+  if (clause.valueMode === 'property' && clause.comparePropertyId) {
+    const rhsEntry = scopedVariables.find((v) => v.variable.id === clause.comparePropertyId);
+    expected = String(rhsEntry?.playValue ?? '').trim().toLowerCase();
+  }
+  switch (clause.comparator) {
+    case 'equals':
+    case '=':
+      return actual === expected;
+    case 'not_equals':
+    case '!=':
+      return actual !== expected;
+    case 'contains':
+      return expected.length > 0 && actual.includes(expected);
+    default:
+      return false;
+  }
+}
+
+function matchesConditionEntity(
+  expectedId: string | undefined,
+  expectedKind: string | undefined,
+  actualAssetId: string | undefined,
+  actualRole: RuntimeEventRecord['subjectRole'] | undefined,
+): boolean {
+  if (!expectedId) return true;
+  if (expectedKind === 'scene' && expectedId === 'timer') {
+    return actualRole === 'timer';
+  }
+  if (actualAssetId) {
+    return actualAssetId === expectedId;
+  }
+  return false;
+}
+
+function evaluateEventClause(
+  clause: EventConditionClause,
+  runtimeCtx?: PlayRuntimeContext,
+): boolean {
+  const simMap = runtimeCtx?.simulatedEvents ?? {};
+  const normalizedId = clause.eventId === 'custom' ? 'custom' : normalizeEventId(clause.eventId);
+  const spec = normalizedId === 'custom' ? undefined : getEventSpec(normalizedId);
+  const simKey = getSimulatedEventKey(clause);
+
+  // Explicit manual toggle override in Play sidebar
+  if (simMap[simKey]) return true;
+
+  if (normalizedId === 'custom') {
+    return Boolean(simMap[simKey]);
+  }
+
+  const records = runtimeCtx?.eventRecords ?? [];
+  const events = runtimeCtx?.runtimeEvents;
+  const spatial = runtimeCtx?.spatial;
+  const heroAssetId = runtimeCtx?.heroAssetId;
+  const hazardAssetId = runtimeCtx?.hazardAssetId;
+
+  const subjectSpecified = Boolean(
+    clause.subjectAssetId &&
+      (clause.subjectKind === 'asset' || clause.subjectKind === 'scene'),
+  );
+  const targetSpecified = Boolean(
+    spec &&
+      spec.targetMode !== 'none' &&
+      clause.targetId &&
+      clause.targetKind === 'asset',
+  );
+
+  // Check recorded entity-scoped events first
+  for (const rec of records) {
+    if (normalizeEventId(rec.eventId) !== normalizedId) continue;
+    const subjOk =
+      !subjectSpecified ||
+      matchesConditionEntity(
+        clause.subjectAssetId,
+        clause.subjectKind,
+        rec.subjectAssetId,
+        rec.subjectRole,
+      );
+    if (!subjOk) continue;
+
+    const tgtOk =
+      !targetSpecified ||
+      matchesConditionEntity(
+        clause.targetId,
+        clause.targetKind,
+        rec.targetAssetId,
+        rec.targetRole,
+      );
+    if (tgtOk) return true;
+  }
+
+  // Fallback for legacy/unscoped tests if no scoped records matched and neither entity is specified
+  if (!subjectSpecified && !targetSpecified && events?.has(normalizedId)) {
+    return true;
+  }
+
+  if (!spatial) return false;
+
+  const heroCenterY = spatial.heroY - 22;
+  const hasActiveHazard = spatial.hasHazard && !spatial.hazardResolved;
+
+  const heroMatchesSubject =
+    !subjectSpecified ||
+    (heroAssetId !== undefined && clause.subjectAssetId === heroAssetId);
+  const hazardMatchesSubject =
+    !subjectSpecified ||
+    (hazardAssetId !== undefined && clause.subjectAssetId === hazardAssetId);
+  const heroMatchesTarget =
+    !targetSpecified ||
+    (heroAssetId !== undefined && clause.targetId === heroAssetId);
+  const hazardMatchesTarget =
+    !targetSpecified ||
+    (hazardAssetId !== undefined && clause.targetId === hazardAssetId);
+
+  switch (normalizedId) {
+    case 'jumps':
+      return heroMatchesSubject && !spatial.onGround && spatial.heroVy < 0;
+    case 'lands':
+      return (
+        heroMatchesSubject &&
+        spatial.onGround &&
+        Boolean(events?.has('was_airborne'))
+      );
+    case 'blocks':
+      return heroMatchesSubject && spatial.shieldTimer > 0 && hasActiveHazard && hazardMatchesTarget && Math.hypot(spatial.hazardX - spatial.heroX, spatial.hazardY - heroCenterY) < 48;
+    case 'touches': {
+      if (!hasActiveHazard) return false;
+      const touching =
+        Math.hypot(spatial.hazardX - spatial.heroX, spatial.hazardY - heroCenterY) < 38;
+      if (!touching) return false;
+      return (
+        (heroMatchesSubject && hazardMatchesTarget) ||
+        (hazardMatchesSubject && heroMatchesTarget)
+      );
+    }
+    default:
+      return false;
+  }
+}
+
+export function evaluateEdgeConditionGroup(
+  group: EdgeConditionGroup,
+  scopedVariables: ScopedStateVariable[],
+  runtimeCtx?: PlayRuntimeContext,
+  fallbackRaw = '',
+): ConditionEvaluation {
+  if (!group || group.clauses.length === 0) {
+    return { hasCondition: false, raw: '', kind: 'none', passed: true };
+  }
+
+  const numericParams = runtimeCtx?.numericParameters ?? [];
+  const results = group.clauses.map((clause: EdgeConditionClause) =>
+    clause.kind === 'event'
+      ? evaluateEventClause(clause, runtimeCtx)
+      : evaluatePropertyClause(clause, scopedVariables, numericParams),
+  );
+
+  const passed =
+    group.combinator === 'OR' ? results.some(Boolean) : results.every(Boolean);
+
+  return {
+    hasCondition: true,
+    raw: fallbackRaw,
+    kind: 'structured',
+    passed,
+  };
+}
+
 export function evaluateEdgeCondition(
   condition: string | undefined,
   stats: PlayStats,
   customFlags: Record<string, boolean>,
   scopedVariables: ScopedStateVariable[] = [],
+  conditionGroup?: EdgeConditionGroup,
+  runtimeCtx?: PlayRuntimeContext,
 ): ConditionEvaluation {
   const raw = (condition ?? '').trim();
+  if (conditionGroup && conditionGroup.clauses.length > 0) {
+    return evaluateEdgeConditionGroup(conditionGroup, scopedVariables, runtimeCtx, raw);
+  }
   if (!raw) {
     return { hasCondition: false, raw: '', kind: 'none', passed: true };
   }
@@ -318,8 +623,18 @@ export function extractCustomFlagConditions(
   const dummyStats: PlayStats = { hp: 3, score: 0 };
 
   for (const edge of edges) {
-    if (!playableIds.has(edge.fromId) || !playableIds.has(edge.toId)) continue;
+    if (!playableIds.has(edge.toId)) continue;
+    if (edge.fromId !== null && !playableIds.has(edge.fromId)) continue;
+    if (edge.conditionGroup && edge.conditionGroup.clauses.length > 0) continue;
     const raw = (edge.condition ?? '').trim();
+    if (!raw || seen.has(raw)) continue;
+    const check = evaluateEdgeCondition(raw, dummyStats, {}, scopedVariables);
+    if (check.kind === 'flag') seen.add(raw);
+  }
+  for (const node of nodes) {
+    if (node.kind !== 'group' || !playableIds.has(node.id)) continue;
+    if (node.availableWhenGroup && node.availableWhenGroup.clauses.length > 0) continue;
+    const raw = (node.availableWhen ?? '').trim();
     if (!raw || seen.has(raw)) continue;
     const check = evaluateEdgeCondition(raw, dummyStats, {}, scopedVariables);
     if (check.kind === 'flag') seen.add(raw);
@@ -332,6 +647,14 @@ export function extractCustomFlagConditions(
  */
 export function hasCardContent(node: BoardNode): boolean {
   if (!NODE_CATALOG[node.kind].isPlayable) return false;
+  if (node.kind === 'group') {
+    return Boolean(
+      node.title.trim() ||
+        node.note.trim() ||
+        node.availableWhen?.trim() ||
+        node.availableWhenGroup?.clauses.length,
+    );
+  }
   if (node.note.trim().length > 0) return true;
   if (node.title.trim().length > 0) return true;
   if (node.manualFields.length > 0) return true;
@@ -355,7 +678,112 @@ export function hasCardContent(node: BoardNode): boolean {
 }
 
 export function getPlayableNodes(nodes: BoardNode[]): BoardNode[] {
-  return nodes.filter((n) => hasCardContent(n));
+  const directPlayable = new Set(nodes.filter((n) => hasCardContent(n)).map((n) => n.id));
+  // Also mark any Group as playable if it contains at least one playable descendant
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const n of nodes) {
+      if (n.parentId && directPlayable.has(n.id) && !directPlayable.has(n.parentId)) {
+        const parent = nodes.find((p) => p.id === n.parentId);
+        if (parent && parent.kind === 'group') {
+          directPlayable.add(parent.id);
+          changed = true;
+        }
+      }
+    }
+  }
+  return nodes.filter((n) => directPlayable.has(n.id));
+}
+
+export function evaluateGroupAvailability(
+  groupNode: BoardNode,
+  nodes: BoardNode[],
+  stats: PlayStats,
+  customFlags: Record<string, boolean>,
+  scopedVariables: ScopedStateVariable[] = [],
+  runtimeCtx?: PlayRuntimeContext,
+): ConditionEvaluation {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const chain: BoardNode[] = [];
+  let curr: BoardNode | undefined = groupNode;
+  const seen = new Set<string>();
+  while (curr && curr.kind === 'group' && !seen.has(curr.id)) {
+    seen.add(curr.id);
+    chain.unshift(curr);
+    curr = curr.parentId ? nodeMap.get(curr.parentId) : undefined;
+  }
+
+  let firstCondEval: ConditionEvaluation | null = null;
+  for (const grp of chain) {
+    const ev = evaluateEdgeCondition(
+      grp.availableWhen,
+      stats,
+      customFlags,
+      scopedVariables,
+      grp.availableWhenGroup,
+      runtimeCtx,
+    );
+    if (ev.hasCondition) {
+      if (!firstCondEval) firstCondEval = ev;
+      if (!ev.passed) {
+        return ev;
+      }
+    }
+  }
+
+  return (
+    firstCondEval ?? {
+      hasCondition: false,
+      raw: '',
+      kind: 'none',
+      passed: true,
+    }
+  );
+}
+
+export function getGroupLocalRoots(
+  groupId: string,
+  nodes: BoardNode[],
+  edges: BoardEdge[],
+): BoardNode[] {
+  const playable = getPlayableNodes(nodes);
+  const directChildren = playable.filter((n) => n.parentId === groupId);
+  if (directChildren.length === 0) return [];
+
+  const childIds = new Set(directChildren.map((n) => n.id));
+  const incomingCounts = new Map<string, number>();
+  const guardedByEntryTrigger = new Set<string>();
+  directChildren.forEach((n) => incomingCounts.set(n.id, 0));
+
+  for (const edge of edges) {
+    if (edge.fromId === null && childIds.has(edge.toId)) {
+      guardedByEntryTrigger.add(edge.toId);
+      continue;
+    }
+    if (edge.fromId && childIds.has(edge.fromId) && childIds.has(edge.toId) && edge.fromId !== edge.toId) {
+      const from = directChildren.find((n) => n.id === edge.fromId);
+      const to = directChildren.find((n) => n.id === edge.toId);
+      // Ignore backward loop edges when identifying entry roots
+      if (from && to && to.x + 120 < from.x) continue;
+      incomingCounts.set(edge.toId, (incomingCounts.get(edge.toId) ?? 0) + 1);
+    }
+  }
+
+  const roots = directChildren.filter(
+    (n) => (incomingCounts.get(n.id) ?? 0) === 0 && !guardedByEntryTrigger.has(n.id),
+  );
+  const candidates =
+    roots.length > 0
+      ? roots
+      : guardedByEntryTrigger.size > 0
+        ? []
+        : [directChildren[0]];
+
+  return [...candidates].sort((a, b) => {
+    if (Math.abs(a.y - b.y) > 40) return a.y - b.y;
+    return a.x - b.x;
+  });
 }
 
 /**
@@ -417,10 +845,11 @@ export function detectUsedStats(
 
   for (const edge of edges) {
     const cond = (edge.condition ?? '').trim();
-    if (!cond) continue;
-    if (/血量|血|生命|体力|\bhp\b|health|life/i.test(cond)) usesHp = true;
-    if (/分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(cond))
-      usesScore = true;
+    if (cond) {
+      if (/血量|血|生命|体力|\bhp\b|health|life/i.test(cond)) usesHp = true;
+      if (/分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(cond))
+        usesScore = true;
+    }
   }
 
   return { usesHp, usesScore };
@@ -468,6 +897,15 @@ export function resolveDialogueContent(node: BoardNode): {
 
 export type ChallengeDirection = 'left' | 'right' | 'down' | 'up' | 'patrol' | 'static';
 
+function matchChallengeDirection(text: string): ChallengeDirection | undefined {
+  if (/来回|左右|往返|巡逻|摆动|摇摆|back\s*and\s*forth|patrol|oscillat|swing/.test(text)) return 'patrol';
+  if (text === '右' || text === 'r' || /从左[往向到至]右|向右|往右|朝右|右移|右边|右侧|右方|\bright(?:ward|wards)?\b/.test(text)) return 'right';
+  if (text === '上' || text === 'u' || /从下[往向到至]上|向上|往上|朝上|上移|上方|上边|升起|上升|飞起|冒出|\bup(?:ward|wards)?\b|\bris(?:e|ing)\b|ascend/.test(text)) return 'up';
+  if (text === '下' || text === 'd' || /从上[往向到至]下|向下|往下|朝下|下移|下方|下边|掉落|落下|掉下|下落|坠落|砸下|从天|天降|\bdown(?:ward|wards)?\b|\bfall(?:ing)?\b|\bdrop(?:ping)?\b|descend/.test(text)) return 'down';
+  if (text === '左' || text === 'l' || /从右[往向到至]左|向左|往左|朝左|左移|左边|左侧|左方|\bleft(?:ward|wards)?\b|靠近|接近|追|逼近|toward|approach|chase/.test(text)) return 'left';
+  if (/静止|不动|固定|原地|隐藏|存在|stationary|still|static|fixed|hidden|in\s+place/.test(text)) return 'static';
+}
+
 export function resolveChallengeConfig(node: BoardNode): {
   pattern: ChallengePattern;
   direction: ChallengeDirection;
@@ -511,48 +949,9 @@ export function resolveChallengeConfig(node: BoardNode): {
       : node.note;
   const dirSource = (behaviorText || fallbackText).toLowerCase();
 
-  let direction: ChallengeDirection;
-  if (behavior === null || (isSceneTemplate && !behaviorText)) {
-    direction = 'static';
-  } else if (/来回|左右|往返|巡逻|摆动|摇摆|back\s*and\s*forth|patrol|oscillat|swing/.test(dirSource)) {
-    direction = 'patrol';
-  } else if (
-    behaviorDirField === '右' ||
-    behaviorDirField === 'r' ||
-    /从左[往向到至]右|向右|往右|朝右|右移|右边|右侧|右方|\bright(?:ward|wards)?\b/.test(dirSource)
-  ) {
-    direction = 'right';
-  } else if (
-    behaviorDirField === '上' ||
-    behaviorDirField === 'u' ||
-    /从下[往向到至]上|向上|往上|朝上|上移|上方|上边|升起|上升|飞起|冒出|\bup(?:ward|wards)?\b|\bris(?:e|ing)\b|ascend/.test(
-      dirSource,
-    )
-  ) {
-    direction = 'up';
-  } else if (
-    behaviorDirField === '下' ||
-    behaviorDirField === 'd' ||
-    /从上[往向到至]下|向下|往下|朝下|下移|下方|下边|掉落|落下|掉下|下落|坠落|砸下|从天|天降|\bdown(?:ward|wards)?\b|\bfall(?:ing)?\b|\bdrop(?:ping)?\b|descend/.test(
-      dirSource,
-    )
-  ) {
-    direction = 'down';
-  } else if (
-    behaviorDirField === '左' ||
-    behaviorDirField === 'l' ||
-    /从右[往向到至]左|向左|往左|朝左|左移|左边|左侧|左方|\bleft(?:ward|wards)?\b|靠近|接近|追|逼近|toward|approach|chase/.test(
-      dirSource,
-    )
-  ) {
-    direction = 'left';
-  } else if (/静止|不动|固定|原地|隐藏|存在|stationary|still|static|fixed|hidden|in\s+place/.test(dirSource)) {
-    direction = 'static';
-  } else if (basePattern === 'falling-hazard') {
-    direction = 'down';
-  } else {
-    direction = 'left';
-  }
+  const direction: ChallengeDirection = behavior === null || (isSceneTemplate && !behaviorText)
+    ? 'static'
+    : matchChallengeDirection(behaviorDirField) ?? matchChallengeDirection(dirSource) ?? (basePattern === 'falling-hazard' ? 'down' : 'left');
 
   const pattern: ChallengePattern =
     basePattern === 'collectible'
@@ -588,6 +987,45 @@ export function resolveChallengeConfig(node: BoardNode): {
     rotates,
     isSceneOnly,
   };
+}
+
+export function resolveChallengeTimeLimitSec(
+  node: BoardNode,
+  edges: BoardEdge[],
+): number | null {
+  const inferred = inferCardFieldsFromText('challenge', node.note, 'en', {
+    promptInput: node.promptInput,
+  });
+  const params =
+    node.fields.relatedParameters !== undefined
+      ? node.fields.relatedParameters
+      : inferred.relatedParameters ?? [];
+  const timeParam = params.find(
+    (p) =>
+      p.id === 'auto-time-limit' ||
+      /time\s*limit|countdown|timer|时长|限时|倒计时/i.test(p.name),
+  );
+  if (timeParam && Number.isFinite(timeParam.value) && timeParam.value > 0) {
+    return timeParam.value;
+  }
+
+  // Also activate a default countdown if an outgoing edge from this Challenge (or its connected Actions) waits on time_up
+  const connectedActionIds = new Set(
+    edges.filter((e) => e.fromId === node.id).map((e) => e.toId),
+  );
+  const checksTimeUp = edges.some((e) => {
+    const isRelevant =
+      e.fromId === node.id ||
+      (e.fromId !== null && connectedActionIds.has(e.fromId)) ||
+      (e.fromId === null && e.toId === node.id);
+    if (!isRelevant) return false;
+    return Boolean(
+      e.conditionGroup?.clauses.some(
+        (c) => c.kind === 'event' && normalizeEventId(c.eventId) === 'time_up',
+      ),
+    );
+  });
+  return checksTimeUp ? 10 : null;
 }
 
 export function resolveActionControl(node: BoardNode): ActionControlConfig {
@@ -638,11 +1076,20 @@ export function findStartNodeId(
   const playable = getPlayableNodes(nodes);
   if (playable.length === 0) return null;
 
-  const nodeMap = new Map(playable.map((n) => [n.id, n]));
+  const playableIds = new Set(playable.map((n) => n.id));
+  const topLevel = playable.filter((n) => !n.parentId || !playableIds.has(n.parentId));
+  const scopeNodes = topLevel.length > 0 ? topLevel : playable;
+
+  const nodeMap = new Map(scopeNodes.map((n) => [n.id, n]));
   const forwardIncoming = new Map<string, number>();
-  playable.forEach((n) => forwardIncoming.set(n.id, 0));
+  const guardedByEntryTrigger = new Set<string>();
+  scopeNodes.forEach((n) => forwardIncoming.set(n.id, 0));
 
   for (const edge of edges) {
+    if (edge.fromId === null) {
+      if (nodeMap.has(edge.toId)) guardedByEntryTrigger.add(edge.toId);
+      continue;
+    }
     const from = nodeMap.get(edge.fromId);
     const to = nodeMap.get(edge.toId);
     if (!from || !to) continue;
@@ -650,15 +1097,21 @@ export function findStartNodeId(
     forwardIncoming.set(to.id, (forwardIncoming.get(to.id) ?? 0) + 1);
   }
 
-  const roots = playable.filter((n) => (forwardIncoming.get(n.id) ?? 0) === 0);
-  const candidates = roots.length > 0 ? roots : playable;
+  const roots = scopeNodes.filter(
+    (n) => (forwardIncoming.get(n.id) ?? 0) === 0 && !guardedByEntryTrigger.has(n.id),
+  );
+  if (roots.length === 0 && guardedByEntryTrigger.size > 0) {
+    return null;
+  }
+  const candidates = roots.length > 0 ? roots : scopeNodes;
 
   const kindPriority: Record<string, number> = {
-    narration: 0,
-    dialogue: 1,
-    challenge: 2,
-    action: 3,
-    outcome: 4,
+    group: 0,
+    narration: 1,
+    dialogue: 2,
+    challenge: 3,
+    action: 4,
+    outcome: 5,
   };
 
   const sorted = [...candidates].sort((a, b) => {
@@ -679,14 +1132,15 @@ export function computeLoopEdgeIds(
   const playable = nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable);
   const nodeMap = new Map(playable.map((n) => [n.id, n]));
   const playableEdges = edges.filter(
-    (e) => nodeMap.has(e.fromId) && nodeMap.has(e.toId),
+    (e): e is BoardEdge & { fromId: string } =>
+      e.fromId !== null && nodeMap.has(e.fromId) && nodeMap.has(e.toId),
   );
 
   const loopIds = new Set<string>();
   const startId = findStartNodeId(nodes, edges) ?? playable[0]?.id ?? null;
   if (!startId) return loopIds;
 
-  const adj = new Map<string, BoardEdge[]>();
+  const adj = new Map<string, (BoardEdge & { fromId: string })[]>();
   for (const e of playableEdges) {
     const list = adj.get(e.fromId) ?? [];
     list.push(e);
@@ -745,19 +1199,27 @@ export function getEvaluatedOutgoing(
   customFlags: Record<string, boolean>,
   loopEdgeIds: Set<string>,
   scopedVariables: ScopedStateVariable[] = [],
+  runtimeCtx?: PlayRuntimeContext,
 ): EvaluatedEdge[] {
   const playableMap = new Map(getPlayableNodes(nodes).map((n) => [n.id, n]));
   const activeSet = new Set(activeNodeIds);
   const result: EvaluatedEdge[] = [];
 
   for (const edge of edges) {
-    if (!activeSet.has(edge.fromId)) continue;
+    if (!edge.fromId || !activeSet.has(edge.fromId)) continue;
     const target = playableMap.get(edge.toId);
     if (!target) continue;
     result.push({
       edge,
       target,
-      evaluation: evaluateEdgeCondition(edge.condition, stats, customFlags, scopedVariables),
+      evaluation: evaluateEdgeCondition(
+        edge.condition,
+        stats,
+        customFlags,
+        scopedVariables,
+        edge.conditionGroup,
+        runtimeCtx,
+      ),
       isLoop: loopEdgeIds.has(edge.id),
     });
   }

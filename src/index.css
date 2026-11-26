@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@source not "../.aistudio";
 
 @theme {
   --font-display: "Fredoka", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;

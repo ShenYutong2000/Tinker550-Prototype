@@ -31,7 +31,7 @@ interface CardExpandedPanelProps {
   numericParameters: NumericFormulaSymbol[];
   onUpdateNode: (
     id: string,
-    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput' | 'challengeAssetId'>>,
+    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
   ) => void;
   onUpdateNodeField: <K extends keyof CardFieldConfig>(
     id: string,
@@ -93,11 +93,6 @@ export function CardExpandedPanel({
 }: CardExpandedPanelProps) {
   const b = COPY[lang].studio.board;
   const boundAssetIds = getNodeAssetIds(node);
-  const challengeAppearances = node.kind === 'challenge'
-    ? assetItems.filter(asset => boundAssetIds.includes(asset.id) &&
-      ['objects', 'characters', 'effects'].includes(asset.categoryId) &&
-      asset.states.some(state => state.id === asset.activeStateId && state.mediaKind !== 'video' && state.mediaUrl))
-    : [];
 
   // Action Control searchable input combobox
   const [ctrlInputOpen, setCtrlInputOpen] = useState(false);
@@ -212,17 +207,38 @@ export function CardExpandedPanel({
           assetItems={assetItems}
           selectedIds={boundAssetIds}
           preferredCategories={PREFERRED_ASSETS_BY_KIND[node.kind]}
-          onChange={(nextIds) => onUpdateNode(node.id, { assetIds: nextIds })}
+          onChange={(nextIds) => {
+            const nextSet = new Set(nextIds);
+            const p = node.promptInput;
+            if (p) {
+              const patch: Partial<NonNullable<BoardNode['promptInput']>> = {};
+              let touched = false;
+              if (p.actorAssetId && !nextSet.has(p.actorAssetId)) {
+                patch.actorAssetId = undefined;
+                patch.actorName = '';
+                touched = true;
+              }
+              if (p.obstacleAssetId && !nextSet.has(p.obstacleAssetId)) {
+                patch.obstacleAssetId = undefined;
+                patch.obstacle = '';
+                touched = true;
+              }
+              if (p.sceneAssetId && !nextSet.has(p.sceneAssetId)) {
+                patch.sceneAssetId = undefined;
+                patch.sceneName = '';
+                touched = true;
+              }
+              if (touched) {
+                onUpdateNode(node.id, {
+                  assetIds: nextIds,
+                  promptInput: { ...p, ...patch },
+                });
+                return;
+              }
+            }
+            onUpdateNode(node.id, { assetIds: nextIds });
+          }}
         />
-        {challengeAppearances.length > 0 && <label className="grid gap-1 text-xs text-slate-600">
-          {lang === 'zh' ? '舞台造型' : 'Stage appearance'}
-          <select value={challengeAppearances.some(asset => asset.id === node.challengeAssetId) ? node.challengeAssetId : ''}
-            onChange={event => onUpdateNode(node.id, { challengeAssetId: event.target.value || undefined })}
-            className="w-full rounded-md border border-slate-300 bg-white px-2 py-1">
-            <option value="">{lang === 'zh' ? '自动选择' : 'Automatic'}</option>
-            {challengeAppearances.map(asset => <option value={asset.id} key={asset.id}>{asset.name}</option>)}
-          </select>
-        </label>}
       </section>
 
       {/* 2. Narration & Dialogue: Playback Settings */}
@@ -550,6 +566,25 @@ export function CardExpandedPanel({
       {/* 2 & 3. Outcome: Related Properties + Optional Related Parameters */}
       {node.kind === 'outcome' && (
         <>
+          <section className="grid gap-2 text-xs">
+            <label className="grid gap-1">
+              {lang === 'zh' ? '舞台加分公式' : 'Stage score formula'}
+              <input className="rounded border border-slate-300 px-2 py-1" value={node.fields.stageScoreFormula ?? ''}
+                placeholder="Reward + StageWidth / 10"
+                onChange={e => onUpdateNodeField(node.id, 'stageScoreFormula', e.target.value)} />
+            </label>
+            <label className="grid gap-1">
+              {lang === 'zh' ? '舞台对象结果' : 'Stage object result'}
+              <select className="rounded border border-slate-300 px-2 py-1" value={node.fields.stageTargetEffect ?? ''}
+                onChange={e => onUpdateNodeField(node.id, 'stageTargetEffect', (e.target.value || undefined) as CardFieldConfig['stageTargetEffect'])}>
+                <option value="">{lang === 'zh' ? '无' : 'None'}</option>
+                <option value="open">{lang === 'zh' ? '打开绑定的目标' : 'Open the bound target'}</option>
+                <option value="collect">{lang === 'zh' ? '收集该实例' : 'Collect this instance'}</option>
+                <option value="lock-camera">{lang === 'zh' ? '锁定当前镜头' : 'Lock camera here'}</option>
+                <option value="follow-camera">{lang === 'zh' ? '恢复镜头跟随' : 'Resume camera follow'}</option>
+              </select>
+            </label>
+          </section>
           <section className="pt-3 border-t border-black/8 space-y-2">
             <h4 className="text-[11px] font-semibold text-[#334155]">
               2. {b.secProperties}

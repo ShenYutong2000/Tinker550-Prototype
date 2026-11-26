@@ -11,11 +11,14 @@ import {
   AlertTriangle,
   Award,
   BookOpen,
-  Check,
   ChevronDown,
   ChevronUp,
+  Copy,
   Database,
+  FileText,
   GitCommitHorizontal,
+  Layers,
+  ListOrdered,
   Maximize2,
   MessageSquareQuote,
   Minus,
@@ -25,6 +28,7 @@ import {
   SlidersHorizontal,
   StickyNote,
   Trash2,
+  Ungroup,
   X,
   Zap,
 } from 'lucide-react';
@@ -37,23 +41,34 @@ import {
 } from '../playtest/boardPlayEngine';
 import { COPY, type Language } from '../../../shared/i18n';
 import {
-  defaultConditionForVariable,
   type ScopedStateVariable,
   type StateVariable,
   type StateVariableValue,
 } from '../properties/stateModel';
 import {
   CARD_EXPANDED_WIDTH,
+  GROUP_HEADER_HEIGHT,
+  GROUP_MIN_HEIGHT,
+  GROUP_MIN_WIDTH,
   NODE_CATALOG,
   formatActionControlKey,
+  getCollapsedAncestorGroup,
+  getDescendantNodeIds,
   getNodeAssetIds,
+  getNodeDepth,
   getNodeDimensions,
+  isDescendantOf,
+  resolveGroupCode,
   type BoardEdge,
   type BoardNode,
   type CardFieldConfig,
   type NodeKind,
 } from './studioModel';
+import type { EdgeConditionGroup } from './arrowConditionModel';
 import { StateManagerPanel } from '../properties/StateManagerPanel';
+import { ArrowConditionBuilder } from './ArrowConditionBuilder';
+import { GroupInfoModal } from './GroupInfoModal';
+import { GroupDirectoryPanel } from './GroupDirectoryPanel';
 import { CardExpandedPanel } from './cards/CardExpandedPanel';
 import { CardPromptFront } from './cards/CardPromptFront';
 
@@ -64,18 +79,30 @@ interface DesignBoardProps {
   assetItems: AssetItem[];
   scopedVariables: ScopedStateVariable[];
   stateManagerOpen: boolean;
-  focusTarget: { nodeId?: string; edgeId?: string; nonce: number; stageLink?: boolean } | null;
+  focusTarget: { nodeId?: string; edgeId?: string; nonce: number } | null;
   selectedNodeId: string | null;
   autoFocusNodeId: string | null;
-  stageEditingCardIds: string[];
   activePlayNodeIds: string[];
   activePlayEdgeId: string | null;
+  placementCounts: Record<string, number>;
+  onLocateStage: (nodeId: string) => void;
+  onToggleStageTemplate: (nodeId: string) => void;
+  onToggleStageReset: (nodeId: string) => void;
   onSelectNode: (id: string | null) => void;
   onConsumeAutoFocus: () => void;
   onDragNode: (id: string, dx: number, dy: number) => void;
+  onCommitNodeDrop: (id: string) => void;
+  onResizeGroup: (
+    id: string,
+    rect: { x?: number; y?: number; width: number; height: number },
+  ) => void;
+  onCommitGroupResize: (id: string) => void;
+  onToggleGroupCollapse: (id: string) => void;
+  onDuplicateNode: (id: string) => void;
+  onUngroup: (id: string) => void;
   onUpdateNode: (
     id: string,
-    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput' | 'challengeAssetId'>>,
+    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
   ) => void;
   onUpdateNodeField: <K extends keyof CardFieldConfig>(
     id: string,
@@ -85,8 +112,20 @@ interface DesignBoardProps {
   onResetNodeAutoFields: (id: string) => void;
   onDeleteNode: (id: string) => void;
   onAddNodeAt: (kind: NodeKind, worldX: number, worldY: number) => void;
-  onConnectNodes: (fromId: string, toId: string) => void;
-  onUpdateEdgeCondition: (edgeId: string, condition: string) => void;
+  onConnectNodes: (
+    fromId: string | null,
+    toId: string,
+    entryOffset?: { dx: number; dy: number },
+  ) => string | null;
+  onUpdateEntryEdgeOffset: (
+    edgeId: string,
+    entryOffset: { dx: number; dy: number },
+  ) => void;
+  onUpdateEdgeCondition: (
+    edgeId: string,
+    condition: string,
+    conditionGroup?: EdgeConditionGroup,
+  ) => void;
   onDeleteEdge: (edgeId: string) => void;
   onToggleStateManager: (open?: boolean) => void;
   onAddGlobalVariable: (variable: StateVariable) => void;
@@ -140,6 +179,8 @@ function renderKindIcon(kind: NodeKind, color: string) {
       return <Zap {...props} />;
     case 'outcome':
       return <Award {...props} />;
+    case 'group':
+      return <Layers {...props} />;
     case 'draft':
       return <StickyNote {...props} />;
   }
@@ -149,6 +190,62 @@ interface EdgePathResult {
   path: string;
   midX: number;
   midY: number;
+  startX?: number;
+  startY?: number;
+}
+
+function getEntryEdgeGeometry(
+  edge: BoardEdge,
+  to: BoardNode,
+  expandedNodeId: string | null = null,
+): EdgePathResult & { startX: number; startY: number } {
+  const toBase = getNodeDimensions(to);
+  const toDim = {
+    width:
+      expandedNodeId === to.id && NODE_CATALOG[to.kind].isPlayable
+        ? CARD_EXPANDED_WIDTH
+        : toBase.width,
+    height: toBase.height,
+  };
+  const offset = edge.entryOffset ?? { dx: -136, dy: Math.round(toDim.height / 2) };
+  const startX = to.x + offset.dx;
+  const startY = to.y + offset.dy;
+  const toCx = to.x + toDim.width / 2;
+  const toCy = to.y + toDim.height / 2;
+  const dx = toCx - startX;
+  const dy = toCy - startY;
+
+  if (Math.abs(dx) >= Math.abs(dy) * 0.55) {
+    const endX = dx >= 0 ? to.x : to.x + toDim.width;
+    const endY = toCy;
+    const curveOffset = Math.max(36, Math.abs(endX - startX) * 0.42);
+    const c1x = dx >= 0 ? startX + curveOffset : startX - curveOffset;
+    const c2x = dx >= 0 ? endX - curveOffset : endX + curveOffset;
+    const midX = 0.125 * startX + 0.375 * c1x + 0.375 * c2x + 0.125 * endX;
+    const midY = 0.125 * startY + 0.375 * startY + 0.375 * endY + 0.125 * endY;
+    return {
+      path: `M ${startX} ${startY} C ${c1x} ${startY}, ${c2x} ${endY}, ${endX} ${endY}`,
+      midX,
+      midY,
+      startX,
+      startY,
+    };
+  }
+
+  const endX = toCx;
+  const endY = dy >= 0 ? to.y : to.y + toDim.height;
+  const curveOffset = Math.max(32, Math.abs(endY - startY) * 0.42);
+  const c1y = dy >= 0 ? startY + curveOffset : startY - curveOffset;
+  const c2y = dy >= 0 ? endY - curveOffset : endY + curveOffset;
+  const midX = 0.125 * startX + 0.375 * startX + 0.375 * endX + 0.125 * endX;
+  const midY = 0.125 * startY + 0.375 * c1y + 0.375 * c2y + 0.125 * endY;
+  return {
+    path: `M ${startX} ${startY} C ${startX} ${c1y}, ${endX} ${c2y}, ${endX} ${endY}`,
+    midX,
+    midY,
+    startX,
+    startY,
+  };
 }
 
 function getEdgeGeometry(
@@ -260,18 +357,28 @@ export function DesignBoard({
   focusTarget,
   selectedNodeId,
   autoFocusNodeId,
-  stageEditingCardIds,
   activePlayNodeIds,
   activePlayEdgeId,
+  placementCounts,
+  onLocateStage,
+  onToggleStageTemplate,
+  onToggleStageReset,
   onSelectNode,
   onConsumeAutoFocus,
   onDragNode,
+  onCommitNodeDrop,
+  onResizeGroup,
+  onCommitGroupResize,
+  onToggleGroupCollapse,
+  onDuplicateNode,
+  onUngroup,
   onUpdateNode,
   onUpdateNodeField,
   onResetNodeAutoFields,
   onDeleteNode,
   onAddNodeAt,
   onConnectNodes,
+  onUpdateEntryEdgeOffset,
   onUpdateEdgeCondition,
   onDeleteEdge,
   onToggleStateManager,
@@ -299,25 +406,65 @@ export function DesignBoard({
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
   const [freshFocusNodeId, setFreshFocusNodeId] = useState<string | null>(null);
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
-  const [edgeConditionDraft, setEdgeConditionDraft] = useState('');
+  const [editingGroupInfo, setEditingGroupInfo] = useState<{
+    id: string;
+    focusField: 'title' | 'note';
+  } | null>(null);
+  const [groupDirectoryOpen, setGroupDirectoryOpen] = useState(false);
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
   const [edgeContextMenu, setEdgeContextMenu] = useState<{
     edgeId: string;
     x: number;
     y: number;
   } | null>(null);
-  const [connectingFrom, setConnectingFrom] = useState<{
-    nodeId: string;
-    side: 'left' | 'right';
-  } | null>(null);
-  const connectingFromId = connectingFrom?.nodeId ?? null;
+  const [isConnectMode, setIsConnectMode] = useState(false);
+  const [connectingFrom, setConnectingFrom] = useState<
+    | { kind: 'node'; nodeId: string; side: 'left' | 'right' }
+    | { kind: 'air'; worldX: number; worldY: number }
+    | null
+  >(null);
+  const connectingFromId = connectingFrom?.kind === 'node' ? connectingFrom.nodeId : null;
+  const isConnectingActive = isConnectMode || Boolean(connectingFrom);
   const [connectPointerWorld, setConnectPointerWorld] = useState<{
     x: number;
     y: number;
   } | null>(null);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [boardSize, setBoardSize] = useState({ width: 720, height: 560 });
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const syncSize = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const nextW = Math.round(rect.width);
+        const nextH = Math.round(rect.height);
+        setBoardSize((prev) =>
+          prev.width === nextW && prev.height === nextH
+            ? prev
+            : { width: nextW, height: nextH },
+        );
+      }
+    };
+    syncSize();
+    const ro = new ResizeObserver(syncSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const exitConnectMode = useCallback(() => {
+    setIsConnectMode(false);
+    setConnectingFrom(null);
+    setConnectPointerWorld(null);
+    portDragRef.current = null;
+    airDragRef.current = null;
+  }, []);
 
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
+  const [resizingGroupId, setResizingGroupId] = useState<string | null>(null);
+  const [draggingEntryEdgeId, setDraggingEntryEdgeId] = useState<string | null>(null);
   const [isPanning, setIsPanning] = useState(false);
 
   const panDragRef = useRef<{
@@ -331,6 +478,18 @@ export function DesignBoard({
     id: string;
     lastClientX: number;
     lastClientY: number;
+    moved: boolean;
+  } | null>(null);
+
+  const groupResizeRef = useRef<{
+    id: string;
+    dir: 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+    startW: number;
+    startH: number;
   } | null>(null);
 
   const portDragRef = useRef<{
@@ -340,21 +499,85 @@ export function DesignBoard({
     moved: boolean;
   } | null>(null);
 
-  // Immediately focus newly added blank card for instant typing
-  useEffect(() => {
-    if (!autoFocusNodeId) return;
-    setEditingNodeId(autoFocusNodeId);
-    setFreshFocusNodeId(autoFocusNodeId);
-    setExpandedNodeId(null);
-    onConsumeAutoFocus();
-  }, [autoFocusNodeId, onConsumeAutoFocus]);
+  const airDragRef = useRef<{
+    worldX: number;
+    worldY: number;
+    startClientX: number;
+    startClientY: number;
+    moved: boolean;
+    wasAlreadyAir: boolean;
+  } | null>(null);
+
+  const entryTailDragRef = useRef<{
+    edgeId: string;
+    toX: number;
+    toY: number;
+  } | null>(null);
 
   const activePlaySet = useMemo(() => new Set(activePlayNodeIds), [activePlayNodeIds]);
   const loopEdgeIds = useMemo(() => computeLoopEdgeIds(nodes, edges), [nodes, edges]);
   const nodeMap = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edgeMap = useMemo(() => new Map(edges.map((e) => [e.id, e])), [edges]);
+
+  // Immediately focus newly added blank card (or open Group Design Notes modal for a new Group) & keep it visible
+  useEffect(() => {
+    if (!autoFocusNodeId) return;
+    const target = nodeMap.get(autoFocusNodeId);
+    if (target?.kind === 'group') {
+      setEditingNodeId(null);
+      setFreshFocusNodeId(null);
+      setExpandedNodeId(null);
+      setEditingGroupInfo({ id: target.id, focusField: 'note' });
+    } else {
+      setEditingNodeId(autoFocusNodeId);
+      setFreshFocusNodeId(autoFocusNodeId);
+      setExpandedNodeId(null);
+    }
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (target && rect && rect.width > 0 && rect.height > 0) {
+      const dim = getNodeDimensions(target);
+      const left = target.x * zoom + pan.x;
+      const right = (target.x + dim.width) * zoom + pan.x;
+      const top = target.y * zoom + pan.y;
+      const bottom = (target.y + dim.height) * zoom + pan.y;
+
+      const padLeft = 28;
+      const padRight = 28;
+      const padTop = 104;
+      const padBottom = 76;
+
+      let dx = 0;
+      let dy = 0;
+      if (right > rect.width - padRight) {
+        dx = rect.width - padRight - right;
+      }
+      if (left + dx < padLeft) {
+        dx = padLeft - left;
+      }
+      if (bottom > rect.height - padBottom) {
+        dy = rect.height - padBottom - bottom;
+      }
+      if (top + dy < padTop) {
+        dy = padTop - top;
+      }
+
+      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+        setPan((prev) => ({
+          x: Math.round(prev.x + dx),
+          y: Math.round(prev.y + dy),
+        }));
+      }
+    }
+
+    onConsumeAutoFocus();
+  }, [autoFocusNodeId, nodeMap, onConsumeAutoFocus, pan.x, pan.y, zoom]);
   const numericBoardParameters = useMemo(
     () => collectNumericBoardParameters(nodes),
+    [nodes],
+  );
+  const groupCountTotal = useMemo(
+    () => nodes.filter((n) => n.kind === 'group').length,
     [nodes],
   );
   const dirtyVarCount = useMemo(
@@ -377,25 +600,32 @@ export function DesignBoard({
         const dim = getNodeDimensions(targetNode);
         worldCx = targetNode.x + dim.width / 2;
         worldCy = targetNode.y + dim.height / 2;
-        if (!focusTarget.stageLink) onSelectNode(targetNode.id);
+        onSelectNode(targetNode.id);
         setHighlightedNodeId(targetNode.id);
       }
     } else if (focusTarget.edgeId) {
       const targetEdge = edgeMap.get(focusTarget.edgeId);
       if (targetEdge) {
-        const from = nodeMap.get(targetEdge.fromId);
         const to = nodeMap.get(targetEdge.toId);
-        if (from && to) {
-          const geom = getEdgeGeometry(from, to, loopEdgeIds.has(targetEdge.id));
+        if (targetEdge.fromId === null && to) {
+          const geom = getEntryEdgeGeometry(targetEdge, to);
           worldCx = geom.midX;
           worldCy = geom.midY;
           setHighlightedEdgeId(targetEdge.id);
+        } else if (targetEdge.fromId) {
+          const from = nodeMap.get(targetEdge.fromId);
+          if (from && to) {
+            const geom = getEdgeGeometry(from, to, loopEdgeIds.has(targetEdge.id));
+            worldCx = geom.midX;
+            worldCy = geom.midY;
+            setHighlightedEdgeId(targetEdge.id);
+          }
         }
       }
     }
 
     if (worldCx !== null && worldCy !== null) {
-      const targetZoom = focusTarget.stageLink ? zoom : Math.max(0.88, zoom);
+      const targetZoom = Math.max(0.88, zoom);
       setZoom(targetZoom);
       setPan({
         x: Math.round(rect.width / 2 - worldCx * targetZoom),
@@ -428,6 +658,24 @@ export function DesignBoard({
     if (!el) return;
 
     const onWheel = (event: WheelEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target) {
+        if (target.closest('[data-board-overlay="true"], [data-card-popover="true"]')) {
+          return;
+        }
+        let cursor: HTMLElement | null = target;
+        while (cursor && cursor !== el) {
+          const style = window.getComputedStyle(cursor);
+          const overflowY = style.overflowY;
+          if (
+            (overflowY === 'auto' || overflowY === 'scroll') &&
+            cursor.scrollHeight > cursor.clientHeight + 2
+          ) {
+            return;
+          }
+          cursor = cursor.parentElement;
+        }
+      }
       event.preventDefault();
       const rect = el.getBoundingClientRect();
       const factor = event.deltaY < 0 ? 1.09 : 0.92;
@@ -459,19 +707,19 @@ export function DesignBoard({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setConnectingFrom(null);
-        setConnectPointerWorld(null);
-        portDragRef.current = null;
+        exitConnectMode();
         setEditingNodeId(null);
         setExpandedNodeId(null);
         setEditingEdgeId(null);
+        setEditingGroupInfo(null);
+        setGroupDirectoryOpen(false);
         setEdgeContextMenu(null);
         setAddMenuOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [exitConnectMode]);
 
   const handleFitView = useCallback(() => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -487,6 +735,7 @@ export function DesignBoard({
     let maxY = -Infinity;
 
     nodes.forEach((n) => {
+      if (getCollapsedAncestorGroup(n.id, nodeMap)) return;
       const dim = getNodeDimensions(n);
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y - 50);
@@ -516,7 +765,32 @@ export function DesignBoard({
       x: Math.round(rect.width / 2 - centerX * fitZoom),
       y: Math.round((rect.height + padTop - padBottom) / 2 - centerY * fitZoom),
     });
-  }, [nodes]);
+  }, [nodeMap, nodes]);
+
+  const completeAirTriggerToNode = useCallback(
+    (node: BoardNode, originWorldX: number, originWorldY: number, wasDragged: boolean) => {
+      const dim = getNodeDimensions(node);
+      const cardWidth = expandedNodeId === node.id ? CARD_EXPANDED_WIDTH : dim.width;
+      const dxRaw = originWorldX - node.x;
+      const dyRaw = originWorldY - node.y;
+      const tooClose = !wasDragged && Math.hypot(dxRaw, dyRaw) < 48;
+      const entryOffset = tooClose
+        ? { dx: -136, dy: Math.round(dim.height / 2) }
+        : {
+            dx:
+              dxRaw >= 0 && dxRaw <= cardWidth && dyRaw >= 0 && dyRaw <= dim.height
+                ? -136
+                : Math.round(dxRaw),
+            dy: Math.round(dyRaw),
+          };
+      const createdId = onConnectNodes(null, node.id, entryOffset);
+      exitConnectMode();
+      if (createdId) {
+        setEditingEdgeId(createdId);
+      }
+    },
+    [exitConnectMode, expandedNodeId, onConnectNodes],
+  );
 
   const handleCanvasPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     setEdgeContextMenu(null);
@@ -527,12 +801,28 @@ export function DesignBoard({
     setEditingNodeId(null);
     setExpandedNodeId(null);
     setEditingEdgeId(null);
+    setEditingGroupInfo(null);
+    setGroupDirectoryOpen(false);
     setAddMenuOpen(false);
 
-    if (connectingFrom) {
-      setConnectingFrom(null);
-      setConnectPointerWorld(null);
-      portDragRef.current = null;
+    if (isConnectMode && (!connectingFrom || connectingFrom.kind === 'air')) {
+      const worldPt = clientToWorld(event.clientX, event.clientY);
+      const wasAlreadyAir = connectingFrom?.kind === 'air';
+      setConnectingFrom({ kind: 'air', worldX: worldPt.x, worldY: worldPt.y });
+      setConnectPointerWorld(worldPt);
+      airDragRef.current = {
+        worldX: worldPt.x,
+        worldY: worldPt.y,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        moved: false,
+        wasAlreadyAir,
+      };
+      return;
+    }
+
+    if (isConnectingActive) {
+      exitConnectMode();
       return;
     }
 
@@ -546,6 +836,40 @@ export function DesignBoard({
     setIsPanning(true);
   };
 
+  const applyGroupResizeMove = useCallback(
+    (clientX: number, clientY: number) => {
+      const r = groupResizeRef.current;
+      if (!r) return;
+      const dx = (clientX - r.startClientX) / zoom;
+      const dy = (clientY - r.startClientY) / zoom;
+
+      let nextX = r.startX;
+      let nextY = r.startY;
+      let nextW = r.startW;
+      let nextH = r.startH;
+
+      if (r.dir.includes('e')) {
+        nextW = Math.max(GROUP_MIN_WIDTH, r.startW + dx);
+      }
+      if (r.dir.includes('s')) {
+        nextH = Math.max(GROUP_MIN_HEIGHT, r.startH + dy);
+      }
+      if (r.dir.includes('w')) {
+        const clampedW = Math.max(GROUP_MIN_WIDTH, r.startW - dx);
+        nextX = r.startX + (r.startW - clampedW);
+        nextW = clampedW;
+      }
+      if (r.dir.includes('n')) {
+        const clampedH = Math.max(GROUP_MIN_HEIGHT, r.startH - dy);
+        nextY = r.startY + (r.startH - clampedH);
+        nextH = clampedH;
+      }
+
+      onResizeGroup(r.id, { x: nextX, y: nextY, width: nextW, height: nextH });
+    },
+    [onResizeGroup, zoom],
+  );
+
   const handleCanvasPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (portDragRef.current) {
       const dx = event.clientX - portDragRef.current.startClientX;
@@ -555,8 +879,31 @@ export function DesignBoard({
       }
     }
 
+    if (airDragRef.current) {
+      const dx = event.clientX - airDragRef.current.startClientX;
+      const dy = event.clientY - airDragRef.current.startClientY;
+      if (Math.hypot(dx, dy) > 8) {
+        airDragRef.current.moved = true;
+      }
+    }
+
+    if (entryTailDragRef.current) {
+      const worldPt = clientToWorld(event.clientX, event.clientY);
+      const tDrag = entryTailDragRef.current;
+      onUpdateEntryEdgeOffset(tDrag.edgeId, {
+        dx: worldPt.x - tDrag.toX,
+        dy: worldPt.y - tDrag.toY,
+      });
+      return;
+    }
+
     if (connectingFrom) {
       setConnectPointerWorld(clientToWorld(event.clientX, event.clientY));
+    }
+
+    if (groupResizeRef.current) {
+      applyGroupResizeMove(event.clientX, event.clientY);
+      return;
     }
 
     if (nodeDragRef.current) {
@@ -565,7 +912,46 @@ export function DesignBoard({
       const dy = (event.clientY - drag.lastClientY) / zoom;
       drag.lastClientX = event.clientX;
       drag.lastClientY = event.clientY;
+      if (Math.abs(dx) > 0.1 || Math.abs(dy) > 0.1) {
+        drag.moved = true;
+      }
       onDragNode(drag.id, dx, dy);
+
+      const draggedNode = nodeMap.get(drag.id);
+      if (draggedNode) {
+        const dim = getNodeDimensions(draggedNode);
+        const cx = draggedNode.x + dx + dim.width / 2;
+        const cy = draggedNode.y + dy + dim.height / 2;
+        let bestId: string | null = null;
+        let bestDepth = -1;
+        let bestArea = Infinity;
+        for (const candidate of nodes) {
+          if (candidate.kind !== 'group' || candidate.collapsed) continue;
+          if (candidate.id === draggedNode.id) continue;
+          if (
+            draggedNode.kind === 'group' &&
+            isDescendantOf(candidate.id, draggedNode.id, nodeMap)
+          ) {
+            continue;
+          }
+          const gDim = getNodeDimensions(candidate);
+          if (
+            cx >= candidate.x &&
+            cx <= candidate.x + gDim.width &&
+            cy >= candidate.y &&
+            cy <= candidate.y + gDim.height
+          ) {
+            const depth = getNodeDepth(candidate.id, nodeMap);
+            const area = gDim.width * gDim.height;
+            if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
+              bestDepth = depth;
+              bestArea = area;
+              bestId = candidate.id;
+            }
+          }
+        }
+        setDropTargetGroupId(bestId);
+      }
       return;
     }
 
@@ -578,18 +964,77 @@ export function DesignBoard({
     }
   };
 
-  const handleCanvasPointerUp = () => {
+  const handleCanvasPointerUp = useCallback(() => {
     panDragRef.current = null;
+    if (nodeDragRef.current?.moved) {
+      onCommitNodeDrop(nodeDragRef.current.id);
+    }
     nodeDragRef.current = null;
+    if (groupResizeRef.current) {
+      onCommitGroupResize(groupResizeRef.current.id);
+    }
+    groupResizeRef.current = null;
+    entryTailDragRef.current = null;
+    setDraggingEntryEdgeId(null);
+
+    if (airDragRef.current) {
+      const air = airDragRef.current;
+      airDragRef.current = null;
+      if (air.moved) {
+        // Dragged from air onto empty space -> reset air origin cleanly while staying in Connect mode
+        setConnectingFrom(null);
+        setConnectPointerWorld(null);
+      } else if (air.wasAlreadyAir) {
+        // Clicked empty space a second time -> exit Connect mode
+        exitConnectMode();
+      }
+    }
+
     if (portDragRef.current?.moved) {
       // Released a dragged connection onto empty canvas -> cancel cleanly
-      setConnectingFrom(null);
-      setConnectPointerWorld(null);
+      exitConnectMode();
     }
     portDragRef.current = null;
     setDraggingNodeId(null);
+    setDropTargetGroupId(null);
+    setResizingGroupId(null);
     setIsPanning(false);
-  };
+  }, [exitConnectMode, onCommitGroupResize, onCommitNodeDrop]);
+
+  // Keep Group resizing & entry-dot dragging responsive even if cursor moves outside the board
+  useEffect(() => {
+    if (!resizingGroupId && !draggingEntryEdgeId) return;
+    const onWindowPointerMove = (e: PointerEvent) => {
+      if (groupResizeRef.current) {
+        applyGroupResizeMove(e.clientX, e.clientY);
+      } else if (entryTailDragRef.current) {
+        const worldPt = clientToWorld(e.clientX, e.clientY);
+        const tDrag = entryTailDragRef.current;
+        onUpdateEntryEdgeOffset(tDrag.edgeId, {
+          dx: worldPt.x - tDrag.toX,
+          dy: worldPt.y - tDrag.toY,
+        });
+      }
+    };
+    const onWindowPointerUp = () => {
+      handleCanvasPointerUp();
+    };
+    window.addEventListener('pointermove', onWindowPointerMove);
+    window.addEventListener('pointerup', onWindowPointerUp);
+    window.addEventListener('pointercancel', onWindowPointerUp);
+    return () => {
+      window.removeEventListener('pointermove', onWindowPointerMove);
+      window.removeEventListener('pointerup', onWindowPointerUp);
+      window.removeEventListener('pointercancel', onWindowPointerUp);
+    };
+  }, [
+    applyGroupResizeMove,
+    clientToWorld,
+    draggingEntryEdgeId,
+    handleCanvasPointerUp,
+    onUpdateEntryEdgeOffset,
+    resizingGroupId,
+  ]);
 
   const handleZoomStep = (delta: number) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -618,7 +1063,8 @@ export function DesignBoard({
       target.closest('button') ||
       target.closest('input') ||
       target.closest('textarea') ||
-      target.closest('[data-card-popover="true"]')
+      target.closest('[data-card-popover="true"]') ||
+      target.closest('[data-resize-handle="true"]')
     ) {
       return;
     }
@@ -627,13 +1073,57 @@ export function DesignBoard({
     setEditingEdgeId(null);
     setEdgeContextMenu(null);
 
+    // Dragging from open air inside an expanded Group in Connect mode -> start a standalone trigger arrow!
+    if (
+      node.kind === 'group' &&
+      !node.collapsed &&
+      isConnectMode &&
+      (!connectingFrom || connectingFrom.kind === 'air')
+    ) {
+      const worldPt = clientToWorld(event.clientX, event.clientY);
+      const wasAlreadyAir = connectingFrom?.kind === 'air';
+      setConnectingFrom({ kind: 'air', worldX: worldPt.x, worldY: worldPt.y });
+      setConnectPointerWorld(worldPt);
+      airDragRef.current = {
+        worldX: worldPt.x,
+        worldY: worldPt.y,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        moved: false,
+        wasAlreadyAir,
+      };
+      return;
+    }
+
+    if (connectingFrom?.kind === 'air') {
+      if (NODE_CATALOG[node.kind].isPlayable) {
+        completeAirTriggerToNode(
+          node,
+          connectingFrom.worldX,
+          connectingFrom.worldY,
+          Boolean(airDragRef.current?.moved),
+        );
+      } else {
+        exitConnectMode();
+      }
+      return;
+    }
+
     if (connectingFromId) {
       if (connectingFromId !== node.id && NODE_CATALOG[node.kind].isPlayable) {
         onConnectNodes(connectingFromId, node.id);
       }
-      setConnectingFrom(null);
-      setConnectPointerWorld(null);
-      portDragRef.current = null;
+      exitConnectMode();
+      return;
+    }
+
+    if (isConnectMode && NODE_CATALOG[node.kind].isPlayable) {
+      const dim = getNodeDimensions(node);
+      const cardWidth = expandedNodeId === node.id ? CARD_EXPANDED_WIDTH : dim.width;
+      const worldPt = clientToWorld(event.clientX, event.clientY);
+      const side: 'left' | 'right' = worldPt.x < node.x + cardWidth / 2 ? 'left' : 'right';
+      setConnectingFrom({ kind: 'node', nodeId: node.id, side });
+      setConnectPointerWorld(worldPt);
       return;
     }
 
@@ -643,6 +1133,7 @@ export function DesignBoard({
       id: node.id,
       lastClientX: event.clientX,
       lastClientY: event.clientY,
+      moved: false,
     };
   };
 
@@ -656,24 +1147,41 @@ export function DesignBoard({
     event.stopPropagation();
     setAddMenuOpen(false);
     setEditingEdgeId(null);
+    setEditingGroupInfo(null);
     setEdgeContextMenu(null);
 
-    if (connectingFrom && connectingFrom.nodeId !== node.id) {
+    if (connectingFrom?.kind === 'air') {
+      if (NODE_CATALOG[node.kind].isPlayable) {
+        completeAirTriggerToNode(
+          node,
+          connectingFrom.worldX,
+          connectingFrom.worldY,
+          Boolean(airDragRef.current?.moved),
+        );
+      } else {
+        exitConnectMode();
+      }
+      return;
+    }
+
+    if (connectingFrom?.kind === 'node' && connectingFrom.nodeId !== node.id) {
       onConnectNodes(connectingFrom.nodeId, node.id);
+      exitConnectMode();
+      return;
+    }
+
+    if (
+      connectingFrom?.kind === 'node' &&
+      connectingFrom.nodeId === node.id &&
+      connectingFrom.side === side
+    ) {
       setConnectingFrom(null);
       setConnectPointerWorld(null);
       portDragRef.current = null;
       return;
     }
 
-    if (connectingFrom && connectingFrom.nodeId === node.id && connectingFrom.side === side) {
-      setConnectingFrom(null);
-      setConnectPointerWorld(null);
-      portDragRef.current = null;
-      return;
-    }
-
-    setConnectingFrom({ nodeId: node.id, side });
+    setConnectingFrom({ kind: 'node', nodeId: node.id, side });
     setConnectPointerWorld({
       x: side === 'left' ? node.x - 28 : node.x + cardWidth + 28,
       y: node.y + cardHeight / 2,
@@ -691,16 +1199,25 @@ export function DesignBoard({
     event: ReactPointerEvent<HTMLElement>,
   ) => {
     if (
+      airDragRef.current?.moved &&
+      connectingFrom?.kind === 'air' &&
+      NODE_CATALOG[node.kind].isPlayable &&
+      !(node.kind === 'group' && !node.collapsed)
+    ) {
+      event.stopPropagation();
+      completeAirTriggerToNode(node, connectingFrom.worldX, connectingFrom.worldY, true);
+      return;
+    }
+
+    if (
       portDragRef.current?.moved &&
-      connectingFrom &&
+      connectingFrom?.kind === 'node' &&
       connectingFrom.nodeId !== node.id &&
       NODE_CATALOG[node.kind].isPlayable
     ) {
       event.stopPropagation();
       onConnectNodes(connectingFrom.nodeId, node.id);
-      setConnectingFrom(null);
-      setConnectPointerWorld(null);
-      portDragRef.current = null;
+      exitConnectMode();
     }
   };
 
@@ -708,7 +1225,17 @@ export function DesignBoard({
     setAddMenuOpen(false);
     const selected = selectedNodeId ? nodeMap.get(selectedNodeId) : null;
     if (selected) {
-      onAddNodeAt(kind, Math.round(selected.x + 280), Math.round(selected.y));
+      if (selected.kind === 'group' && !selected.collapsed && kind !== 'group') {
+        const siblingCount = nodes.filter((n) => n.parentId === selected.id).length;
+        onAddNodeAt(
+          kind,
+          Math.round(selected.x + 24 + (siblingCount % 2) * 284),
+          Math.round(selected.y + GROUP_HEADER_HEIGHT + 24 + Math.floor(siblingCount / 2) * 156),
+        );
+        return;
+      }
+      const sDim = getNodeDimensions(selected);
+      onAddNodeAt(kind, Math.round(selected.x + sDim.width + 48), Math.round(selected.y));
       return;
     }
     const rect = containerRef.current?.getBoundingClientRect();
@@ -716,8 +1243,8 @@ export function DesignBoard({
       onAddNodeAt(kind, 180, 180);
       return;
     }
-    const cx = (rect.width / 2 - pan.x) / zoom - 122;
-    const cy = ((rect.height + 80) / 2 - pan.y) / zoom - 64;
+    const cx = (rect.width / 2 - pan.x) / zoom - (kind === 'group' ? 240 : 122);
+    const cy = ((rect.height + 80) / 2 - pan.y) / zoom - (kind === 'group' ? 140 : 64);
     const offset = nodes.length === 0 ? 0 : ((nodes.length % 4) - 1.5) * 32;
     onAddNodeAt(kind, Math.round(cx + offset), Math.round(cy + offset * 0.6));
   };
@@ -726,13 +1253,13 @@ export function DesignBoard({
     setEdgeContextMenu(null);
     setEditingNodeId(null);
     setExpandedNodeId(null);
+    setEditingGroupInfo(null);
     setEditingEdgeId(edge.id);
-    setEdgeConditionDraft(edge.condition ?? '');
   };
 
   const handleEdgeContextMenu = (
     edge: BoardEdge,
-    event: ReactMouseEvent<SVGElement | HTMLDivElement>,
+    event: ReactMouseEvent<SVGElement | HTMLDivElement | HTMLButtonElement>,
   ) => {
     event.preventDefault();
     event.stopPropagation();
@@ -747,12 +1274,8 @@ export function DesignBoard({
     setEdgeContextMenu({ edgeId: edge.id, x, y });
   };
 
-  const commitEdgeCondition = (edgeId: string) => {
-    onUpdateEdgeCondition(edgeId, edgeConditionDraft.trim());
-    setEditingEdgeId(null);
-  };
-
-  const connectingSourceNode = connectingFrom ? nodeMap.get(connectingFrom.nodeId) : null;
+  const connectingSourceNode =
+    connectingFrom?.kind === 'node' ? nodeMap.get(connectingFrom.nodeId) : null;
   const connectingSourceDim = connectingSourceNode
     ? getNodeDimensions(connectingSourceNode)
     : null;
@@ -764,15 +1287,51 @@ export function DesignBoard({
         : connectingSourceDim.width
       : 0;
 
+  const visibleNodesSorted = useMemo(() => {
+    const visible = nodes.filter((n) => !getCollapsedAncestorGroup(n.id, nodeMap));
+    return [...visible].sort((a, b) => {
+      const aIsGroup = a.kind === 'group' ? 0 : 1;
+      const bIsGroup = b.kind === 'group' ? 0 : 1;
+      if (aIsGroup !== bIsGroup) return aIsGroup - bIsGroup;
+      return getNodeDepth(a.id, nodeMap) - getNodeDepth(b.id, nodeMap);
+    });
+  }, [nodeMap, nodes]);
+
   const computedEdges = useMemo(() => {
     return edges
       .map((edge) => {
-        const from = nodeMap.get(edge.fromId);
-        const to = nodeMap.get(edge.toId);
-        if (!from || !to) return null;
+        const rawTo = nodeMap.get(edge.toId);
+        if (!rawTo) return null;
+
+        if (edge.fromId === null) {
+          // Hide internal standalone trigger arrow while owning Group is collapsed
+          if (getCollapsedAncestorGroup(rawTo.id, nodeMap)) return null;
+          const geom = getEntryEdgeGeometry(edge, rawTo, expandedNodeId);
+          return {
+            edge,
+            from: undefined as BoardNode | undefined,
+            to: rawTo,
+            isLoop: false,
+            isEntry: true,
+            ...geom,
+          };
+        }
+
+        const rawFrom = nodeMap.get(edge.fromId);
+        if (!rawFrom) return null;
+        const from = getCollapsedAncestorGroup(rawFrom.id, nodeMap) ?? rawFrom;
+        const to = getCollapsedAncestorGroup(rawTo.id, nodeMap) ?? rawTo;
+        if (from.id === to.id) return null;
         const isLoop = loopEdgeIds.has(edge.id);
         const geom = getEdgeGeometry(from, to, isLoop, expandedNodeId);
-        return { edge, from, to, isLoop, ...geom };
+        return {
+          edge,
+          from: from as BoardNode | undefined,
+          to,
+          isLoop,
+          isEntry: false,
+          ...geom,
+        };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
   }, [edges, expandedNodeId, loopEdgeIds, nodeMap]);
@@ -839,16 +1398,476 @@ export function DesignBoard({
     const dim = getNodeDimensions(node);
     const kindLabel = lang === 'zh' ? meta.labelZh : meta.labelEn;
     const placeholderText = lang === 'zh' ? meta.placeholderZh : meta.placeholderEn;
-    const isDraft = !meta.isPlayable;
+    const isGroup = node.kind === 'group';
+    const isDraft = node.kind === 'draft';
     const isSelected = selectedNodeId === node.id;
     const isPlaying = activePlaySet.has(node.id);
-    const isStageEditing = stageEditingCardIds.includes(node.id);
+    const depth = getNodeDepth(node.id, nodeMap);
+
+    if (isGroup) {
+      const descendants = getDescendantNodeIds(node.id, nodes);
+      const directChildren = nodes.filter((n) => n.parentId === node.id);
+      const subGroupCount = directChildren.filter((n) => n.kind === 'group').length;
+      const cardCount = directChildren.length - subGroupCount;
+      const hasPlayingChild =
+        isPlaying || descendants.some((dId) => activePlaySet.has(dId));
+      const hasSelectedChild =
+        Boolean(node.collapsed) &&
+        Boolean(selectedNodeId && descendants.includes(selectedNodeId));
+      const isEditingGroupTitle = editingNodeId === node.id;
+      const isDragging = draggingNodeId === node.id;
+      const isResizing = resizingGroupId === node.id;
+      const isDropTarget = dropTargetGroupId === node.id;
+      const isConnectSource = connectingFromId === node.id;
+      const isConnectCandidate = Boolean(
+        (isConnectMode && !connectingFrom) ||
+          (connectingFrom?.kind === 'node' && connectingFrom.nodeId !== node.id) ||
+          connectingFrom?.kind === 'air',
+      );
+      const groupCode = resolveGroupCode(node, nodes);
+      const hasGroupNote = Boolean(node.note.trim());
+      const summaryParts: string[] = [];
+      if (cardCount > 0) {
+        summaryParts.push(
+          lang === 'zh' ? `${cardCount} 张卡` : `${cardCount} card${cardCount > 1 ? 's' : ''}`,
+        );
+      }
+      if (subGroupCount > 0) {
+        summaryParts.push(
+          lang === 'zh'
+            ? `${subGroupCount} ${t.groupSubgroupsUnit}`
+            : `${subGroupCount} ${t.groupSubgroupsUnit}`,
+        );
+      }
+      if (summaryParts.length === 0) {
+        summaryParts.push(lang === 'zh' ? '0 项内容' : '0 items');
+      }
+
+      const groupBorder = isDropTarget
+        ? '#2563EB'
+        : hasPlayingChild
+          ? '#F59E0B'
+          : isSelected || hasSelectedChild
+            ? '#14244B'
+            : '#94A3B8';
+
+      return (
+        <div
+          key={node.id}
+          onPointerDown={(e) => handleNodePointerDown(node, e)}
+          onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
+          style={{
+            left: `${Math.round(node.x)}px`,
+            top: `${Math.round(node.y)}px`,
+            width: `${dim.width}px`,
+            height: `${dim.height}px`,
+            borderColor: groupBorder,
+            zIndex: node.collapsed
+              ? isDragging
+                ? 36
+                : 18 + depth
+              : isDragging || isResizing
+                ? 16
+                : 4 + depth,
+          }}
+          className={`pointer-events-auto absolute rounded-2xl border transition-shadow duration-150 flex flex-col ${
+            node.collapsed
+              ? 'bg-white border-2 shadow-[0_8px_22px_rgba(20,36,75,0.09)]'
+              : 'bg-[#F1F5F9]/75 backdrop-blur-[1px] border-[1.5px] shadow-[0_6px_22px_rgba(15,23,42,0.05)]'
+          } ${
+            isDropTarget
+              ? 'ring-4 ring-[#4E9AE3]/35 bg-[#EFF6FF]/75'
+              : highlightedNodeId === node.id
+                ? 'ring-4 ring-[#4E9AE3]/80'
+                : hasPlayingChild
+                  ? 'ring-3 ring-[#FBC53D]/65'
+                  : isConnectCandidate
+                    ? 'hover:ring-2 hover:ring-[#4E9AE3] cursor-crosshair'
+                    : isDragging
+                      ? 'cursor-grabbing shadow-[0_20px_40px_rgba(20,36,75,0.16)]'
+                      : 'cursor-grab'
+          }`}
+        >
+          {/* Group Header Bar */}
+          <div className="px-3 h-10 border-b border-[#CBD5E1]/80 bg-white/95 flex items-center justify-between gap-2 shrink-0 rounded-t-[14px]">
+            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+              <Layers className="w-3.5 h-3.5 text-[#475569] shrink-0" aria-hidden="true" />
+              <span className="px-1.5 py-0.5 rounded bg-[#14244B] text-white font-mono text-[10px] font-bold tracking-tight shrink-0">
+                {groupCode}
+              </span>
+              {isEditingGroupTitle ? (
+                <input
+                  type="text"
+                  autoFocus
+                  value={node.title}
+                  placeholder={t.groupNamePlaceholder}
+                  onChange={(e) => onUpdateNode(node.id, { title: e.target.value })}
+                  onBlur={() => setEditingNodeId(null)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.stopPropagation();
+                      setEditingNodeId(null);
+                    }
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="min-w-0 flex-1 text-xs font-bold text-[#14244B] bg-[#F8FAFC] border border-[#CBD5E1] rounded px-1.5 py-0.5 focus:outline-none focus:border-[#14244B]"
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSelectNode(node.id);
+                    setEditingNodeId(node.id);
+                  }}
+                  className="min-w-0 flex items-center gap-1.5 text-left group/title cursor-text"
+                >
+                  <span className="font-display text-xs font-bold text-[#14244B] truncate">
+                    {node.title.trim() || t.groupUntitled}
+                  </span>
+                  <Pencil
+                    className="w-2.5 h-2.5 text-[#94A3B8] opacity-0 group-hover/title:opacity-100 shrink-0 transition-opacity"
+                    aria-hidden="true"
+                  />
+                </button>
+              )}
+
+              {!node.collapsed && (
+                <span className="text-[10.5px] text-[#64748B] font-mono tabular-nums whitespace-nowrap shrink-0">
+                  · {summaryParts.join(' · ')}
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-0.5 shrink-0">
+              {hasPlayingChild && (
+                <span className="text-[10px] font-bold text-[#B45309] mr-1 whitespace-nowrap">
+                  · {t.playingNow}
+                </span>
+              )}
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditingEdgeId(null);
+                  setEdgeContextMenu(null);
+                  setEditingGroupInfo({ id: node.id, focusField: 'note' });
+                  onSelectNode(node.id);
+                }}
+                title={t.groupDescEditTitle}
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10.5px] font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                  hasGroupNote
+                    ? 'bg-[#EFF6FF] text-[#0369A1] hover:bg-[#DBEAFE]'
+                    : 'text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9]'
+                }`}
+              >
+                <FileText className="w-3 h-3 shrink-0" aria-hidden="true" />
+                <span>{t.groupDescLabel}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDuplicateNode(node.id);
+                }}
+                title={t.groupDuplicate}
+                aria-label={t.groupDuplicate}
+                className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <Copy className="w-3 h-3" aria-hidden="true" />
+              </button>
+              <button type="button" aria-pressed={Boolean(node.stageTemplate)}
+                title={lang === 'zh' ? '可复用舞台玩法' : 'Reusable stage mechanism'}
+                onPointerDown={event => event.stopPropagation()}
+                onClick={event => { event.stopPropagation(); onToggleStageTemplate(node.id); }}
+                className="px-1.5 py-0.5 rounded border border-slate-300 text-[10px] aria-pressed:bg-slate-200">
+                {lang === 'zh' ? '舞台模板' : 'Stage template'}
+              </button>
+              <button type="button" aria-pressed={Boolean(node.stageResetOnEntry)}
+                title={lang === 'zh' ? '进入场景时重置分数、生命和属性' : 'Reset score, HP, and properties on scene entry'}
+                onPointerDown={event => event.stopPropagation()}
+                onClick={event => { event.stopPropagation(); onToggleStageReset(node.id); }}
+                className="px-1.5 py-0.5 rounded border border-slate-300 text-[10px] aria-pressed:bg-slate-200">
+                {lang === 'zh' ? '入场重置' : 'Reset on entry'}
+              </button>
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleGroupCollapse(node.id);
+                  onSelectNode(node.id);
+                }}
+                title={node.collapsed ? t.groupExpand : t.groupCollapse}
+                aria-label={node.collapsed ? t.groupExpand : t.groupCollapse}
+                className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
+              >
+                {node.collapsed ? (
+                  <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+              </button>
+
+              {directChildren.length > 0 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (editingGroupInfo?.id === node.id) setEditingGroupInfo(null);
+                    onUngroup(node.id);
+                  }}
+                  title={t.groupUngroup}
+                  aria-label={t.groupUngroup}
+                  className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Ungroup className="w-3 h-3" aria-hidden="true" />
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (editingGroupInfo?.id === node.id) setEditingGroupInfo(null);
+                  onDeleteNode(node.id);
+                }}
+                title={t.deleteCard}
+                aria-label={t.deleteCard}
+                className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#DC2626] hover:bg-[#FEF2F2] flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-3 h-3" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+
+          {/* Core Idea Strip (when expanded & documented) */}
+          {!node.collapsed && hasGroupNote && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditingEdgeId(null);
+                setEditingGroupInfo({ id: node.id, focusField: 'note' });
+              }}
+              title={t.groupDescEditTitle}
+              className="px-3 py-1.5 border-b border-[#E2E8F0]/80 bg-[#F8FAFC]/90 text-left flex items-center gap-1.5 text-[11px] text-[#334155] hover:bg-[#EFF6FF] transition-colors cursor-pointer shrink-0"
+            >
+              <FileText className="w-3 h-3 shrink-0 text-[#0369A1]" aria-hidden="true" />
+              <span className="truncate">{node.note}</span>
+            </button>
+          )}
+
+          {/* Collapsed Body OR Expanded Container Drop Zone */}
+          {node.collapsed ? (
+            <div className="px-3 flex-1 flex flex-col justify-center gap-0.5 text-[11px] text-[#64748B] rounded-b-[14px]">
+              {hasGroupNote && (
+                <div className="text-[10.5px] text-[#475569] truncate">
+                  {node.note}
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-mono tabular-nums truncate">
+                  {summaryParts.join(' · ')}
+                </span>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToggleGroupCollapse(node.id);
+                  }}
+                  className="text-[11px] font-semibold text-[#14244B] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {t.groupExpand}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="relative flex-1 min-h-0">
+              {directChildren.length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center px-6 pointer-events-none">
+                  <span className="text-xs text-[#94A3B8] text-center">
+                    {t.groupEmptyDropHint}
+                  </span>
+                </div>
+              )}
+
+              {isResizing && (
+                <div className="absolute bottom-2.5 right-8 px-1.5 py-0.5 rounded bg-[#14244B]/85 text-white font-mono text-[10px] tabular-nums pointer-events-none">
+                  {dim.width} × {dim.height}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 8-Direction Resize Handles on Expanded Group Container */}
+          {!node.collapsed && (() => {
+            const startResize = (
+              dir: 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw',
+              e: ReactPointerEvent<HTMLElement>,
+            ) => {
+              e.stopPropagation();
+              e.preventDefault();
+              setAddMenuOpen(false);
+              setEditingEdgeId(null);
+              setEdgeContextMenu(null);
+              onSelectNode(node.id);
+              setResizingGroupId(node.id);
+              groupResizeRef.current = {
+                id: node.id,
+                dir,
+                startClientX: e.clientX,
+                startClientY: e.clientY,
+                startX: node.x,
+                startY: node.y,
+                startW: dim.width,
+                startH: dim.height,
+              };
+            };
+
+            return (
+              <>
+                <div
+                  data-resize-handle="true"
+                  role="separator"
+                  aria-label={`${t.groupResizeAria} (top)`}
+                  onPointerDown={(e) => startResize('n', e)}
+                  className="absolute -top-1 inset-x-4 h-2.5 cursor-ns-resize z-20"
+                />
+                <div
+                  data-resize-handle="true"
+                  role="separator"
+                  aria-label={`${t.groupResizeAria} (bottom)`}
+                  onPointerDown={(e) => startResize('s', e)}
+                  className="absolute -bottom-1 inset-x-4 h-2.5 cursor-ns-resize z-20"
+                />
+                <div
+                  data-resize-handle="true"
+                  role="separator"
+                  aria-label={`${t.groupResizeAria} (left)`}
+                  onPointerDown={(e) => startResize('w', e)}
+                  className="absolute -left-1 inset-y-4 w-2.5 cursor-ew-resize z-20"
+                />
+                <div
+                  data-resize-handle="true"
+                  role="separator"
+                  aria-label={`${t.groupResizeAria} (right)`}
+                  onPointerDown={(e) => startResize('e', e)}
+                  className="absolute -right-1 inset-y-4 w-2.5 cursor-ew-resize z-20"
+                />
+                <div
+                  data-resize-handle="true"
+                  onPointerDown={(e) => startResize('nw', e)}
+                  className="absolute -top-1.5 -left-1.5 w-4 h-4 cursor-nwse-resize z-25"
+                />
+                <div
+                  data-resize-handle="true"
+                  onPointerDown={(e) => startResize('ne', e)}
+                  className="absolute -top-1.5 -right-1.5 w-4 h-4 cursor-nesw-resize z-25"
+                />
+                <div
+                  data-resize-handle="true"
+                  onPointerDown={(e) => startResize('sw', e)}
+                  className="absolute -bottom-1.5 -left-1.5 w-4 h-4 cursor-nesw-resize z-25"
+                />
+                <div
+                  data-resize-handle="true"
+                  role="separator"
+                  title={t.groupResizeAria}
+                  aria-label={t.groupResizeAria}
+                  onPointerDown={(e) => startResize('se', e)}
+                  className={`absolute -bottom-1 -right-1 w-7 h-7 cursor-nwse-resize z-30 flex items-end justify-end p-1.5 rounded-br-2xl transition-colors ${
+                    isResizing
+                      ? 'text-[#14244B] bg-[#E2E8F0]/80'
+                      : 'text-[#64748B] hover:text-[#14244B] hover:bg-[#E2E8F0]/55'
+                  }`}
+                >
+                  <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+                    <path
+                      d="M10 1L1 10M10 5.5L5.5 10"
+                      stroke="currentColor"
+                      strokeWidth="1.7"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </div>
+              </>
+            );
+          })()}
+
+          {/* Left & Right Connector Ports on Group Container */}
+          <>
+            <button
+              type="button"
+              title={t.connectPort}
+              aria-label={`${t.connectPort} (Left)`}
+              onPointerDown={(e) =>
+                handlePortPointerDown(node, 'left', dim.width, dim.height, e)
+              }
+              onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
+              onClick={(e) => e.stopPropagation()}
+              className={`absolute -left-2.5 top-1/2 -translate-y-1/2 w-5 h-5 z-30 rounded-full border-2 flex items-center justify-center transition-transform cursor-pointer ${
+                isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'left'
+                  ? 'bg-[#14244B] border-white scale-115 shadow-xs'
+                  : isConnectCandidate
+                    ? 'bg-white border-[#2563EB] ring-2 ring-[#4E9AE3]/35 hover:scale-115'
+                    : 'bg-white border-[#64748B] hover:border-[#14244B] hover:scale-115'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'left'
+                    ? 'bg-white'
+                    : isConnectCandidate
+                      ? 'bg-[#2563EB]'
+                      : 'bg-[#64748B]'
+                }`}
+              />
+            </button>
+
+            <button
+              type="button"
+              title={t.connectPort}
+              aria-label={`${t.connectPort} (Right)`}
+              onPointerDown={(e) =>
+                handlePortPointerDown(node, 'right', dim.width, dim.height, e)
+              }
+              onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
+              onClick={(e) => e.stopPropagation()}
+              className={`absolute -right-2.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-transform cursor-pointer ${
+                isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'right'
+                  ? 'bg-[#14244B] border-white scale-115 shadow-xs'
+                  : isConnectCandidate
+                    ? 'bg-white border-[#2563EB] ring-2 ring-[#4E9AE3]/35 hover:scale-115'
+                    : 'bg-white border-[#64748B] hover:border-[#14244B] hover:scale-115'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'right'
+                    ? 'bg-white'
+                    : isConnectCandidate
+                      ? 'bg-[#2563EB]'
+                      : 'bg-[#64748B]'
+                }`}
+              />
+            </button>
+          </>
+        </div>
+      );
+    }
+
     const isEditingDraft = isDraft && editingNodeId === node.id;
     const isExpanded = meta.isPlayable && expandedNodeId === node.id;
     const isDragging = draggingNodeId === node.id;
     const isConnectSource = connectingFromId === node.id;
     const isConnectCandidate = Boolean(
-      connectingFromId && connectingFromId !== node.id && meta.isPlayable,
+      meta.isPlayable &&
+        ((isConnectMode && !connectingFrom) ||
+          (connectingFrom?.kind === 'node' && connectingFrom.nodeId !== node.id) ||
+          connectingFrom?.kind === 'air'),
     );
 
     const cardWidth = isExpanded ? CARD_EXPANDED_WIDTH : dim.width;
@@ -901,8 +1920,6 @@ export function DesignBoard({
           minHeight: `${dim.height}px`,
           backgroundColor: meta.surfaceBg,
           borderColor: activeBorderColor,
-          outline: isStageEditing ? '2px solid #0F766E' : undefined,
-          outlineOffset: isStageEditing ? 3 : undefined,
         }}
         className={`pointer-events-auto absolute ${meta.shapeClass} ${
           isDraft ? 'border border-dashed' : 'border-2'
@@ -941,9 +1958,12 @@ export function DesignBoard({
           </div>
 
           <div className="flex items-center gap-0.5 shrink-0">
-            {isStageEditing && <span className="mr-1 whitespace-nowrap rounded bg-teal-100 px-1 text-[10px] font-bold text-teal-900">
-              {lang === 'zh' ? '正在改画面' : 'Editing stage visual'}
-            </span>}
+            {!!placementCounts[node.id] && <button type="button"
+              className="px-1.5 py-0.5 text-[10px] text-[#2563EB] underline"
+              onPointerDown={event => event.stopPropagation()}
+              onClick={event => { event.stopPropagation(); onLocateStage(node.id); }}>
+              {placementCounts[node.id]} {lang === 'zh' ? '个实例' : 'instances'}
+            </button>}
             {isPlaying && (
               <span className="text-[10px] font-bold text-[#B45309] mr-1 whitespace-nowrap">
                 · {t.playingNow}
@@ -1183,7 +2203,7 @@ export function DesignBoard({
               onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
               onClick={(e) => e.stopPropagation()}
               className={`absolute -left-2.5 top-[68px] -translate-y-1/2 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-transform cursor-pointer ${
-                isConnectSource && connectingFrom?.side === 'left'
+                isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'left'
                   ? 'bg-[#14244B] border-white scale-115 shadow-xs'
                   : isConnectCandidate
                     ? 'bg-white border-[#2563EB] ring-2 ring-[#4E9AE3]/35 hover:scale-115'
@@ -1192,7 +2212,7 @@ export function DesignBoard({
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
-                  isConnectSource && connectingFrom?.side === 'left'
+                  isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'left'
                     ? 'bg-white'
                     : isConnectCandidate
                       ? 'bg-[#2563EB]'
@@ -1211,7 +2231,7 @@ export function DesignBoard({
               onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
               onClick={(e) => e.stopPropagation()}
               className={`absolute -right-2.5 top-[68px] -translate-y-1/2 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-transform cursor-pointer ${
-                isConnectSource && connectingFrom?.side === 'right'
+                isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'right'
                   ? 'bg-[#14244B] border-white scale-115 shadow-xs'
                   : isConnectCandidate
                     ? 'bg-white border-[#2563EB] ring-2 ring-[#4E9AE3]/35 hover:scale-115'
@@ -1220,7 +2240,7 @@ export function DesignBoard({
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
-                  isConnectSource && connectingFrom?.side === 'right'
+                  isConnectSource && connectingFrom?.kind === 'node' && connectingFrom.side === 'right'
                     ? 'bg-white'
                     : isConnectCandidate
                       ? 'bg-[#2563EB]'
@@ -1244,10 +2264,19 @@ export function DesignBoard({
       onPointerDown={handleCanvasPointerDown}
       onPointerMove={handleCanvasPointerMove}
       onPointerUp={handleCanvasPointerUp}
-      onPointerLeave={handleCanvasPointerUp}
+      onPointerLeave={() => {
+        if (!groupResizeRef.current && !nodeDragRef.current && !entryTailDragRef.current) {
+          handleCanvasPointerUp();
+        }
+      }}
       onContextMenu={(e) => {
         if (e.target === e.currentTarget) {
           setEdgeContextMenu(null);
+        }
+      }}
+      onScroll={(e) => {
+        if (e.currentTarget.scrollTop !== 0 || e.currentTarget.scrollLeft !== 0) {
+          e.currentTarget.scrollTo(0, 0);
         }
       }}
       style={{
@@ -1256,8 +2285,8 @@ export function DesignBoard({
         backgroundSize: `${gridSpacing}px ${gridSpacing}px`,
         backgroundPosition: `${pan.x}px ${pan.y}px`,
       }}
-      className={`relative flex-1 min-h-0 overflow-hidden select-none ${
-        connectingFromId
+      className={`relative flex-1 min-h-0 overflow-clip select-none ${
+        isConnectingActive
           ? 'cursor-crosshair'
           : isPanning
             ? 'cursor-grabbing'
@@ -1287,16 +2316,12 @@ export function DesignBoard({
       )}
 
       {/* Active Connect Mode Banner */}
-      {connectingFromId && (
-        <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-30 bg-[#14244B] text-white text-xs font-medium px-4 py-2 rounded-xl shadow-md flex items-center gap-2.5 whitespace-nowrap">
-          <span>{t.connectingHint}</span>
+      {isConnectingActive && (
+        <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-40 bg-[#14244B] text-white text-xs font-medium px-4 py-2 rounded-xl shadow-md flex items-center gap-2.5 whitespace-nowrap">
+          <span>{connectingFrom ? t.connectingHint : t.connectPickSourceHint}</span>
           <button
             type="button"
-            onClick={() => {
-              setConnectingFrom(null);
-              setConnectPointerWorld(null);
-              portDragRef.current = null;
-            }}
+            onClick={exitConnectMode}
             aria-label={t.cancelConnect}
             className="text-white/75 hover:text-white cursor-pointer"
           >
@@ -1305,13 +2330,13 @@ export function DesignBoard({
         </div>
       )}
 
-      {/* World Transform Layer */}
+      {/* World Transform Layer (isolated z-10 stacking context so stickers never cover fixed toolbars) */}
       <div
         style={{
           transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
           transformOrigin: '0 0',
         }}
-        className="absolute top-0 left-0 w-0 h-0 pointer-events-none"
+        className="absolute top-0 left-0 w-0 h-0 z-10 pointer-events-none"
       >
         {/* SVG Relationship Arrows Layer */}
         <svg
@@ -1356,13 +2381,16 @@ export function DesignBoard({
             </marker>
           </defs>
 
-          {computedEdges.map(({ edge, path, isLoop }) => {
+          {computedEdges.map(({ edge, to, path, isLoop, isEntry, startX, startY }) => {
             const isActive = activePlayEdgeId === edge.id;
             const isLocated = highlightedEdgeId === edge.id;
             const isHovered =
               hoveredEdgeId === edge.id ||
               editingEdgeId === edge.id ||
               edgeContextMenu?.edgeId === edge.id;
+            const hasCond = Boolean(
+              edge.condition?.trim() || edge.conditionGroup?.clauses.length,
+            );
 
             const strokeColor = isActive
               ? '#F59E0B'
@@ -1372,7 +2400,9 @@ export function DesignBoard({
                   ? '#14244B'
                   : isLoop
                     ? '#0D9488'
-                    : '#64748B';
+                    : isEntry && hasCond
+                      ? '#0284C7'
+                      : '#64748B';
 
             const marker = isActive
               ? 'url(#board-arrow-active)'
@@ -1387,8 +2417,18 @@ export function DesignBoard({
                 onMouseLeave={() =>
                   setHoveredEdgeId((prev) => (prev === edge.id ? null : prev))
                 }
+                onPointerDown={(e) => {
+                  if (!isConnectingActive && e.button === 0) {
+                    e.stopPropagation();
+                  }
+                }}
+                onClick={(e) => {
+                  if (isConnectingActive) return;
+                  e.stopPropagation();
+                  openEdgeConditionEditor(edge);
+                }}
                 onContextMenu={(e) => handleEdgeContextMenu(edge, e)}
-                className="pointer-events-auto cursor-context-menu"
+                className={`pointer-events-auto ${isConnectingActive ? '' : 'cursor-pointer'}`}
               >
                 <path d={path} fill="none" stroke="transparent" strokeWidth="20" />
                 <path
@@ -1399,36 +2439,112 @@ export function DesignBoard({
                   strokeDasharray={isLoop ? '6 4' : undefined}
                   markerEnd={marker}
                 />
+                {isEntry && startX !== undefined && startY !== undefined && (
+                  <g
+                    role="button"
+                    aria-label={t.entryArrowOriginAria}
+                    onPointerDown={(e) => {
+                      if (isConnectingActive || e.button !== 0) return;
+                      e.stopPropagation();
+                      setDraggingEntryEdgeId(edge.id);
+                      entryTailDragRef.current = {
+                        edgeId: edge.id,
+                        toX: to.x,
+                        toY: to.y,
+                      };
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    className="cursor-grab active:cursor-grabbing"
+                  >
+                    <circle cx={startX} cy={startY} r="12" fill="transparent" />
+                    <circle
+                      cx={startX}
+                      cy={startY}
+                      r="7.5"
+                      fill="#FFFFFF"
+                      stroke={strokeColor}
+                      strokeWidth="2.2"
+                    />
+                    <circle
+                      cx={startX}
+                      cy={startY}
+                      r="3.5"
+                      fill={
+                        isActive
+                          ? '#F59E0B'
+                          : isLocated
+                            ? '#2563EB'
+                            : hasCond
+                              ? '#0284C7'
+                              : '#64748B'
+                      }
+                    />
+                  </g>
+                )}
               </g>
             );
           })}
 
-          {connectingSourceNode && connectingSourceDim && connectingFrom && connectPointerWorld && (
-            <path
-              d={`M ${
-                connectingFrom.side === 'left'
-                  ? connectingSourceNode.x
-                  : connectingSourceNode.x + connectingSourceWidth
-              } ${connectingSourceNode.y + connectingSourceDim.height / 2} L ${connectPointerWorld.x} ${connectPointerWorld.y}`}
-              fill="none"
-              stroke="#2563EB"
-              strokeWidth="2.2"
-              strokeDasharray="6 5"
-              markerEnd="url(#board-arrow)"
-            />
+          {connectingFrom?.kind === 'node' &&
+            connectingSourceNode &&
+            connectingSourceDim &&
+            connectPointerWorld && (
+              <path
+                d={`M ${
+                  connectingFrom.side === 'left'
+                    ? connectingSourceNode.x
+                    : connectingSourceNode.x + connectingSourceWidth
+                } ${connectingSourceNode.y + connectingSourceDim.height / 2} L ${connectPointerWorld.x} ${connectPointerWorld.y}`}
+                fill="none"
+                stroke="#2563EB"
+                strokeWidth="2.2"
+                strokeDasharray="6 5"
+                markerEnd="url(#board-arrow)"
+              />
+            )}
+
+          {connectingFrom?.kind === 'air' && connectPointerWorld && (
+            <g>
+              <path
+                d={`M ${connectingFrom.worldX} ${connectingFrom.worldY} L ${connectPointerWorld.x} ${connectPointerWorld.y}`}
+                fill="none"
+                stroke="#2563EB"
+                strokeWidth="2.2"
+                strokeDasharray="6 5"
+                markerEnd="url(#board-arrow)"
+              />
+              <circle
+                cx={connectingFrom.worldX}
+                cy={connectingFrom.worldY}
+                r="7.5"
+                fill="#FFFFFF"
+                stroke="#2563EB"
+                strokeWidth="2.2"
+              />
+              <circle
+                cx={connectingFrom.worldX}
+                cy={connectingFrom.worldY}
+                r="3.5"
+                fill="#2563EB"
+              />
+            </g>
           )}
         </svg>
 
-        {/* Render Experience Cards & Draft Stickies */}
-        {nodes.map(renderCard)}
+        {/* Render Groups, Experience Cards & Draft Stickies */}
+        {visibleNodesSorted.map(renderCard)}
 
-        {/* Condition Mini-Cards ONLY when attached or currently being edited */}
-        {computedEdges.map(({ edge, midX, midY, isLoop }) => {
+        {/* Condition Mini-Cards on Arrow Midpoints */}
+        {computedEdges.map(({ edge, midX, midY, isLoop, isEntry }) => {
           const isEditing = editingEdgeId === edge.id;
           const isActive = activePlayEdgeId === edge.id;
-          const hasCondition = Boolean(edge.condition?.trim());
+          const hasCondition = Boolean(
+            edge.condition?.trim() || edge.conditionGroup?.clauses.length,
+          );
 
-          if (!isEditing && !hasCondition) return null;
+          if (!hasCondition && !isEntry) return null;
+
+          const firstKind = edge.conditionGroup?.clauses[0]?.kind;
 
           return (
             <div
@@ -1444,131 +2560,124 @@ export function DesignBoard({
               onPointerDown={(e) => e.stopPropagation()}
               onContextMenu={(e) => handleEdgeContextMenu(edge, e)}
               className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 ${
-                isEditing ? 'z-50' : 'z-35'
+                isEditing ? 'z-40' : 'z-35'
               }`}
             >
-              {isEditing ? (
-                <div className="bg-white rounded-xl border-2 border-[#14244B] shadow-[0_12px_28px_rgba(20,36,75,0.22)] p-2 space-y-1.5">
-                  <div className="flex items-center gap-1 whitespace-nowrap">
-                    <span className="text-[10px] font-mono font-bold text-[#0369A1] pl-1">
-                      if
-                    </span>
-                    <input
-                      type="text"
-                      autoFocus
-                      value={edgeConditionDraft}
-                      placeholder={t.editConditionPlaceholder}
-                      onChange={(e) => setEdgeConditionDraft(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          commitEdgeCondition(edge.id);
-                        } else if (e.key === 'Escape') {
-                          setEditingEdgeId(null);
-                        }
-                      }}
-                      className="w-40 text-xs text-[#14244B] bg-[#F8FAFC] border border-[#CBD5E1] rounded-md px-2 py-1 focus:outline-none focus:border-[#14244B]"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => commitEdgeCondition(edge.id)}
-                      title={t.saveCondition}
-                      aria-label={t.saveCondition}
-                      className="w-6 h-6 rounded-md bg-[#14244B] hover:bg-[#1E3468] text-white flex items-center justify-center cursor-pointer"
-                    >
-                      <Check className="w-3.5 h-3.5" aria-hidden="true" />
-                    </button>
-                    {hasCondition && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onUpdateEdgeCondition(edge.id, '');
-                          setEditingEdgeId(null);
-                        }}
-                        title={t.clearCondition}
-                        aria-label={t.clearCondition}
-                        className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center cursor-pointer"
-                      >
-                        <X className="w-3.5 h-3.5" aria-hidden="true" />
-                      </button>
-                    )}
-                  </div>
-                  {scopedVariables.length > 0 && (
-                    <div className="pt-1 border-t border-[#F1F5F9] space-y-1 max-w-[260px]">
-                      <div className="text-[10px] font-semibold text-[#64748B]">
-                        {st.pickVarHint}
-                      </div>
-                      <div className="flex items-center gap-1 flex-wrap">
-                        {scopedVariables.slice(0, 6).map((entry) => {
-                          const expr = defaultConditionForVariable(entry);
-                          return (
-                            <button
-                              key={entry.variable.id}
-                              type="button"
-                              onClick={() => setEdgeConditionDraft(expr)}
-                              className="px-1.5 py-0.5 rounded bg-[#F0F9FF] hover:bg-[#E0F2FE] border border-[#BAE6FD] text-[10px] font-mono font-semibold text-[#0369A1] transition-colors cursor-pointer whitespace-nowrap"
-                            >
-                              {expr}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="flex items-center gap-1 flex-wrap">
-                    {(lang === 'zh'
-                      ? ['当血量 > 2', '分数 >= 2', '拿到钥匙时']
-                      : ['HP > 2', 'Score >= 2', 'Has key']
-                    ).map((preset) => (
-                      <button
-                        key={preset}
-                        type="button"
-                        onClick={() => {
-                          onUpdateEdgeCondition(edge.id, preset);
-                          setEditingEdgeId(null);
-                        }}
-                        className="px-1.5 py-0.5 rounded bg-[#F1F5F9] hover:bg-[#E0F2FE] text-[10px] font-medium text-[#334155] hover:text-[#0369A1] transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        {preset}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => openEdgeConditionEditor(edge)}
-                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white border text-[11px] font-semibold shadow-xs transition-all whitespace-nowrap cursor-pointer ${
-                    isActive
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openEdgeConditionEditor(edge);
+                }}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white border text-[11px] font-semibold shadow-xs transition-all whitespace-nowrap cursor-pointer ${
+                  isEditing
+                    ? 'border-[#0284C7] ring-2 ring-[#7DD3FC]/80 text-[#14244B]'
+                    : isActive
                       ? 'border-[#F59E0B] ring-2 ring-[#FBC53D]/60 text-[#14244B]'
                       : highlightedEdgeId === edge.id
                         ? 'border-[#2563EB] ring-2 ring-[#4E9AE3]/60 text-[#14244B]'
-                        : isLoop
-                          ? 'border-[#0D9488]/60 text-[#14244B] hover:border-[#14244B]'
-                          : 'border-[#CBD5E1] text-[#14244B] hover:border-[#14244B]'
-                  }`}
-                >
-                  {isLoop && (
-                    <RotateCcw
-                      className="w-3 h-3 text-[#0D9488] shrink-0"
-                      aria-hidden="true"
-                    />
-                  )}
+                        : !hasCondition && isEntry
+                          ? 'border-dashed border-[#94A3B8] text-[#64748B] hover:border-[#0284C7] hover:text-[#0369A1]'
+                          : isLoop
+                            ? 'border-[#0D9488]/60 text-[#14244B] hover:border-[#14244B]'
+                            : 'border-[#CBD5E1] text-[#14244B] hover:border-[#14244B]'
+                }`}
+              >
+                {isLoop && (
+                  <RotateCcw
+                    className="w-3 h-3 text-[#0D9488] shrink-0"
+                    aria-hidden="true"
+                  />
+                )}
+                {firstKind === 'event' ? (
+                  <Zap className="w-3 h-3 text-[#0284C7] shrink-0" aria-hidden="true" />
+                ) : firstKind === 'property' ? (
+                  <SlidersHorizontal
+                    className="w-3 h-3 text-[#047857] shrink-0"
+                    aria-hidden="true"
+                  />
+                ) : hasCondition ? (
                   <span className="font-mono text-[10px] font-bold text-[#0369A1]">
                     if
                   </span>
-                  <span className="max-w-[140px] truncate">{edge.condition}</span>
-                </button>
-              )}
+                ) : (
+                  <Zap className="w-3 h-3 text-[#64748B] shrink-0" aria-hidden="true" />
+                )}
+                <span className="max-w-[190px] truncate">
+                  {hasCondition ? edge.condition : t.entryArrowEmptyLabel}
+                </span>
+              </button>
             </div>
           );
         })}
       </div>
 
+      {/* Screen-Space Structured Arrow Condition Builder Popover (Edge OR Group Available When) */}
+      {(() => {
+        if (editingEdgeId) {
+          const targetComputed = computedEdges.find((item) => item.edge.id === editingEdgeId);
+          if (!targetComputed) return null;
+          const anchorX = targetComputed.midX * zoom + pan.x;
+          const anchorY = targetComputed.midY * zoom + pan.y;
+
+          return (
+            <ArrowConditionBuilder
+              key={targetComputed.edge.id}
+              lang={lang}
+              edge={targetComputed.edge}
+              fromNode={targetComputed.from ?? targetComputed.to}
+              nodes={nodes}
+              assetItems={assetItems}
+              scopedVariables={scopedVariables}
+              numericParameters={numericBoardParameters}
+              anchorX={anchorX}
+              anchorY={anchorY}
+              containerWidth={boardSize.width}
+              containerHeight={boardSize.height}
+              onSave={(summary, conditionGroup) => {
+                onUpdateEdgeCondition(targetComputed.edge.id, summary, conditionGroup);
+                setEditingEdgeId(null);
+              }}
+              onClear={() => {
+                onUpdateEdgeCondition(targetComputed.edge.id, '', undefined);
+                setEditingEdgeId(null);
+              }}
+              onClose={() => setEditingEdgeId(null)}
+            />
+          );
+        }
+
+        return null;
+      })()}
+
+      {/* Group Design Notes Window (shown after Add Group or when editing Group notes) */}
+      {editingGroupInfo && (() => {
+        const groupNode = nodeMap.get(editingGroupInfo.id);
+        if (!groupNode || groupNode.kind !== 'group') return null;
+        return (
+          <GroupInfoModal
+            key={groupNode.id}
+            lang={lang}
+            groupCode={resolveGroupCode(groupNode, nodes)}
+            initialTitle={groupNode.title}
+            initialNote={groupNode.note}
+            focusField={editingGroupInfo.focusField}
+            onSave={(title, note) => {
+              onUpdateNode(groupNode.id, { title, note });
+              setEditingGroupInfo(null);
+            }}
+            onClose={() => setEditingGroupInfo(null)}
+          />
+        );
+      })()}
+
       {/* Screen-Space Right-Click Arrow Context Menu */}
       {edgeContextMenu && contextMenuEdge && (
         <div
-          style={{ left: `${edgeContextMenu.x}px`, top: `${edgeContextMenu.y}px` }}
+          style={{
+            left: `${Math.max(12, Math.min(Math.max(12, boardSize.width - 204), edgeContextMenu.x))}px`,
+            top: `${Math.max(12, Math.min(Math.max(12, boardSize.height - 132), edgeContextMenu.y))}px`,
+          }}
           onPointerDown={(e) => e.stopPropagation()}
           onContextMenu={(e) => e.preventDefault()}
           className="absolute z-50 w-48 bg-white rounded-xl border border-[#CBD5E1] shadow-[0_14px_34px_rgba(20,36,75,0.2)] p-1.5 space-y-0.5"
@@ -1611,6 +2720,21 @@ export function DesignBoard({
         </div>
       )}
 
+      {/* Centralized Groups Directory Panel */}
+      {groupDirectoryOpen && (
+        <GroupDirectoryPanel
+          lang={lang}
+          nodes={nodes}
+          edges={edges}
+          onClose={() => setGroupDirectoryOpen(false)}
+          onAddGroup={() => handleAddKindInViewport('group')}
+          onUpdateGroupInfo={(id, title, note) => onUpdateNode(id, { title, note })}
+          onToggleGroupCollapse={onToggleGroupCollapse}
+          onLocateGroup={(id) => onLocateBoardReference({ nodeId: id })}
+          onDeleteGroup={onDeleteNode}
+        />
+      )}
+
       {/* Floating Categorized Properties Panel (scoped strictly over Design Board so right Play stays visible!) */}
       {stateManagerOpen && (
         <StateManagerPanel
@@ -1635,7 +2759,7 @@ export function DesignBoard({
       )}
 
       {/* Responsive Bottom Board Toolbars (never overlap or clip on narrower viewports) */}
-      <div className="pointer-events-none absolute inset-x-3 bottom-3 z-30 flex flex-wrap items-end justify-between gap-2">
+      <div className="pointer-events-none absolute inset-x-3 bottom-3 z-40 flex flex-wrap items-end justify-between gap-2">
         {/* Left: Board Authoring Toolbelt */}
         <div className="relative pointer-events-auto max-w-full">
           {addMenuOpen && (
@@ -1767,37 +2891,64 @@ export function DesignBoard({
 
             <button
               type="button"
-              disabled={nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable).length < 2}
+              onClick={() => handleAddKindInViewport('group')}
+              title={lang === 'zh' ? NODE_CATALOG.group.shortHintZh : NODE_CATALOG.group.shortHintEn}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#F1F5F9] hover:bg-[#E2E8F0] text-[#14244B] border border-[#CBD5E1] text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
+            >
+              <Layers className="w-3.5 h-3.5 text-[#334155]" aria-hidden="true" />
+              <span>{t.addGroupBtn}</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => {
                 setAddMenuOpen(false);
-                if (connectingFrom) {
+                if (!groupDirectoryOpen && stateManagerOpen) {
+                  onToggleStateManager(false);
+                }
+                setGroupDirectoryOpen((v) => !v);
+              }}
+              aria-pressed={groupDirectoryOpen}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B] ${
+                groupDirectoryOpen
+                  ? 'bg-[#14244B] text-white'
+                  : 'text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9]'
+              }`}
+            >
+              <ListOrdered className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{t.groupsDirBtn}</span>
+              {groupCountTotal > 0 && (
+                <span className="font-mono text-[11px] tabular-nums opacity-75">
+                  {groupCountTotal}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
+              disabled={nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable).length < 1}
+              onClick={() => {
+                setAddMenuOpen(false);
+                if (isConnectingActive) {
+                  exitConnectMode();
+                } else {
+                  setIsConnectMode(true);
                   setConnectingFrom(null);
                   setConnectPointerWorld(null);
                   portDragRef.current = null;
-                } else {
-                  const selected = selectedNodeId ? nodeMap.get(selectedNodeId) : null;
-                  if (selected && NODE_CATALOG[selected.kind].isPlayable) {
-                    setConnectingFrom({ nodeId: selected.id, side: 'right' });
-                  } else {
-                    const firstPlayable = nodes.find(
-                      (n) => NODE_CATALOG[n.kind].isPlayable,
-                    );
-                    if (firstPlayable) {
-                      setConnectingFrom({ nodeId: firstPlayable.id, side: 'right' });
-                    }
-                  }
+                  airDragRef.current = null;
                 }
               }}
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B] ${
-                connectingFromId
+                isConnectingActive
                   ? 'bg-[#2563EB] text-white cursor-pointer'
-                  : nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable).length < 2
+                  : nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable).length < 1
                     ? 'text-[#94A3B8] cursor-not-allowed'
                     : 'text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9] cursor-pointer'
               }`}
             >
               <GitCommitHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>{connectingFromId ? t.cancelConnect : t.connectMode}</span>
+              <span>{isConnectingActive ? t.cancelConnect : t.connectMode}</span>
             </button>
 
             <div aria-hidden="true" className="w-px h-4 bg-[#E2E8F0] mx-0.5" />
@@ -1806,6 +2957,7 @@ export function DesignBoard({
               type="button"
               onClick={() => {
                 setAddMenuOpen(false);
+                setGroupDirectoryOpen(false);
                 onToggleStateManager();
               }}
               aria-pressed={stateManagerOpen}

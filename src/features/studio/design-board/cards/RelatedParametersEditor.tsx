@@ -93,6 +93,10 @@ export function RelatedParametersEditor({
                 </div>
 
                 {/* Tactile range slider synced with number input */}
+                <label className="flex items-center gap-1 text-[11px] text-[#475569]">
+                  <input type="checkbox" checked={Boolean(param.exposeOnStage)} onChange={e => updateParam(param.id, { exposeOnStage: e.target.checked })} />
+                  {lang === 'zh' ? '在舞台实例上开放' : 'Expose on stage instances'}
+                </label>
                 <div className="flex items-center gap-2 px-0.5">
                   <input
                     type="range"

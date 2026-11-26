@@ -24,6 +24,10 @@ import {
   type StateVariableValue,
 } from './properties/stateModel';
 import {
+  GROUP_DEFAULT_HEIGHT,
+  GROUP_DEFAULT_WIDTH,
+  GROUP_MIN_HEIGHT,
+  GROUP_MIN_WIDTH,
   INITIAL_EDGES,
   INITIAL_NODES,
   NODE_CATALOG,
@@ -31,9 +35,15 @@ import {
   createDefaultPromptInput,
   formatBehaviorSummary,
   formatOutcomeRuleSummary,
+  getAncestorGroupIds,
   getDefaultKeyForMechanic,
+  getDescendantNodeIds,
+  getNextGroupCode,
   getNodeAssetIds,
+  getNodeDepth,
+  getNodeDimensions,
   inferCardFieldsFromText,
+  isDescendantOf,
   mergeAutoFields,
   type ActionMechanic,
   type BoardEdge,
@@ -45,6 +55,7 @@ import {
   type OutcomePropertyRule,
   type SpotlightStage,
 } from './design-board/studioModel';
+import type { EdgeConditionGroup } from './design-board/arrowConditionModel';
 import {
   detectUnlockedVisualEffectsFromText,
   type VisualEffectType,
@@ -53,7 +64,7 @@ import { AssetEditorDrawer } from './asset-library/AssetEditorDrawer';
 import { AssetsPanel, type AiPlacedNotice } from './asset-library/AssetsPanel';
 import { DesignBoard } from './design-board/DesignBoard';
 import { FloatingGuidance } from './guidance/FloatingGuidance';
-import { RightStudioColumn } from './playtest/RightStudioColumn';
+import { StageEditor } from './playtest/StageEditor';
 
 interface StudioWorkspaceProps {
   lang: Language;
@@ -98,6 +109,8 @@ export function StudioWorkspace({
     typeof window !== 'undefined' ? window.innerWidth >= 768 : true,
   );
   const [rightWidth, setRightWidth] = useState(DEFAULT_RIGHT_WIDTH);
+  const [placementCounts, setPlacementCounts] = useState<Record<string, number>>({});
+  const [stageFocus, setStageFocus] = useState<{ nodeId: string; nonce: number } | null>(null);
   const [activeSplitter, setActiveSplitter] = useState<'left' | 'right' | null>(null);
 
   // Asset Library State
@@ -117,6 +130,7 @@ export function StudioWorkspace({
     () => initialLibraryRef.current!.unlockedCategories,
   );
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [stageAssetPick, setStageAssetPick] = useState<'picking' | { assetId: string } | null>(null);
   const [assetEditorTab, setAssetEditorTab] = useState<'looks' | 'properties'>('looks');
   const [highlightPropertyId, setHighlightPropertyId] = useState<string | null>(null);
   const [aiNotice, setAiNotice] = useState<AiPlacedNotice | null>(null);
@@ -152,7 +166,6 @@ export function StudioWorkspace({
     nodeId?: string;
     edgeId?: string;
     nonce: number;
-    stageLink?: boolean;
   } | null>(null);
 
   const scopedVariables = useMemo(
@@ -164,7 +177,6 @@ export function StudioWorkspace({
   const [nodes, setNodes] = useState<BoardNode[]>(() => [...INITIAL_NODES]);
   const [edges, setEdges] = useState<BoardEdge[]>(() => [...INITIAL_EDGES]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [appearanceReset, setAppearanceReset] = useState<{ target: string } | null>(null);
   const [autoFocusNodeId, setAutoFocusNodeId] = useState<string | null>(null);
 
   // Cumulatively unlock specific Visual Effects when student cards or edges express that visual intent
@@ -194,14 +206,12 @@ export function StudioWorkspace({
   });
 
   // Live Play -> Design Board synchronized highlighting
-  const [stageEditingCardIds, setStageEditingCardIds] = useState<string[]>([]);
-  const [returnToStage, setReturnToStage] = useState(false);
   const [activePlayNodeIds, setActivePlayNodeIds] = useState<string[]>([]);
   const [activePlayEdgeId, setActivePlayEdgeId] = useState<string | null>(null);
 
   const handleActivePlayChange = useCallback(
     (nodeIds: string[], edgeId: string | null) => {
-      setActivePlayNodeIds(nodeIds);
+      setActivePlayNodeIds(previous => previous.length === nodeIds.length && previous.every((id, index) => id === nodeIds[index]) ? previous : nodeIds);
       setActivePlayEdgeId(edgeId);
     },
     [],
@@ -241,14 +251,29 @@ export function StudioWorkspace({
     if (!activeSplitter) return;
     const rect = workspaceRef.current?.getBoundingClientRect();
     if (!rect) return;
+    const minCenterWidth = 280;
 
     if (activeSplitter === 'left') {
+      const occupiedRight = rightOpen ? rightWidth + 6 : 44;
+      const availableMaxLeft = Math.max(
+        MIN_LEFT_WIDTH,
+        rect.width - occupiedRight - 6 - minCenterWidth,
+      );
       const next = Math.round(event.clientX - rect.left);
-      setLeftWidth(Math.max(MIN_LEFT_WIDTH, Math.min(MAX_LEFT_WIDTH, next)));
+      setLeftWidth(
+        Math.max(MIN_LEFT_WIDTH, Math.min(MAX_LEFT_WIDTH, availableMaxLeft, next)),
+      );
     } else if (activeSplitter === 'right') {
-      const maxRight = Math.max(460, Math.round(rect.width * 0.56));
+      const occupiedLeft = leftOpen ? leftWidth + 6 : 44;
+      const maxRight = Math.max(360, Math.round(rect.width * 0.56));
+      const availableMaxRight = Math.max(
+        MIN_RIGHT_WIDTH,
+        rect.width - occupiedLeft - 6 - minCenterWidth,
+      );
       const next = Math.round(rect.right - event.clientX);
-      setRightWidth(Math.max(MIN_RIGHT_WIDTH, Math.min(maxRight, next)));
+      setRightWidth(
+        Math.max(MIN_RIGHT_WIDTH, Math.min(maxRight, availableMaxRight, next)),
+      );
     }
   };
 
@@ -520,6 +545,22 @@ export function StudioWorkspace({
   const handleLocateBoardReference = useCallback(
     (target: { nodeId?: string; edgeId?: string }) => {
       setStateManagerOpen(false);
+      if (target.nodeId) {
+        setNodes((prev) => {
+          const map = new Map(prev.map((n) => [n.id, n]));
+          const ancestorIds = new Set(getAncestorGroupIds(target.nodeId!, map));
+          if (ancestorIds.size === 0) return prev;
+          const hasCollapsed = prev.some(
+            (n) => ancestorIds.has(n.id) && n.kind === 'group' && n.collapsed,
+          );
+          if (!hasCollapsed) return prev;
+          return prev.map((n) =>
+            ancestorIds.has(n.id) && n.kind === 'group' && n.collapsed
+              ? { ...n, collapsed: false }
+              : n,
+          );
+        });
+      }
       setBoardFocusTarget({ ...target, nonce: Date.now() });
     },
     [],
@@ -555,49 +596,365 @@ export function StudioWorkspace({
 
   // Design Board Handlers — every newly added card starts truly blank & ready to type
   const addNodeAt = useCallback(
-    (kind: NodeKind, x: number, y: number) => {
+    (kind: NodeKind, x: number, y: number, explicitParentId?: string | null) => {
       const meta = NODE_CATALOG[kind];
       const id = `n-${kind}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
-      const newNode: BoardNode = {
-        id,
-        kind,
-        parentId: null,
-        title: '',
-        note: '',
-        assetId: undefined,
-        assetIds: [],
-        promptInput: createDefaultPromptInput(kind),
-        fields: {},
-        manualFields: [],
-        x,
-        y,
-      };
-      setNodes((prev) => [...prev, newNode]);
+      setNodes((prev) => {
+        const nodeMap = new Map(prev.map((n) => [n.id, n]));
+        const tempNode: BoardNode = {
+          id,
+          kind,
+          parentId: null,
+          title: '',
+          note: '',
+          assetIds: [],
+          promptInput: createDefaultPromptInput(kind),
+          fields: {},
+          manualFields: [],
+          x,
+          y,
+          ...(kind === 'group'
+            ? {
+                width: GROUP_DEFAULT_WIDTH,
+                height: GROUP_DEFAULT_HEIGHT,
+                collapsed: false,
+              }
+            : {}),
+        };
+        const dim = getNodeDimensions(tempNode);
+        const cx = x + dim.width / 2;
+        const cy = y + dim.height / 2;
+
+        let resolvedParentId: string | null = explicitParentId ?? null;
+        if (explicitParentId === undefined) {
+          let bestDepth = -1;
+          let bestArea = Infinity;
+          for (const g of prev) {
+            if (g.kind !== 'group' || g.collapsed) continue;
+            const gDim = getNodeDimensions(g);
+            if (
+              cx >= g.x &&
+              cx <= g.x + gDim.width &&
+              cy >= g.y &&
+              cy <= g.y + gDim.height
+            ) {
+              const depth = getNodeDepth(g.id, nodeMap);
+              const area = gDim.width * gDim.height;
+              if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
+                bestDepth = depth;
+                bestArea = area;
+                resolvedParentId = g.id;
+              }
+            }
+          }
+        }
+
+        const nextGroupCode = kind === 'group' ? getNextGroupCode(prev) : undefined;
+        const groupNumSuffix = nextGroupCode ? nextGroupCode.slice(1) : '';
+        const defaultGroupTitle =
+          kind === 'group'
+            ? lang === 'zh'
+              ? `机制组 ${groupNumSuffix}`
+              : `Group ${groupNumSuffix}`
+            : '';
+
+        const newNode: BoardNode = {
+          ...tempNode,
+          parentId: resolvedParentId,
+          title: defaultGroupTitle,
+          ...(nextGroupCode ? { groupCode: nextGroupCode } : {}),
+        };
+        return [...prev, newNode];
+      });
       setSelectedNodeId(id);
       setAutoFocusNodeId(id);
       if (meta.isPlayable) {
         markCardAdded();
       }
+      return id;
     },
-    [markCardAdded],
+    [lang, markCardAdded],
   );
 
   const handleDragNode = useCallback((id: string, dx: number, dy: number) => {
+    setNodes((prev) => {
+      const target = prev.find((n) => n.id === id);
+      if (!target) return prev;
+      const moveIds = new Set<string>([id]);
+      if (target.kind === 'group') {
+        for (const descId of getDescendantNodeIds(id, prev)) {
+          moveIds.add(descId);
+        }
+      }
+      return prev.map((n) =>
+        moveIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n,
+      );
+    });
+  }, []);
+
+  const handleCommitNodeDrop = useCallback((id: string) => {
+    setNodes((prev) => {
+      const dragged = prev.find((n) => n.id === id);
+      if (!dragged) return prev;
+      const nodeMap = new Map(prev.map((n) => [n.id, n]));
+      const dim = getNodeDimensions(dragged);
+      const cx = dragged.x + dim.width / 2;
+      const cy = dragged.y + dim.height / 2;
+
+      let bestGroupId: string | null = null;
+      let bestDepth = -1;
+      let bestArea = Infinity;
+
+      for (const candidate of prev) {
+        if (candidate.kind !== 'group' || candidate.collapsed) continue;
+        if (candidate.id === dragged.id) continue;
+        if (
+          dragged.kind === 'group' &&
+          isDescendantOf(candidate.id, dragged.id, nodeMap)
+        ) {
+          continue;
+        }
+        const gDim = getNodeDimensions(candidate);
+        if (
+          cx >= candidate.x &&
+          cx <= candidate.x + gDim.width &&
+          cy >= candidate.y &&
+          cy <= candidate.y + gDim.height
+        ) {
+          const depth = getNodeDepth(candidate.id, nodeMap);
+          const area = gDim.width * gDim.height;
+          if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
+            bestDepth = depth;
+            bestArea = area;
+            bestGroupId = candidate.id;
+          }
+        }
+      }
+
+      if (bestGroupId) {
+        const targetGroup = prev.find((n) => n.id === bestGroupId);
+        if (targetGroup) {
+          const gDim = getNodeDimensions(targetGroup);
+          const neededW = Math.max(gDim.width, Math.round(dragged.x + dim.width + 20 - targetGroup.x));
+          const neededH = Math.max(gDim.height, Math.round(dragged.y + dim.height + 20 - targetGroup.y));
+          const groupNeedsExpand = neededW > gDim.width || neededH > gDim.height;
+          if (dragged.parentId === bestGroupId && !groupNeedsExpand) return prev;
+          return prev.map((n) => {
+            if (n.id === dragged.id) return { ...n, parentId: bestGroupId };
+            if (n.id === bestGroupId && groupNeedsExpand) {
+              return { ...n, width: neededW, height: neededH };
+            }
+            return n;
+          });
+        }
+      }
+
+      if (dragged.parentId === bestGroupId) return prev;
+      return prev.map((n) =>
+        n.id === dragged.id ? { ...n, parentId: bestGroupId } : n,
+      );
+    });
+  }, []);
+
+  const handleResizeGroup = useCallback(
+    (
+      id: string,
+      rect: { x?: number; y?: number; width: number; height: number },
+    ) => {
+      const nextW = Math.round(Math.max(GROUP_MIN_WIDTH, rect.width));
+      const nextH = Math.round(Math.max(GROUP_MIN_HEIGHT, rect.height));
+      setNodes((prev) =>
+        prev.map((n) =>
+          n.id === id && n.kind === 'group'
+            ? {
+                ...n,
+                x: rect.x !== undefined ? Math.round(rect.x) : n.x,
+                y: rect.y !== undefined ? Math.round(rect.y) : n.y,
+                width: nextW,
+                height: nextH,
+              }
+            : n,
+        ),
+      );
+    },
+    [],
+  );
+
+  const handleCommitGroupResize = useCallback((groupId: string) => {
+    setNodes((prev) => {
+      const grp = prev.find(
+        (n) => n.id === groupId && n.kind === 'group' && !n.collapsed,
+      );
+      if (!grp) return prev;
+      const nodeMap = new Map(prev.map((n) => [n.id, n]));
+      const gDim = getNodeDimensions(grp);
+      const gx1 = grp.x;
+      const gy1 = grp.y;
+      const gx2 = grp.x + gDim.width;
+      const gy2 = grp.y + gDim.height;
+
+      let changed = false;
+      const next = prev.map((n) => {
+        if (n.id === grp.id) return n;
+        if (n.kind === 'group' && isDescendantOf(grp.id, n.id, nodeMap)) return n;
+
+        const dim = getNodeDimensions(n);
+        const cx = n.x + dim.width / 2;
+        const cy = n.y + dim.height / 2;
+        const isInside = cx >= gx1 && cx <= gx2 && cy >= gy1 && cy <= gy2;
+
+        if (isInside && n.parentId === grp.parentId) {
+          changed = true;
+          return { ...n, parentId: grp.id };
+        }
+        if (!isInside && n.parentId === grp.id) {
+          changed = true;
+          return { ...n, parentId: grp.parentId };
+        }
+        return n;
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const handleToggleGroupCollapse = useCallback((id: string) => {
     setNodes((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, x: n.x + dx, y: n.y + dy } : n)),
+      prev.map((n) =>
+        n.id === id && n.kind === 'group' ? { ...n, collapsed: !n.collapsed } : n,
+      ),
     );
+  }, []);
+
+  const handleDuplicateNode = useCallback(
+    (id: string) => {
+      const root = nodes.find((n) => n.id === id);
+      if (!root) return null;
+
+      const subtreeIds =
+        root.kind === 'group'
+          ? [root.id, ...getDescendantNodeIds(root.id, nodes)]
+          : [root.id];
+      const subtreeSet = new Set(subtreeIds);
+      const idMap = new Map<string, string>();
+      const ts = Date.now().toString(36);
+
+      for (const origId of subtreeIds) {
+        const orig = nodes.find((n) => n.id === origId);
+        if (!orig) continue;
+        const rand = Math.random().toString(36).slice(2, 6);
+        idMap.set(origId, `n-${orig.kind}-${ts}-${rand}`);
+      }
+
+      const clonedRootId = idMap.get(root.id) ?? null;
+      const clones: BoardNode[] = [];
+      for (const origId of subtreeIds) {
+        const orig = nodes.find((n) => n.id === origId);
+        const nextId = idMap.get(origId);
+        if (!orig || !nextId) continue;
+        const nextParentId =
+          origId === root.id
+            ? orig.parentId
+            : orig.parentId && idMap.has(orig.parentId)
+              ? idMap.get(orig.parentId)!
+              : orig.parentId;
+        const clonedGroupCode =
+          orig.kind === 'group' ? getNextGroupCode([...nodes, ...clones]) : orig.groupCode;
+        clones.push({
+          ...orig,
+          id: nextId,
+          parentId: nextParentId,
+          ...(orig.kind === 'group' ? { groupCode: clonedGroupCode } : {}),
+          title:
+            origId === root.id && orig.kind === 'group' && orig.title.trim()
+              ? `${orig.title.trim()} (${lang === 'zh' ? '副本' : 'Copy'})`
+              : orig.title,
+          assetIds: orig.assetIds ? [...orig.assetIds] : undefined,
+          promptInput: orig.promptInput ? { ...orig.promptInput } : undefined,
+          fields: {
+            ...orig.fields,
+            relatedParameters: orig.fields.relatedParameters
+              ? orig.fields.relatedParameters.map((p) => ({ ...p }))
+              : undefined,
+            relatedProperties: orig.fields.relatedProperties
+              ? orig.fields.relatedProperties.map((r) => ({ ...r }))
+              : undefined,
+          },
+          manualFields: [...orig.manualFields],
+          availableWhenGroup: orig.availableWhenGroup
+            ? {
+                combinator: orig.availableWhenGroup.combinator,
+                clauses: orig.availableWhenGroup.clauses.map((c) => ({ ...c })),
+              }
+            : undefined,
+          x: orig.x + 48,
+          y: orig.y + 48,
+        });
+      }
+
+      const internalClonedEdges: BoardEdge[] = [];
+      for (const e of edges) {
+        if (e.fromId === null && subtreeSet.has(e.toId)) {
+          const rand = Math.random().toString(36).slice(2, 6);
+          internalClonedEdges.push({
+            ...e,
+            id: `e-${ts}-${rand}`,
+            fromId: null,
+            toId: idMap.get(e.toId)!,
+            entryOffset: e.entryOffset ? { ...e.entryOffset } : undefined,
+            conditionGroup: e.conditionGroup
+              ? {
+                  combinator: e.conditionGroup.combinator,
+                  clauses: e.conditionGroup.clauses.map((c) => ({ ...c })),
+                }
+              : undefined,
+          });
+        } else if (e.fromId && subtreeSet.has(e.fromId) && subtreeSet.has(e.toId)) {
+          const rand = Math.random().toString(36).slice(2, 6);
+          internalClonedEdges.push({
+            ...e,
+            id: `e-${ts}-${rand}`,
+            fromId: idMap.get(e.fromId)!,
+            toId: idMap.get(e.toId)!,
+            conditionGroup: e.conditionGroup
+              ? {
+                  combinator: e.conditionGroup.combinator,
+                  clauses: e.conditionGroup.clauses.map((c) => ({ ...c })),
+                }
+              : undefined,
+          });
+        }
+      }
+
+      setNodes((prev) => [...prev, ...clones]);
+      if (internalClonedEdges.length > 0) {
+        setEdges((prev) => [...prev, ...internalClonedEdges]);
+      }
+      if (clonedRootId) {
+        setSelectedNodeId(clonedRootId);
+      }
+      return clonedRootId;
+    },
+    [edges, lang, nodes],
+  );
+
+  const handleUngroup = useCallback((id: string) => {
+    setNodes((prev) => {
+      const target = prev.find((n) => n.id === id);
+      if (!target || target.kind !== 'group') return prev;
+      const fallbackParent = target.parentId ?? null;
+      return prev
+        .filter((n) => n.id !== id)
+        .map((n) => (n.parentId === id ? { ...n, parentId: fallbackParent } : n));
+    });
+    setEdges((prev) => prev.filter((e) => e.fromId !== id && e.toId !== id));
+    setSelectedNodeId((prev) => (prev === id ? null : prev));
   }, []);
 
   const handleUpdateNode = useCallback(
     (
       id: string,
-      patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput' | 'challengeAssetId'>>,
+      patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
     ) => {
-      if ('challengeAssetId' in patch) {
-        setAppearanceReset({ target: 'challenge:' + id });
-      } else if (patch.assetIds?.includes(patch.promptInput?.actorAssetId ?? '')) {
-        setAppearanceReset({ target: 'hero' });
-      }
       setNodes((prev) =>
         prev.map((n) => {
           if (n.id !== id) return n;
@@ -799,7 +1156,6 @@ export function StudioWorkspace({
               })
             : n.fields;
 
-          const stageAsset = 'challengeAssetId' in patch ? patch.challengeAssetId : n.challengeAssetId;
           return {
             ...n,
             ...patch,
@@ -808,7 +1164,6 @@ export function StudioWorkspace({
             promptInput: nextPrompt,
             assetId: nextAssetIds[0],
             assetIds: nextAssetIds,
-            challengeAssetId: stageAsset && nextAssetIds.includes(stageAsset) ? stageAsset : undefined,
             fields: nextFields,
             manualFields: effectiveManualFields,
           };
@@ -927,34 +1282,84 @@ export function StudioWorkspace({
   );
 
   const handleDeleteNode = useCallback((id: string) => {
-    setNodes((prev) =>
-      prev
+    setNodes((prev) => {
+      const deleted = prev.find((n) => n.id === id);
+      const fallbackParent = deleted?.parentId ?? null;
+      return prev
         .filter((n) => n.id !== id)
-        .map((n) => (n.parentId === id ? { ...n, parentId: null } : n)),
-    );
+        .map((n) => (n.parentId === id ? { ...n, parentId: fallbackParent } : n));
+    });
     setEdges((prev) => prev.filter((e) => e.fromId !== id && e.toId !== id));
     setSelectedNodeId((prev) => (prev === id ? null : prev));
   }, []);
 
   const handleConnectNodes = useCallback(
-    (fromId: string, toId: string) => {
-      if (fromId === toId) return;
+    (
+      fromId: string | null,
+      toId: string,
+      entryOffset?: { dx: number; dy: number },
+    ): string | null => {
+      if (fromId !== null && fromId === toId) return null;
+      const newEdgeId = `e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+      let created = false;
       setEdges((prev) => {
-        const exists = prev.some((e) => e.fromId === fromId && e.toId === toId);
-        if (exists) return prev;
-        return [...prev, { id: `e-${Date.now().toString(36)}`, fromId, toId }];
+        if (fromId !== null) {
+          const exists = prev.some((e) => e.fromId === fromId && e.toId === toId);
+          if (exists) return prev;
+        }
+        created = true;
+        return [
+          ...prev,
+          {
+            id: newEdgeId,
+            fromId,
+            toId,
+            ...(fromId === null && entryOffset ? { entryOffset } : {}),
+          },
+        ];
       });
       markCardsConnected();
+      return created || fromId === null ? newEdgeId : null;
     },
     [markCardsConnected],
   );
 
+  const handleUpdateEntryEdgeOffset = useCallback(
+    (edgeId: string, entryOffset: { dx: number; dy: number }) => {
+      setEdges((prev) =>
+        prev.map((e) =>
+          e.id === edgeId && e.fromId === null
+            ? {
+                ...e,
+                entryOffset: {
+                  dx: Math.round(entryOffset.dx),
+                  dy: Math.round(entryOffset.dy),
+                },
+              }
+            : e,
+        ),
+      );
+    },
+    [],
+  );
+
   const handleUpdateEdgeCondition = useCallback(
-    (edgeId: string, condition: string) => {
+    (
+      edgeId: string,
+      condition: string,
+      conditionGroup?: EdgeConditionGroup,
+    ) => {
       setEdges((prev) =>
         prev.map((e) =>
           e.id === edgeId
-            ? { ...e, condition: condition ? condition : undefined }
+            ? {
+                ...e,
+                condition: condition ? condition : undefined,
+                conditionGroup:
+                  condition && conditionGroup && conditionGroup.clauses.length > 0
+                    ? conditionGroup
+                    : undefined,
+              }
             : e,
         ),
       );
@@ -983,7 +1388,12 @@ export function StudioWorkspace({
       ref={workspaceRef}
       onPointerMove={handleWorkspacePointerMove}
       onPointerUp={handleWorkspacePointerUp}
-      className={`h-screen w-screen overflow-hidden flex flex-col bg-[#F8FAFC] ${
+      onScroll={(e) => {
+        if (e.currentTarget.scrollTop !== 0 || e.currentTarget.scrollLeft !== 0) {
+          e.currentTarget.scrollTo(0, 0);
+        }
+      }}
+      className={`h-screen w-screen overflow-clip flex flex-col bg-[#F8FAFC] ${
         activeSplitter ? 'select-none cursor-col-resize' : ''
       }`}
     >
@@ -1093,24 +1503,15 @@ export function StudioWorkspace({
       </header>
 
       {/* Main 3-Panel Studio Body */}
-      <div className="flex-1 flex min-h-0 overflow-hidden">
+      <div className="flex-1 flex min-h-0 overflow-clip">
         {/* LEFT + CENTER SPOTLIGHT ZONE */}
         <div
-          className={`relative flex-1 min-w-0 flex min-h-0 overflow-hidden transition-shadow duration-300 ${
+          className={`relative flex-1 min-w-0 flex min-h-0 overflow-clip transition-shadow duration-300 ${
             spotlightStage === 'focus-build'
               ? 'z-30 ring-2 ring-inset ring-[#FBC53D]/80'
               : ''
           }`}
         >
-          {/* Prominent Top Floating Guidance Card */}
-          <FloatingGuidance
-            lang={lang}
-            stage={spotlightStage}
-            checklist={checklist}
-            nodes={nodes}
-            onSkipSpotlight={() => setSpotlightStage('free')}
-          />
-
           {/* ① Left Column: Game Asset Library */}
           <AssetsPanel
             lang={lang}
@@ -1120,9 +1521,17 @@ export function StudioWorkspace({
             items={assetItems}
             unlockedCategories={unlockedCategories}
             selectedAssetId={selectedAssetId}
+            pickingForStage={stageAssetPick === 'picking'}
             aiNotice={aiNotice}
-            onToggle={() => setLeftOpen((v) => !v)}
+            onToggle={() => {
+              setStageAssetPick(null);
+              setLeftOpen((v) => !v);
+            }}
             onSelectAsset={(id) => {
+              if (stageAssetPick === 'picking') {
+                setStageAssetPick({ assetId: id });
+                return;
+              }
               setSelectedAssetId((prev) => {
                 const next = prev === id ? null : id;
                 if (next) {
@@ -1200,7 +1609,15 @@ export function StudioWorkspace({
           )}
 
           {/* ② Center Column: Design Board */}
-          <div className="flex-1 min-w-[260px] flex flex-col min-h-0 overflow-hidden">
+          <div className="relative flex-1 min-w-[280px] flex flex-col min-h-0 overflow-clip">
+            {/* Prominent Top Floating Guidance Card (always centered over DesignBoard) */}
+            <FloatingGuidance
+              lang={lang}
+              stage={spotlightStage}
+              checklist={checklist}
+              nodes={nodes}
+              onSkipSpotlight={() => setSpotlightStage('free')}
+            />
             <DesignBoard
               lang={lang}
               nodes={nodes}
@@ -1211,18 +1628,31 @@ export function StudioWorkspace({
               focusTarget={boardFocusTarget}
               selectedNodeId={selectedNodeId}
               autoFocusNodeId={autoFocusNodeId}
-              stageEditingCardIds={stageEditingCardIds}
               activePlayNodeIds={activePlayNodeIds}
               activePlayEdgeId={activePlayEdgeId}
+              placementCounts={placementCounts}
+              onLocateStage={(nodeId) => {
+                setRightOpen(true);
+                setStageFocus({ nodeId, nonce: Date.now() });
+              }}
+              onToggleStageTemplate={id => setNodes(items => items.map(item => item.id === id ? { ...item, stageTemplate: !item.stageTemplate } : item))}
+              onToggleStageReset={id => setNodes(items => items.map(item => item.id === id ? { ...item, stageResetOnEntry: !item.stageResetOnEntry } : item))}
               onSelectNode={setSelectedNodeId}
               onConsumeAutoFocus={() => setAutoFocusNodeId(null)}
               onDragNode={handleDragNode}
+              onCommitNodeDrop={handleCommitNodeDrop}
+              onResizeGroup={handleResizeGroup}
+              onCommitGroupResize={handleCommitGroupResize}
+              onToggleGroupCollapse={handleToggleGroupCollapse}
+              onDuplicateNode={handleDuplicateNode}
+              onUngroup={handleUngroup}
               onUpdateNode={handleUpdateNode}
               onUpdateNodeField={handleUpdateNodeField}
               onResetNodeAutoFields={handleResetNodeAutoFields}
               onDeleteNode={handleDeleteNode}
               onAddNodeAt={addNodeAt}
               onConnectNodes={handleConnectNodes}
+              onUpdateEntryEdgeOffset={handleUpdateEntryEdgeOffset}
               onUpdateEdgeCondition={handleUpdateEdgeCondition}
               onDeleteEdge={handleDeleteEdge}
               onToggleStateManager={(open) =>
@@ -1247,10 +1677,6 @@ export function StudioWorkspace({
           </div>
         </div>
 
-        {returnToStage && <button type="button" className="absolute bottom-4 right-14 z-30 rounded-lg border border-teal-300 bg-white px-3 py-2 text-xs font-semibold text-teal-900 shadow"
-          onClick={() => { setReturnToStage(false); setRightOpen(true); }}>
-          {lang === 'zh' ? '返回舞台编辑' : 'Back to stage editing'}
-        </button>}
         {/* Right Vertical Drag Splitter */}
         {rightOpen && (
           <div
@@ -1270,42 +1696,24 @@ export function StudioWorkspace({
         )}
 
         {/* ③ Right Column: Live Build Preview + Explicit Play Viewport */}
-        <RightStudioColumn
-          lang={lang}
-          isOpen={rightOpen}
-          width={rightWidth}
-          spotlightStage={spotlightStage}
-          nodes={nodes}
-          edges={edges}
-          assetItems={assetItems}
-          scopedVariables={scopedVariables}
-          selectedNodeId={selectedNodeId}
-          onToggle={() => {
-            if (rightOpen) setStageEditingCardIds([]);
-            setReturnToStage(false);
-            setRightOpen(!rightOpen);
-          }}
-          onLocateCard={id => {
-            if (window.matchMedia('(max-width: 767px)').matches) {
-              setReturnToStage(true);
-              setRightOpen(false);
-              requestAnimationFrame(() => setBoardFocusTarget({ nodeId: id, nonce: Date.now(), stageLink: true }));
-            } else {
-              setBoardFocusTarget({ nodeId: id, nonce: Date.now(), stageLink: true });
-            }
-          }}
-          onStageCardsChange={setStageEditingCardIds}
-          appearanceReset={appearanceReset}
-          onOpenAsset={id => {
-            setLeftOpen(true);
-            setStateManagerOpen(false);
-            setSelectedAssetId(id);
-            setAssetEditorTab('looks');
-          }}
-          onActivePlayChange={handleActivePlayChange}
-          onUserTestedInPlay={handleUserTestedInPlay}
-          onUpdatePlayValue={handleUpdatePlayValue}
-          onResetPlayValues={handleResetAllPlayValues}
+        <StageEditor
+            lang={lang}
+            isOpen={rightOpen}
+            width={rightWidth}
+            nodes={nodes}
+            edges={edges}
+            assets={assetItems}
+            variables={scopedVariables}
+            selectedNodeId={selectedNodeId}
+            stageFocus={stageFocus}
+            assetPick={stageAssetPick}
+            onAssetPickChange={setStageAssetPick}
+            onOpenLibrary={() => { setSelectedAssetId(null); setLeftOpen(true); }}
+            onPlacementCounts={setPlacementCounts}
+            onToggle={() => { setStageAssetPick(null); setRightOpen((v) => !v); }}
+            onLocate={handleLocateBoardReference}
+            onActive={handleActivePlayChange}
+            onPlay={handleUserTestedInPlay}
         />
       </div>
     </div>

@@ -266,7 +266,16 @@ export function findVariableReferences(
   }
 
   for (const edge of edges) {
-    if (edge.condition && textMentionsVariable(edge.condition, entry)) {
+    const matchedInGroup = edge.conditionGroup?.clauses.some(
+      (clause) =>
+        clause.kind === 'property' &&
+        (clause.propertyId === entry.variable.id ||
+          clause.comparePropertyId === entry.variable.id ||
+          (clause.valueMode === 'formula' &&
+            clause.formulaExpression &&
+            textMentionsVariable(clause.formulaExpression, entry))),
+    );
+    if (matchedInGroup || (edge.condition && textMentionsVariable(edge.condition, entry))) {
       edgeIds.push(edge.id);
     }
   }

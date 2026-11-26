@@ -1,20 +1,17 @@
-import { StageTimeline, type TimelineCursor, type TimelineEntry } from './StageTimeline';
-import { StageEffectTimeline } from './StageEffectControls';
-import { StageEffectLayer, TimelineEffectFrame } from './StageEffectLayer';
-import { DEFAULT_STAGE_EFFECT, StageEffectScheduler, effectEntries, eventEffects, type EffectOccurrence, type EffectPoint, type EffectTrigger } from './stageEffects';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUp,
   Check,
   Heart,
+  Layers,
   Lock,
+  Maximize,
   MessageSquareQuote,
   Minus,
   PanelRightClose,
   PanelRightOpen,
   Play,
   Plus,
-  Pause,
   RotateCcw,
   Shield,
   Sparkles,
@@ -26,16 +23,23 @@ import {
 } from 'lucide-react';
 import type { AssetCategoryId, AssetItem } from '../asset-library/assetLibraryModel';
 import {
+  extractSimulatedEventsFromEdges,
+} from '../design-board/arrowConditionModel';
+import {
   INITIAL_PLAY_STATS,
   collectNumericBoardParameters,
   computeLoopEdgeIds,
   detectUsedStats,
+  evaluateEdgeCondition,
+  evaluateGroupAvailability,
   extractCustomFlagConditions,
   findStartNodeId,
   getEvaluatedOutgoing,
+  getGroupLocalRoots,
   getPlayableNodes,
   resolveActionConfig,
   resolveChallengeConfig,
+  resolveChallengeTimeLimitSec,
   resolveDialogueContent,
   resolveOutcomeConfig,
   resolvePlaybackSettings,
@@ -43,8 +47,12 @@ import {
   resolveSubtitlePosition,
   type ChallengeDirection,
   type ConditionEvaluation,
+  type PlayRuntimeContext,
   type PlayStats,
+  type RuntimeEventRecord,
 } from './boardPlayEngine';
+import { drawChallengeEntity, drawStageBackdrop } from './cardPreviewDrawing';
+import { cardPreviewBounce, cardPreviewCycle, cardPreviewPatrol, cardPreviewTravelSpeed } from './cardPreviewMotion';
 import { COPY, type Language } from '../../../shared/i18n';
 import {
   applyOutcomePropertyRule,
@@ -54,7 +62,10 @@ import {
   type StateVariableValue,
 } from '../properties/stateModel';
 import {
+  getDescendantNodeIds,
   getNodeAssetIds,
+  isDescendantOf,
+  resolveGroupCode,
   type ActionControlConfig,
   type ActionMechanic,
   type BoardEdge,
@@ -76,25 +87,8 @@ import {
   type VisualEffectItem,
 } from '../asset-library/effects/visualEffectsModel';
 
-import { StagePlacementEditor, type PlacementItem } from './StagePlacementEditor';
-import {
-  WORLD_W, WORLD_H, HERO_BASE_X, GROUND_Y, HERO_POSE, DECORATION_POSE, EMPTY_STAGE_LAYOUT,
-  challengeId, challengePose, stageBounds, stagePoint, editedStagePosition, stageLayoutChanges,
-  cardOverlayId, getStagePlacement, type StageEditorSection,
-  applyStageLayoutChanges, type LayoutChange, type StageLayout, type StagePlacement, type StagePose,
-} from './stageLayout';
-
-import {
-  applyStageMoments, arrangeMoments, dueMoments, momentSecond, readMomentValue, upsertMoment,
-  type MomentClock, type MomentEdit, type MomentTiming, type MomentValue, type StageMoment,
-} from './stageMoments';
-import { StageMomentList } from './StageMomentList';
-
-type TrialSnapshot = { current: StageLayout; edits: MomentEdit[] };
-const INITIAL_CLOCK: MomentClock = { runMs: 0, cardMs: 0 };
-const EMPTY_TRIAL: TrialSnapshot = { current: EMPTY_STAGE_LAYOUT, edits: [] };
-
 interface RightStudioColumnProps {
+  onEditScene: () => void;
   lang: Language;
   isOpen: boolean;
   width: number;
@@ -105,14 +99,9 @@ interface RightStudioColumnProps {
   scopedVariables: ScopedStateVariable[];
   selectedNodeId: string | null;
   onToggle: () => void;
-  onLocateCard: (id: string) => void;
-  onStageCardsChange: (ids: string[]) => void;
-  onOpenAsset: (id: string) => void;
-  appearanceReset: { target: string } | null;
   onActivePlayChange: (nodeIds: string[], edgeId: string | null) => void;
   onUserTestedInPlay: () => void;
   onUpdatePlayValue: (variableId: string, value: StateVariableValue) => void;
-  onResetPlayValues: () => void;
 }
 
 interface FloatingPopup {
@@ -165,6 +154,8 @@ interface LiveActionControl {
   id: string;
   edgeId: string | null;
   fromNodeId: string | null;
+  ownerNodeId: string | null;
+  ownerLabel?: string;
   target: BoardNode;
   mechanic: ActionMechanic;
   keyLabel: string;
@@ -203,453 +194,6 @@ const PASSING_EVAL: ConditionEvaluation = {
   passed: true,
 };
 
-function drawChallengeEntity(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  radius: number,
-  visual: ChallengeVisual,
-  time: number,
-  spriteImg: HTMLImageElement | null,
-  rotateDir: -1 | 0 | 1,
-  baked: { canvas: HTMLCanvasElement; padRatio: number } | null = null,
-  effects?: VisualEffectItem[],
-  sizeOverride?: Partial<StagePose>,
-) {
-  ctx.save();
-  const naturalSize = radius * 2.5;
-  if (sizeOverride?.width !== undefined || sizeOverride?.height !== undefined) {
-    ctx.translate(x, y);
-    ctx.scale((sizeOverride.width ?? naturalSize) / naturalSize, (sizeOverride.height ?? naturalSize) / naturalSize);
-    ctx.translate(-x, -y);
-  }
-  if (spriteImg) {
-    const size = radius * 2.5;
-    drawSpriteWithEffects(
-      ctx,
-      spriteImg,
-      baked,
-      x,
-      y,
-      size,
-      size,
-      effects,
-      time,
-      rotateDir !== 0 ? rotateDir * time * 5.0 : 0,
-      1,
-    );
-    ctx.restore();
-    return;
-  }
-
-  if (visual === 'coin') {
-    const glow = ctx.createRadialGradient(x, y, 2, x, y, 22);
-    glow.addColorStop(0, 'rgba(251, 197, 61, 0.85)');
-    glow.addColorStop(1, 'rgba(251, 197, 61, 0)');
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, 22, 0, Math.PI * 2);
-    ctx.fill();
-
-    const squeeze = 0.72 + 0.28 * Math.abs(Math.cos(time * 4));
-    ctx.fillStyle = '#F59E0B';
-    ctx.beginPath();
-    ctx.ellipse(x, y, 10 * squeeze, 10, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#FEF08A';
-    ctx.beginPath();
-    ctx.ellipse(x, y, 5.5 * squeeze, 5.5, 0, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (visual === 'rock') {
-    ctx.translate(x, y);
-    if (rotateDir !== 0) ctx.rotate(rotateDir * time * 3.2);
-    ctx.fillStyle = '#64748B';
-    ctx.beginPath();
-    ctx.moveTo(-12, -5);
-    ctx.lineTo(-4, -13);
-    ctx.lineTo(9, -10);
-    ctx.lineTo(13, 2);
-    ctx.lineTo(5, 12);
-    ctx.lineTo(-9, 10);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = '#334155';
-    ctx.lineWidth = 1.6;
-    ctx.stroke();
-    ctx.fillStyle = '#475569';
-    ctx.beginPath();
-    ctx.arc(-3, -2, 3, 0, Math.PI * 2);
-    ctx.arc(5, 4, 2.2, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (visual === 'creature') {
-    const squish = Math.sin(time * 6) * 2;
-    ctx.fillStyle = '#8B5CF6';
-    ctx.beginPath();
-    ctx.roundRect(x - 13, y - 10 - squish * 0.5, 26, 20 + squish * 0.5, [12, 12, 5, 5]);
-    ctx.fill();
-    ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.arc(x - 4.5, y - 2, 3.2, 0, Math.PI * 2);
-    ctx.arc(x + 4.5, y - 2, 3.2, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#0F172A';
-    ctx.beginPath();
-    ctx.arc(x - 5.2, y - 2, 1.5, 0, Math.PI * 2);
-    ctx.arc(x + 3.8, y - 2, 1.5, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (visual === 'spike') {
-    ctx.fillStyle = '#E11D48';
-    for (let offset = -10; offset <= 10; offset += 10) {
-      ctx.beginPath();
-      ctx.moveTo(x + offset - 5, y + 10);
-      ctx.lineTo(x + offset, y - 11);
-      ctx.lineTo(x + offset + 5, y + 10);
-      ctx.closePath();
-      ctx.fill();
-    }
-  } else {
-    // Default glowing fireball / spark
-    const glow = ctx.createRadialGradient(x, y, 3, x, y, 22);
-    glow.addColorStop(0, 'rgba(254, 240, 138, 0.95)');
-    glow.addColorStop(0.55, 'rgba(249, 115, 22, 0.85)');
-    glow.addColorStop(1, 'rgba(249, 115, 22, 0)');
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, 22, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#FEF08A';
-    ctx.beginPath();
-    ctx.arc(x, y, 8, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  ctx.restore();
-}
-
-function drawStageBackdrop(
-  ctx: CanvasRenderingContext2D,
-  theme: SceneTheme,
-  worldW: number,
-  worldH: number,
-  groundY: number,
-  time: number,
-  flare: number,
-  bgImg: HTMLImageElement | null,
-  bgBaked: { canvas: HTMLCanvasElement; padRatio: number } | null = null,
-  bgEffects?: VisualEffectItem[],
-) {
-  if (theme === 'meadow') {
-    const sky = ctx.createLinearGradient(0, 0, 0, groundY);
-    sky.addColorStop(0, '#60A5FA');
-    sky.addColorStop(1, '#DBEAFE');
-    ctx.fillStyle = sky;
-    ctx.fillRect(0, 0, worldW, worldH);
-
-    // Sun
-    ctx.fillStyle = '#FDE047';
-    ctx.beginPath();
-    ctx.arc(308, 42, 18, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Soft clouds
-    ctx.fillStyle = 'rgba(255,255,255,0.85)';
-    const drift = (time * 8) % (worldW + 80);
-    [60, 210].forEach((cx, idx) => {
-      const x = ((cx + drift) % (worldW + 80)) - 40;
-      const y = idx === 0 ? 44 : 68;
-      ctx.beginPath();
-      ctx.arc(x, y, 14, 0, Math.PI * 2);
-      ctx.arc(x + 14, y - 4, 16, 0, Math.PI * 2);
-      ctx.arc(x + 28, y, 12, 0, Math.PI * 2);
-      ctx.fill();
-    });
-
-    // Distant hills
-    ctx.fillStyle = '#86EFAC';
-    ctx.beginPath();
-    ctx.ellipse(90, groundY, 130, 38, 0, Math.PI, Math.PI * 2);
-    ctx.ellipse(280, groundY, 150, 48, 0, Math.PI, Math.PI * 2);
-    ctx.fill();
-
-    if (bgImg) {
-      drawSpriteWithEffects(
-        ctx,
-        bgImg,
-        bgBaked,
-        worldW / 2,
-        groundY / 2,
-        worldW,
-        groundY,
-        bgEffects,
-        time,
-        0,
-        0.35,
-      );
-    }
-
-    // Grassy ground
-    ctx.fillStyle = '#16A34A';
-    ctx.fillRect(0, groundY, worldW, 7);
-    ctx.fillStyle = '#78350F';
-    ctx.fillRect(0, groundY + 7, worldW, worldH - groundY - 7);
-    return;
-  }
-
-  if (theme === 'space') {
-    const sky = ctx.createLinearGradient(0, 0, 0, worldH);
-    sky.addColorStop(0, '#020617');
-    sky.addColorStop(1, '#1E1B4B');
-    ctx.fillStyle = sky;
-    ctx.fillRect(0, 0, worldW, worldH);
-
-    // Nebula glow
-    const neb = ctx.createRadialGradient(110, 80, 10, 110, 80, 110);
-    neb.addColorStop(0, 'rgba(139, 92, 246, 0.32)');
-    neb.addColorStop(1, 'rgba(139, 92, 246, 0)');
-    ctx.fillStyle = neb;
-    ctx.fillRect(0, 0, worldW, groundY);
-
-    // Stars
-    for (let i = 0; i < 18; i++) {
-      const sx = (i * 53 + 17) % worldW;
-      const sy = (i * 29 + 11) % (groundY - 24);
-      const twinkle = 0.35 + 0.65 * Math.sin(time * 2.8 + i);
-      ctx.fillStyle = `rgba(224, 242, 254, ${twinkle.toFixed(2)})`;
-      ctx.beginPath();
-      ctx.arc(sx, sy, i % 3 === 0 ? 1.6 : 1.0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Ringed planet
-    ctx.fillStyle = '#38BDF8';
-    ctx.beginPath();
-    ctx.arc(296, 52, 16, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(186, 230, 253, 0.75)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.ellipse(296, 52, 28, 7, -0.25, 0, Math.PI * 2);
-    ctx.stroke();
-
-    if (bgImg) {
-      drawSpriteWithEffects(
-        ctx,
-        bgImg,
-        bgBaked,
-        worldW / 2,
-        groundY / 2,
-        worldW,
-        groundY,
-        bgEffects,
-        time,
-        0,
-        0.25,
-      );
-    }
-
-    // Starship deck floor
-    ctx.fillStyle = '#1E293B';
-    ctx.fillRect(0, groundY, worldW, worldH - groundY);
-    ctx.fillStyle = '#38BDF8';
-    ctx.fillRect(0, groundY, worldW, 3);
-    return;
-  }
-
-  if (theme === 'ocean') {
-    const sea = ctx.createLinearGradient(0, 0, 0, worldH);
-    sea.addColorStop(0, '#0284C7');
-    sea.addColorStop(0.7, '#0369A1');
-    sea.addColorStop(1, '#0C4A6E');
-    ctx.fillStyle = sea;
-    ctx.fillRect(0, 0, worldW, worldH);
-
-    // Rising bubbles
-    ctx.strokeStyle = 'rgba(186, 230, 253, 0.55)';
-    ctx.lineWidth = 1.2;
-    for (let i = 0; i < 8; i++) {
-      const bx = 35 + i * 44;
-      const by = groundY - (((time * 24 + i * 31) % (groundY - 12)) + 8);
-      ctx.beginPath();
-      ctx.arc(bx + Math.sin(time * 2 + i) * 4, by, 2.5 + (i % 3), 0, Math.PI * 2);
-      ctx.stroke();
-    }
-
-    if (bgImg) {
-      drawSpriteWithEffects(
-        ctx,
-        bgImg,
-        bgBaked,
-        worldW / 2,
-        groundY / 2,
-        worldW,
-        groundY,
-        bgEffects,
-        time,
-        0,
-        0.28,
-      );
-    }
-
-    // Sandy floor
-    ctx.fillStyle = '#EAB308';
-    ctx.fillRect(0, groundY, worldW, 6);
-    ctx.fillStyle = '#CA8A04';
-    ctx.fillRect(0, groundY + 6, worldW, worldH - groundY - 6);
-    return;
-  }
-
-  if (theme === 'cavern') {
-    const cav = ctx.createLinearGradient(0, 0, 0, worldH);
-    cav.addColorStop(0, '#1C1917');
-    cav.addColorStop(0.65, '#431407');
-    cav.addColorStop(1, '#7C2D12');
-    ctx.fillStyle = cav;
-    ctx.fillRect(0, 0, worldW, worldH);
-
-    if (bgImg) {
-      drawSpriteWithEffects(
-        ctx,
-        bgImg,
-        bgBaked,
-        worldW / 2,
-        groundY / 2,
-        worldW,
-        groundY,
-        bgEffects,
-        time,
-        0,
-        0.25,
-      );
-    }
-
-    ctx.fillStyle = '#44403C';
-    ctx.fillRect(0, groundY, worldW, worldH - groundY);
-    ctx.fillStyle = '#EA580C';
-    ctx.fillRect(0, groundY, worldW, 3);
-    return;
-  }
-
-  if (theme === 'night') {
-    const sky = ctx.createLinearGradient(0, 0, 0, worldH);
-    sky.addColorStop(0, '#0B132B');
-    sky.addColorStop(0.65, '#1C2E59');
-    sky.addColorStop(1, '#263D73');
-    ctx.fillStyle = sky;
-    ctx.fillRect(0, 0, worldW, worldH);
-
-    if (bgImg) {
-      drawSpriteWithEffects(
-        ctx,
-        bgImg,
-        bgBaked,
-        worldW / 2,
-        groundY / 2,
-        worldW,
-        groundY,
-        bgEffects,
-        time,
-        0,
-        0.3,
-      );
-    }
-
-    const stars = [
-      [42, 28],
-      [98, 44],
-      [168, 22],
-      [232, 36],
-      [295, 24],
-      [334, 52],
-    ];
-    stars.forEach(([sx, sy], idx) => {
-      const twinkle = 0.45 + 0.55 * Math.sin(time * 2.4 + idx * 1.3);
-      ctx.fillStyle = `rgba(254, 243, 199, ${twinkle.toFixed(2)})`;
-      ctx.beginPath();
-      ctx.arc(sx, sy, 1.4, 0, Math.PI * 2);
-      ctx.fill();
-    });
-
-    ctx.fillStyle = '#FEF3C7';
-    ctx.beginPath();
-    ctx.arc(312, 42, 14, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#142347';
-    ctx.beginPath();
-    ctx.arc(318, 38, 12, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Warm lanterns
-    const lanterns = [62, 162, 262];
-    lanterns.forEach((lx, idx) => {
-      const sway = Math.sin(time * 2 + idx) * 2.5;
-      const ly = 50 + Math.sin((lx / worldW) * Math.PI) * 8;
-      const glowR = 18 + flare * 22;
-      const grad = ctx.createRadialGradient(lx + sway, ly + 7, 2, lx + sway, ly + 7, glowR);
-      grad.addColorStop(0, `rgba(251, 197, 61, ${Math.min(0.9, 0.45 + flare * 0.4)})`);
-      grad.addColorStop(1, 'rgba(251, 197, 61, 0)');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(lx + sway, ly + 7, glowR, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#F59E0B';
-      ctx.beginPath();
-      ctx.roundRect(lx + sway - 5, ly, 10, 14, 4);
-      ctx.fill();
-    });
-
-    ctx.fillStyle = '#334155';
-    ctx.fillRect(0, groundY, worldW, worldH - groundY);
-    ctx.fillStyle = '#64748B';
-    ctx.fillRect(0, groundY, worldW, 4);
-    return;
-  }
-
-  // Default Neutral Clean Studio Stage (zero pre-baked Lantern Bridge clutter!)
-  const bg = ctx.createLinearGradient(0, 0, 0, worldH);
-  bg.addColorStop(0, '#1E293B');
-  bg.addColorStop(1, '#334155');
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, worldW, worldH);
-
-  if (bgImg) {
-    drawSpriteWithEffects(
-      ctx,
-      bgImg,
-      bgBaked,
-      worldW / 2,
-      groundY / 2,
-      worldW,
-      groundY,
-      bgEffects,
-      time,
-      0,
-      0.45,
-    );
-  }
-
-  // Subtle geometric studio grid lines
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-  ctx.lineWidth = 1;
-  for (let gx = 36; gx < worldW; gx += 36) {
-    ctx.beginPath();
-    ctx.moveTo(gx, 0);
-    ctx.lineTo(gx, groundY);
-    ctx.stroke();
-  }
-  for (let gy = 36; gy < groundY; gy += 36) {
-    ctx.beginPath();
-    ctx.moveTo(0, gy);
-    ctx.lineTo(worldW, gy);
-    ctx.stroke();
-  }
-
-  // Clean crisp ground platform
-  ctx.fillStyle = '#0F172A';
-  ctx.fillRect(0, groundY, worldW, worldH - groundY);
-  ctx.fillStyle = '#475569';
-  ctx.fillRect(0, groundY, worldW, 4);
-}
-
 export function RightStudioColumn({
   lang,
   isOpen,
@@ -659,16 +203,12 @@ export function RightStudioColumn({
   edges,
   assetItems,
   scopedVariables,
-  selectedNodeId: boardSelectionId,
+  selectedNodeId,
   onToggle,
   onActivePlayChange,
   onUserTestedInPlay,
   onUpdatePlayValue,
-  onResetPlayValues,
-  onLocateCard,
-  onStageCardsChange,
-  onOpenAsset,
-  appearanceReset,
+  onEditScene,
 }: RightStudioColumnProps) {
   const t = COPY[lang].studio.play;
   const st = COPY[lang].studio.states;
@@ -676,8 +216,16 @@ export function RightStudioColumn({
   const isSpotlighted = spotlightStage === 'focus-play';
 
   const playableNodes = useMemo(() => getPlayableNodes(nodes), [nodes]);
+  const nodeMap = useMemo(
+    () => new Map(nodes.map((n) => [n.id, n])),
+    [nodes],
+  );
   const playableMap = useMemo(
     () => new Map(playableNodes.map((n) => [n.id, n])),
+    [playableNodes],
+  );
+  const playableIdSet = useMemo(
+    () => new Set(playableNodes.map((n) => n.id)),
     [playableNodes],
   );
   const loopEdgeIds = useMemo(() => computeLoopEdgeIds(nodes, edges), [nodes, edges]);
@@ -685,6 +233,10 @@ export function RightStudioColumn({
   const customFlagNames = useMemo(
     () => extractCustomFlagConditions(nodes, edges, scopedVariables),
     [nodes, edges, scopedVariables],
+  );
+  const simulatedEventList = useMemo(
+    () => extractSimulatedEventsFromEdges(nodes, edges, playableIdSet, lang),
+    [edges, lang, nodes, playableIdSet],
   );
   const usedStats = useMemo(() => detectUsedStats(nodes, edges), [nodes, edges]);
   const assetMap = useMemo(
@@ -714,181 +266,29 @@ export function RightStudioColumn({
 
   // Play Mode: Live Build Preview (default) vs Explicit Play Run
   const [playMode, setPlayMode] = useState<PlayMode>('preview');
-  const [layoutHistory, setLayoutHistory] = useState<{ current: StageLayout; undo: StageLayout[] }>({
-    current: EMPTY_STAGE_LAYOUT, undo: [],
-  });
-  const [layoutSelection, setLayoutSelection] = useState('');
-  const [editorSection, setEditorSection] = useState<StageEditorSection>('card');
-  const [editorCard, setEditorCard] = useState<string | null>(null);
-  const selectedNodeId = editorCard ?? boardSelectionId;
+  const [fullscreen, setFullscreen] = useState(false);
   useEffect(() => {
-    setEditorCard(null);
-    setLayoutSelection('');
-  }, [boardSelectionId]);
-  const [runChallengeId, setRunChallengeId] = useState<string | null>(null);
-  const [draft, setDraft] = useState<{ id: string; pose: Partial<StagePose> } | null>(null);
-  const [trialHistory, setTrialHistory] = useState<TrialSnapshot & { undo: TrialSnapshot[] }>({
-    ...EMPTY_TRIAL, undo: [],
-  });
-  const [moments, setMoments] = useState<StageMoment[]>([]);
-  const [visibleMoments, setVisibleMoments] = useState<StageMoment[]>([]);
-  const scheduledRef = useRef<StageMoment[]>([]);
-  const visibleRef = useRef<StageMoment[]>([]);
-  const visitRef = useRef<{ id?: string; atMs: number }>({ atMs: 0 });
-  const [clock, setClock] = useState(INITIAL_CLOCK);
-  const frameClockRef = useRef(INITIAL_CLOCK);
-  const [timings, setTimings] = useState<Record<string, MomentTiming>>({});
-  const [editTab, setEditTab] = useState<'arrange' | 'interface' | 'effects' | 'moments'>('arrange');
-  const [timelineCursor, setTimelineCursor] = useState<TimelineCursor | null>(null);
-  const [timelineDetail, setTimelineDetail] = useState<string | null>(null);
-  const effectScheduler = useRef(new StageEffectScheduler());
-  const [effectOccurrences, setEffectOccurrences] = useState<EffectOccurrence[]>([]);
-  const effectSequence = useRef(0);
-  const effectEventRef = useRef<(trigger: EffectTrigger, point: EffectPoint, cardIds?: string[]) => void>(() => {});
-  const effectTimeRef = useRef(0);
-  const readEffectRunTime = useCallback(() => effectTimeRef.current, []);
-  const readEffectPreviewTime = useCallback(() => performance.now(), []);
-  const editSequence = useRef(0);
-  const [loadingBackgrounds, setLoadingBackgrounds] = useState(false);
-  const [failedBackgrounds, setFailedBackgrounds] = useState<string[]>([]);
-  const startRequest = useRef(0);
-  useEffect(() => () => { ++startRequest.current; }, []);
-  const backgroundImages = useRef(new Map<string, HTMLImageElement>());
-  const backgroundLoads = useRef(new Map<string, Promise<boolean>>());
-  const currentBinding = useRef(getAssetVisualBinding);
-  currentBinding.current = getAssetVisualBinding;
-  const loadBackground = useCallback((url: string) => {
-    if (backgroundImages.current.has(url)) return Promise.resolve(true);
-    const existing = backgroundLoads.current.get(url);
-    if (existing) return existing;
-    const loading = new Promise<boolean>(resolve => {
-      const image = new Image();
-      image.crossOrigin = 'anonymous';
-      const finish = (ready: boolean) => {
-        window.clearTimeout(timeout);
-        image.onload = image.onerror = null;
-        if (ready) backgroundImages.current.set(url, image);
-        resolve(ready);
-      };
-      const timeout = window.setTimeout(() => finish(false), 4000);
-      image.onload = () => finish(true);
-      image.onerror = () => finish(false);
-      image.src = url;
-    });
-    backgroundLoads.current.set(url, loading);
-    void loading.then(() => backgroundLoads.current.delete(url));
-    return loading;
-  }, []);
-  const clearStageAppearance = useCallback((id: string) => {
-    const clear = (layout: StageLayout): StageLayout => {
-      const placement = layout.placements[id];
-      if (placement?.assetId === undefined) return layout;
-      return { ...layout, placements: { ...layout.placements, [id]: { ...placement, assetId: undefined } } };
+    if (!fullscreen) return;
+    const leave = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false);
     };
-    setLayoutHistory(previous => ({ current: clear(previous.current), undo: previous.undo.map(clear) }));
-    setTrialHistory(previous => ({
-      ...previous,
-      current: clear(previous.current),
-      undo: previous.undo.map(snapshot => ({ ...snapshot, current: clear(snapshot.current) })),
-    }));
-  }, []);
-  useEffect(() => {
-    if (appearanceReset) clearStageAppearance(appearanceReset.target);
-  }, [clearStageAppearance, appearanceReset]);
-  const [paused, setPaused] = useState(false);
-  const pausedRef = useRef(false);
-  const pauseLayoutRef = useRef<StageLayout | null>(null);
-  const [review, setReview] = useState<'save' | 'restart' | 'stop' | null>(null);
-  const [checkedChanges, setCheckedChanges] = useState<string[]>([]);
-  const [savedNotice, setSavedNotice] = useState(false);
-  const reviewDialogRef = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    if (review && isOpen && !reviewDialogRef.current?.open) reviewDialogRef.current?.showModal();
-  }, [review, isOpen]);
-  const playing = playMode === 'playing';
-  const timelineActive = isOpen && editTab === 'moments' && (!playing || paused);
-  const viewingTimeline = timelineActive ? timelineCursor : null;
-  useEffect(() => {
-    if (!timelineActive) { setTimelineCursor(null); setTimelineDetail(null); }
-  }, [timelineActive]);
-  const base = playing ? trialHistory.current : layoutHistory.current;
-  const edits = playing ? trialHistory.edits : EMPTY_TRIAL.edits;
-  const layout = useMemo(() => applyStageMoments(applyStageMoments(base, visibleMoments), edits),
-    [base, visibleMoments, edits]);
-  const layoutRef = useRef({ layout, base, edits, draft, selection: layoutSelection });
-  layoutRef.current = { layout, base, edits, draft, selection: layoutSelection };
-  const changes = useMemo(
-    () => stageLayoutChanges(layoutHistory.current, trialHistory.current),
-    [layoutHistory.current, trialHistory.current],
-  );
-  const pendingEdits = trialHistory.edits.filter(edit => !edit.confirmed);
-  const dirty = changes.length > 0 || pendingEdits.length > 0;
-  const fireEffectsRef = useRef<(entries: ReturnType<typeof effectEntries>, point: EffectPoint, preview: boolean) => void>(() => {});
-  fireEffectsRef.current = (entries, point, preview) => {
-    const occurrences = entries.filter(([, placement]) => assetItems.some(asset => asset.id === placement.assetId && asset.categoryId === 'effects')).map(([, placement]) => {
-      const anchor = placement.effect!.anchor;
-      return { key: 'effect-play:' + (++effectSequence.current), placement,
-        point: anchor === 'fixed' ? {x: placement.x ?? 180, y: placement.y ?? 125} : anchor === 'hero' ? {x:simRef.current.heroX,y:simRef.current.heroY-22} : point,
-        at: preview ? performance.now() : effectTimeRef.current, preview };
-    });
-    if (occurrences.length) setEffectOccurrences(previous => [...previous.slice(-49), ...occurrences]);
-  };
-  effectEventRef.current = (trigger, point, cardIds = []) => {
-    const challengeCard = hazardLayoutId.current?.replace(/^challenge:/, '');
-    const ids = [...cardIds, ...(visitRef.current.id ? [visitRef.current.id] : []), ...(challengeCard ? [challengeCard] : [])];
-    fireEffectsRef.current(eventEffects(layoutRef.current.layout, trigger, ids), point, trigger === 'victory');
-  };
-  const previewHits = useRef<{ id: string; pose: StagePose }[]>([]);
-  const composedItemsRef = useRef<PlacementItem[]>([]);
-  const hazardLayoutId = useRef<string | null>(null);
-  const commitLayout = (change: (current: StageLayout) => StageLayout) => {
-    setSavedNotice(false);
-    if (playing) {
-      setTrialHistory(prev => ({ ...prev, current: change(prev.current),
-        undo: [...prev.undo.slice(-49), { current: prev.current, edits: prev.edits }] }));
-    } else {
-      setLayoutHistory(prev => ({ current: change(prev.current), undo: [...prev.undo.slice(-49), prev.current] }));
-    }
-  };
-  const recordMoment = (target: string, change: MomentValue) => {
-    if (change.field === 'background' && change.value.color === layout.background.color &&
-      change.value.assetId === layout.background.assetId) return;
-    setSavedNotice(false);
-    const stamp = readClock();
-    const id = 'moment:' + (++editSequence.current);
-    const before = readMomentValue(layout, target, change.field);
-    setTrialHistory(prev => {
-      const last = prev.edits[prev.edits.length - 1];
-      const replace = last && !last.confirmed && last.target === target && last.field === change.field &&
-        last.clock.runMs === stamp.runMs && last.clock.cardId === stamp.cardId;
-      const value = change.field === 'size' && replace && last.field === 'size'
-        ? { ...change, value: { ...last.value, ...change.value } } : change;
-      const edit = { ...value, id: replace ? last.id : id, target, before: replace ? last.before : before, clock: stamp };
-      return { ...prev, edits: [...(replace ? prev.edits.slice(0, -1) : prev.edits), edit],
-        undo: [...prev.undo.slice(-49), { current: prev.current, edits: prev.edits }] };
-    });
-  };
-  const updatePlacement = (id: string, patch: StagePlacement) => {
-    if (playing && !id.startsWith('effect:') && !id.startsWith('interface:') && !id.startsWith('overlay:') &&
-      (!id.startsWith('decoration:') || layoutHistory.current.decorations.includes(id)) &&
-      (patch.width !== undefined || patch.height !== undefined)) {
-      const value = {
-        ...(patch.width !== undefined && patch.width !== layout.placements[id]?.width ? { width: patch.width } : {}),
-        ...(patch.height !== undefined && patch.height !== layout.placements[id]?.height ? { height: patch.height } : {}),
-      };
-      if (Object.keys(value).length) recordMoment(id, { field: 'size', value });
-      return;
-    }
-    commitLayout(current => ({
-      ...current,
-      placements: { ...current.placements, [id]: { ...current.placements[id], ...patch } },
-    }));
-  };
+    window.addEventListener('keydown', leave);
+    return () => window.removeEventListener('keydown', leave);
+  }, [fullscreen]);
   const [activeNodeIds, setActiveNodeIds] = useState<string[]>([]);
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  const [focusedGroupId, setFocusedGroupId] = useState<string | null>(null);
+  const [unlockedGroupIds, setUnlockedGroupIds] = useState<string[]>([]);
+  const [completedGroupIds, setCompletedGroupIds] = useState<string[]>([]);
+  const [pendingGroupIds, setPendingGroupIds] = useState<string[]>([]);
+  const [completedNodeIds, setCompletedNodeIds] = useState<string[]>([]);
   const [lastEdgeId, setLastEdgeId] = useState<string | null>(null);
   const [stats, setStats] = useState<PlayStats>(INITIAL_PLAY_STATS);
   const [customFlags, setCustomFlags] = useState<Record<string, boolean>>({});
+  const [simulatedEvents, setSimulatedEvents] = useState<Record<string, boolean>>({});
+  const [simRevision, setSimRevision] = useState(0);
   const [waveNumber, setWaveNumber] = useState(1);
+  const [challengeTimeLeft, setChallengeTimeLeft] = useState<number | null>(null);
   const [phase, setPhase] = useState<StagePhase>('overlay');
   const [hudToast, setHudToast] = useState<{
     text: string;
@@ -899,62 +299,83 @@ export function RightStudioColumn({
     tone: 'victory' | 'defeat' | 'neutral';
   } | null>(null);
 
-  const actionsByChallenge = useMemo(() => {
-    const result = new Map<string, BoardNode[]>();
-    for (const edge of edges) {
-      if (playableMap.get(edge.fromId)?.kind !== 'challenge') continue;
-      const action = playableMap.get(edge.toId);
-      if (action?.kind !== 'action') continue;
-      const actions = result.get(edge.fromId) ?? [];
-      if (!actions.some(node => node.id === action.id)) actions.push(action);
-      result.set(edge.fromId, actions);
-    }
-    return result;
-  }, [edges, playableMap]);
-  const challengesForAction = useCallback((actionId: string) => {
-    const found = new Set<string>();
-    const visited = new Set<string>();
-    const pending = [actionId];
-    while (pending.length) {
-      const current = pending.pop()!;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      for (const edge of edges) {
-        if (edge.toId !== current) continue;
-        const source = playableMap.get(edge.fromId);
-        if (source?.kind === 'challenge') found.add(source.id);
-        if (source?.kind === 'action') pending.push(source.id);
+  // Build Preview assembled dynamically from student-authored playable cards ONLY
+  const previewSnapshot = useMemo(() => {
+    const selectedNode = selectedNodeId ? playableMap.get(selectedNodeId) ?? null : null;
+    const selectedGroupDescendantIds =
+      selectedNode?.kind === 'group'
+        ? new Set(getDescendantNodeIds(selectedNode.id, nodes))
+        : null;
+    const scopedPool =
+      selectedGroupDescendantIds && selectedGroupDescendantIds.size > 0
+        ? playableNodes.filter((n) => selectedGroupDescendantIds.has(n.id))
+        : playableNodes;
+    const effectivePool = scopedPool.length > 0 ? scopedPool : playableNodes;
+
+    const narrations = effectivePool.filter((n) => n.kind === 'narration');
+    const dialogues = effectivePool.filter((n) => n.kind === 'dialogue');
+    const challenges = effectivePool.filter((n) => n.kind === 'challenge');
+    const actions = effectivePool.filter((n) => n.kind === 'action');
+    const outcomes = effectivePool.filter((n) => n.kind === 'outcome');
+
+    const narration =
+      (selectedNode?.kind === 'narration' ? selectedNode : null) ??
+      narrations[narrations.length - 1] ??
+      null;
+    const dialogue =
+      (selectedNode?.kind === 'dialogue' ? selectedNode : null) ??
+      dialogues[dialogues.length - 1] ??
+      null;
+    const challenge =
+      (selectedNode?.kind === 'challenge' ? selectedNode : null) ??
+      challenges[challenges.length - 1] ??
+      null;
+    const outcome =
+      (selectedNode?.kind === 'outcome' ? selectedNode : null) ??
+      outcomes[outcomes.length - 1] ??
+      null;
+
+    const narrationPos = narration ? resolveSubtitlePosition(narration) : 'bottom';
+    const themeNode =
+      selectedNode && (selectedNode.kind === 'narration' || selectedNode.kind === 'challenge')
+        ? selectedNode
+        : narration ?? challenge;
+    const sceneTheme: SceneTheme = themeNode ? resolveSceneTheme(themeNode) : 'neutral';
+
+    let showNarration = Boolean(narration);
+    let showDialogue = Boolean(dialogue);
+    if (showNarration && showDialogue && narrationPos === 'bottom') {
+      if (selectedNode?.kind === 'narration') {
+        showDialogue = false;
+      } else {
+        showNarration = false;
       }
     }
-    return [...found];
-  }, [edges, playableMap]);
-  const previewSnapshot = useMemo(() => {
-    const selectedNode = (selectedNodeId && playableMap.get(selectedNodeId)) ||
-      (startNodeId && playableMap.get(startNodeId)) || null;
-    const narration = selectedNode?.kind === 'narration' ? selectedNode : null;
-    const dialogue = selectedNode?.kind === 'dialogue' ? selectedNode : null;
-    const challenge = selectedNode?.kind === 'challenge' ? selectedNode :
-      selectedNode?.kind === 'action' ? playableMap.get(challengesForAction(selectedNode.id)[0]) ?? null : null;
-    const outcome = selectedNode?.kind === 'outcome' ? selectedNode : null;
-    const narrationPos = narration ? resolveSubtitlePosition(narration) : 'bottom';
-    const themeCard = narration ?? playableNodes.find(node => node.kind === 'narration');
-    return {
-      selectedNode, narration, dialogue, challenge, outcome, narrationPos,
-      sceneTheme: themeCard ? resolveSceneTheme(themeCard) : 'neutral' as const,
-      challengeCfg: challenge ? resolveChallengeConfig(challenge) : null,
-      outcomeCfg: outcome ? resolveOutcomeConfig(outcome) : null,
-      actions: challenge ? actionsByChallenge.get(challenge.id) ?? [] : selectedNode?.kind === 'action' ? [selectedNode] : [],
-      showHero: Boolean(challenge || dialogue || selectedNode?.kind === 'action'),
-    };
-  }, [actionsByChallenge, challengesForAction, playableMap, playableNodes, selectedNodeId, startNodeId]);
 
-  const challengeRole = useCallback((id: string | null | undefined) => {
-    const actions = id ? actionsByChallenge.get(id) ?? [] : [];
-    const actors = new Set(actions.map(action =>
-      action.promptInput?.actorAssetId ?? getNodeAssetIds(action).find(assetId => assetMap.get(assetId)?.categoryId === 'characters')
-    ).filter((id): id is string => Boolean(id && assetMap.get(id)?.categoryId === 'characters')));
-    return { actions, actorId: actors.size === 1 ? [...actors][0] : undefined, conflict: actors.size > 1 };
-  }, [actionsByChallenge, assetMap]);
+    const challengeCfg = challenge ? resolveChallengeConfig(challenge) : null;
+    const outcomeCfg = outcome ? resolveOutcomeConfig(outcome) : null;
+    const hasHeroCharacterAsset = effectivePool.some(
+      (n) =>
+        n.kind !== 'challenge' &&
+        getNodeAssetIds(n).some((id) => assetMap.get(id)?.categoryId === 'characters'),
+    );
+    const showHero =
+      actions.length > 0 || dialogues.length > 0 || challenges.length > 0 || hasHeroCharacterAsset;
+
+    return {
+      selectedNode,
+      sceneTheme,
+      narration: showNarration ? narration : null,
+      narrationPos,
+      dialogue: showDialogue ? dialogue : null,
+      challenge,
+      challengeCfg,
+      actions,
+      outcome,
+      outcomeCfg,
+      showHero,
+    };
+  }, [assetMap, nodes, playableMap, playableNodes, selectedNodeId]);
 
   const getNodeVisualBindingByCategories = useCallback(
     (
@@ -963,7 +384,7 @@ export function RightStudioColumn({
       strictCategories = false,
     ) => {
       if (!node) return null;
-      const ids = getNodeAssetIds(node);
+      const ids = [...getNodeAssetIds(node)].reverse();
       for (const cat of preferredCategories) {
         const matchId = ids.find((id) => assetMap.get(id)?.categoryId === cat);
         if (matchId) {
@@ -981,21 +402,30 @@ export function RightStudioColumn({
     [assetMap, getAssetVisualBinding],
   );
 
-  // Only load bound character sprite when explicitly bound or selected by the student
+  // Separate Hero character binding cleanly from Challenge obstacle assets
   const characterBinding = useMemo(() => {
-    const override = getAssetVisualBinding(layout.placements.hero?.assetId);
-    if (override) return override;
-    const role = challengeRole(playing ? runChallengeId : previewSnapshot.challenge?.id);
-    const challengeActor = getAssetVisualBinding(role.actorId);
-    if (challengeActor) return challengeActor;
     const resolveCharacterFromNode = (node: BoardNode) => {
-      const boundIds = getNodeAssetIds(node);
+      if (node.kind === 'challenge') {
+        const actorId = node.promptInput?.actorAssetId;
+        if (actorId && actorId !== node.promptInput?.obstacleAssetId) {
+          const binding = getAssetVisualBinding(actorId);
+          if (binding) return binding;
+        }
+        return null;
+      }
+
+      const boundIds = [...getNodeAssetIds(node)].reverse();
       const boundCharId = boundIds.find(
-        (id) => assetMap.get(id)?.categoryId === 'characters' && id !== node.challengeAssetId,
+        (id) => assetMap.get(id)?.categoryId === 'characters',
       );
       if (boundCharId) {
         const binding = getAssetVisualBinding(boundCharId);
         if (binding) return binding;
+      }
+
+      if (node.kind === 'action' && node.promptInput?.actorAssetId) {
+        const actorBinding = getAssetVisualBinding(node.promptInput.actorAssetId);
+        if (actorBinding) return actorBinding;
       }
 
       const namedChar =
@@ -1018,134 +448,112 @@ export function RightStudioColumn({
       return null;
     };
 
+    const selectedGroupDescendantIds =
+      previewSnapshot.selectedNode?.kind === 'group'
+        ? new Set(getDescendantNodeIds(previewSnapshot.selectedNode.id, nodes))
+        : null;
+
     const prioritized = playableNodes.filter((n) =>
-      playMode === 'playing' ? activeNodeIds.includes(n.id) : n.id === selectedNodeId,
+      playMode === 'playing'
+        ? n.id === focusedNodeId || activeNodeIds.includes(n.id)
+        : n.id === selectedNodeId || Boolean(selectedGroupDescendantIds?.has(n.id)),
     );
-    for (const node of [...prioritized, ...playableNodes]) {
-      if (node.kind !== 'action') continue;
-      const actor = getAssetVisualBinding(node.promptInput?.actorAssetId);
-      if (actor) return actor;
-    }
+    prioritized.sort((a, b) => {
+      if (playMode === 'playing') {
+        if (a.id === focusedNodeId) return -1;
+        if (b.id === focusedNodeId) return 1;
+      }
+      return 0;
+    });
     for (const node of prioritized) {
       const binding = resolveCharacterFromNode(node);
       if (binding) return binding;
     }
-    for (const node of playableNodes) {
+    const nonChallengeFallback = playableNodes.filter((n) => n.kind !== 'challenge');
+    for (const node of nonChallengeFallback) {
       const binding = resolveCharacterFromNode(node);
       if (binding) return binding;
     }
     return null;
   }, [
     activeNodeIds,
-    challengeRole, playing, runChallengeId, previewSnapshot.challenge?.id,
-    layout.placements.hero?.assetId,
     assetItems,
     assetMap,
+    focusedNodeId,
     getAssetVisualBinding,
+    nodes,
     playMode,
     playableNodes,
+    previewSnapshot.selectedNode,
     selectedNodeId,
   ]);
 
-  const cardBackgroundSource = useMemo(() => {
+  const backgroundBinding = useMemo(() => {
     const hasBgAsset = (n: BoardNode) =>
       getNodeAssetIds(n).some((id) => assetMap.get(id)?.categoryId === 'backgrounds');
 
-    const activeMatch = playableNodes.find(
-      (n) =>
-        (playMode === 'playing'
-          ? activeNodeIds.includes(n.id)
-          : n.id === selectedNodeId) && hasBgAsset(n),
-    );
+    const selectedGroupDescendantIds =
+      previewSnapshot.selectedNode?.kind === 'group'
+        ? new Set(getDescendantNodeIds(previewSnapshot.selectedNode.id, nodes))
+        : null;
+
+    const activeMatch =
+      (playMode === 'playing' && focusedNodeId
+        ? playableNodes.find((n) => n.id === focusedNodeId && hasBgAsset(n))
+        : undefined) ??
+      playableNodes.find(
+        (n) =>
+          (playMode === 'playing'
+            ? activeNodeIds.includes(n.id)
+            : n.id === selectedNodeId || Boolean(selectedGroupDescendantIds?.has(n.id))) &&
+          hasBgAsset(n),
+      );
     if (activeMatch) {
-      return activeMatch;
+      return getNodeVisualBindingByCategories(activeMatch, ['backgrounds'], true);
     }
     const narrationOrChallenge =
-      playableNodes.find((n) => n.kind === 'narration' && hasBgAsset(n)) ??
-      playableNodes.find((n) => n.kind === 'challenge' && hasBgAsset(n)) ??
-      playableNodes.find((n) => hasBgAsset(n));
-    return narrationOrChallenge;
+      [...playableNodes].reverse().find((n) => n.kind === 'narration' && hasBgAsset(n)) ??
+      [...playableNodes].reverse().find((n) => n.kind === 'challenge' && hasBgAsset(n)) ??
+      [...playableNodes].reverse().find((n) => hasBgAsset(n));
+    return getNodeVisualBindingByCategories(narrationOrChallenge, ['backgrounds'], true);
   }, [
     activeNodeIds,
     assetMap,
+    focusedNodeId,
     getNodeVisualBindingByCategories,
+    nodes,
     playMode,
     playableNodes,
+    previewSnapshot.selectedNode,
     selectedNodeId,
   ]);
-  const timelineCard = viewingTimeline?.cardId && playableNodes.find(node => node.id === viewingTimeline.cardId);
-  const timelineBackground = timelineCard
-    ? getNodeVisualBindingByCategories(timelineCard, ['backgrounds'], true) ??
-      getNodeVisualBindingByCategories(playableNodes.find(node =>
-        getNodeAssetIds(node).some(id => assetMap.get(id)?.categoryId === 'backgrounds')), ['backgrounds'], true)
-    : null;
-  const timelineUsesVisit = Boolean(viewingTimeline?.cardId && paused && viewingTimeline.cardId === clock.cardId);
-  const selectedTime = viewingTimeline?.atMs ?? 0;
-  const timelineTime = selectedTime - (viewingTimeline?.before ? 1 : 0);
-  const timelineRunTime = timelineTime + (timelineUsesVisit ? clock.runMs - clock.cardMs : 0);
-  const timelineLayout = viewingTimeline ? applyStageMoments(layoutHistory.current,
-    dueMoments(arrangeMoments(moments), { runMs: timelineRunTime, cardMs: timelineTime, cardId: viewingTimeline.cardId })
-      .filter(moment => moment.field !== 'background' || !moment.value.assetId ||
-        Boolean(getAssetVisualBinding(moment.value.assetId) && !failedBackgrounds.includes(moment.value.assetId)))) : null;
-  const timelineBackdrop = getAssetVisualBinding(timelineLayout?.background.assetId) ?? timelineBackground;
-  const timelineRender = useRef({ layout: timelineLayout, background: timelineBackdrop, card: Boolean(timelineCard), sample: Boolean(timelineCard && !timelineUsesVisit) });
-  timelineRender.current = { layout: timelineLayout, background: timelineBackdrop, card: Boolean(timelineCard), sample: Boolean(timelineCard && !timelineUsesVisit) };
-  useEffect(() => {
-    if (timelineBackdrop?.url) void loadBackground(timelineBackdrop.url);
-  }, [timelineBackdrop?.url, loadBackground]);
-  const cardBackgroundBinding = getNodeVisualBindingByCategories(cardBackgroundSource, ['backgrounds'], true);
-  const arrangedBackground = getAssetVisualBinding(layout.background.assetId);
-  const backgroundBinding = arrangedBackground ?? cardBackgroundBinding;
-  useEffect(() => {
-    if (arrangedBackground?.url) void loadBackground(arrangedBackground.url);
-  }, [arrangedBackground?.url, loadBackground]);
 
-  const challengeAppearance = useCallback((card: BoardNode) => {
-    const preferred = card.challengeAssetId;
-    return (preferred && getNodeAssetIds(card).includes(preferred) ? getAssetVisualBinding(preferred) : null) ??
-      getNodeVisualBindingByCategories(card, ['objects', 'characters', 'effects'], true);
-  }, [getAssetVisualBinding, getNodeVisualBindingByCategories]);
   const challengeBinding = useMemo(() => {
-    const hasObstacleAsset = (n: BoardNode) =>
-      getNodeAssetIds(n).some((id) => {
-        const cat = assetMap.get(id)?.categoryId;
-        return cat === 'objects' || cat === 'characters' || cat === 'effects';
-      });
+    const focusedChallenge =
+      playMode === 'playing' && focusedNodeId
+        ? playableNodes.find((n) => n.id === focusedNodeId && n.kind === 'challenge')
+        : undefined;
     const targetChallenge =
       playMode === 'playing'
-        ? playableNodes.find(
-            (n) =>
-              n.kind === 'challenge' &&
-              activeNodeIds.includes(n.id),
+        ? focusedChallenge ??
+          playableNodes.find(
+            (n) => n.kind === 'challenge' && activeNodeIds.includes(n.id),
           )
         : previewSnapshot.challenge;
-    const override = targetChallenge && getAssetVisualBinding(layout.placements[challengeId(targetChallenge.id)]?.assetId);
-    if (override) return override;
-    const anyChallenge = playableNodes.find(
-      (n) => n.kind === 'challenge' && hasObstacleAsset(n),
+    if (!targetChallenge) return null;
+    return getNodeVisualBindingByCategories(
+      targetChallenge,
+      ['objects', 'characters', 'effects'],
+      true,
     );
-    return (targetChallenge ? challengeAppearance(targetChallenge) : null) ??
-      (anyChallenge ? challengeAppearance(anyChallenge) : null);
   }, [
     activeNodeIds,
-    assetMap,
+    focusedNodeId,
     getNodeVisualBindingByCategories,
     playMode,
     playableNodes,
     previewSnapshot.challenge,
-    getAssetVisualBinding,
-    challengeAppearance,
-    layout.placements,
   ]);
-
-  useEffect(() => {
-    for (const card of playableNodes) {
-      if (card.kind !== 'challenge') continue;
-      const override = layout.placements[challengeId(card.id)]?.assetId;
-      const binding = getAssetVisualBinding(override) ?? challengeAppearance(card);
-      if (binding) void loadBackground(binding.url);
-    }
-  }, [playableNodes, layout.placements, getAssetVisualBinding, challengeAppearance, loadBackground]);
 
   // Refs for smooth 60fps Canvas Loop
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
@@ -1155,20 +563,20 @@ export function RightStudioColumn({
   const hazardImgRef = useRef<HTMLImageElement | null>(null);
   const heroBakedRef = useRef<{ canvas: HTMLCanvasElement; padRatio: number } | null>(null);
   const bgBakedRef = useRef<{ canvas: HTMLCanvasElement; padRatio: number } | null>(null);
-  const arrangedBgBakeRef = useRef<{
-    image: HTMLImageElement;
-    fingerprint: string;
-    baked: ReturnType<typeof bakeStaticEffectsToCanvas>;
-  } | null>(null);
   const hazardBakedRef = useRef<{ canvas: HTMLCanvasElement; padRatio: number } | null>(null);
   const heroEffectsRef = useRef<VisualEffectItem[] | undefined>(undefined);
   heroEffectsRef.current = characterBinding?.effects;
   const bgEffectsRef = useRef<VisualEffectItem[] | undefined>(undefined);
-  bgEffectsRef.current = cardBackgroundBinding?.effects;
+  bgEffectsRef.current = backgroundBinding?.effects;
   const hazardEffectsRef = useRef<VisualEffectItem[] | undefined>(undefined);
   hazardEffectsRef.current = challengeBinding?.effects;
-  const resolveTimerRef = useRef<{ at: number; run: () => void } | null>(null);
-  const overlayTimerRef = useRef<number | null>(null);
+  const heroAssetIdRef = useRef<string | undefined>(undefined);
+  heroAssetIdRef.current = characterBinding?.assetId;
+  const backgroundAssetIdRef = useRef<string | undefined>(undefined);
+  backgroundAssetIdRef.current = backgroundBinding?.assetId;
+  const hazardAssetIdRef = useRef<string | undefined>(undefined);
+  hazardAssetIdRef.current = challengeBinding?.assetId;
+  const resolveTimerRef = useRef<number | null>(null);
 
   const playModeRef = useRef(playMode);
   playModeRef.current = playMode;
@@ -1178,6 +586,23 @@ export function RightStudioColumn({
   statsRef.current = stats;
   const customFlagsRef = useRef(customFlags);
   customFlagsRef.current = customFlags;
+  const simulatedEventsRef = useRef(simulatedEvents);
+  simulatedEventsRef.current = simulatedEvents;
+  const activeNodeIdsRef = useRef(activeNodeIds);
+  activeNodeIdsRef.current = activeNodeIds;
+  const focusedNodeIdRef = useRef(focusedNodeId);
+  focusedNodeIdRef.current = focusedNodeId;
+  const focusedGroupIdRef = useRef(focusedGroupId);
+  focusedGroupIdRef.current = focusedGroupId;
+  const unlockedGroupIdsRef = useRef(unlockedGroupIds);
+  unlockedGroupIdsRef.current = unlockedGroupIds;
+  const completedGroupIdsRef = useRef(completedGroupIds);
+  completedGroupIdsRef.current = completedGroupIds;
+  const pendingGroupIdsRef = useRef(pendingGroupIds);
+  pendingGroupIdsRef.current = pendingGroupIds;
+  const completedNodeIdsRef = useRef(completedNodeIds);
+  completedNodeIdsRef.current = completedNodeIds;
+  const actionOwnerMapRef = useRef<Map<string, string>>(new Map());
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
   const edgesRef = useRef(edges);
@@ -1190,12 +615,25 @@ export function RightStudioColumn({
   phaseRef.current = phase;
   const playableCountRef = useRef(playableNodes.length);
   playableCountRef.current = playableNodes.length;
+  const runtimeEventsRef = useRef<Set<string>>(new Set());
+  const runtimeEventRecordsRef = useRef<RuntimeEventRecord[]>([]);
+  const pendingActionIdsRef = useRef<Set<string>>(new Set());
+  const firedTriggerEdgeIdsRef = useRef<Set<string>>(new Set());
+  const challengeTimerRemainingRef = useRef<number | null>(null);
+  const lastTimerShownRef = useRef<number | null>(null);
+  const prevSpatialRef = useRef({
+    wasAirborne: false,
+    wasTouching: false,
+    wasBlocking: false,
+    wasDashing: false,
+  });
+  const reactiveTransitionLockRef = useRef(false);
 
+  const WORLD_W = 360;
+  const WORLD_H = 250;
+  const GROUND_Y = 196;
+  const HERO_BASE_X = 76;
 
-  const readClock = (): MomentClock => {
-    const runMs = Math.round(simRef.current.time * 1000);
-    return { runMs, cardId: visitRef.current.id, cardMs: Math.max(0, runMs - visitRef.current.atMs) };
-  };
   const simRef = useRef({
     time: 0,
     heroX: HERO_BASE_X,
@@ -1248,7 +686,7 @@ export function RightStudioColumn({
   }, [characterBinding?.fingerprint]);
 
   useEffect(() => {
-    const url = cardBackgroundBinding?.url;
+    const url = backgroundBinding?.url;
     if (!url) {
       bgImgRef.current = null;
       bgBakedRef.current = null;
@@ -1266,7 +704,7 @@ export function RightStudioColumn({
     return () => {
       cancelled = true;
     };
-  }, [cardBackgroundBinding?.url]);
+  }, [backgroundBinding?.url]);
 
   useEffect(() => {
     if (bgImgRef.current) {
@@ -1275,7 +713,7 @@ export function RightStudioColumn({
         bgEffectsRef.current,
       );
     }
-  }, [cardBackgroundBinding?.fingerprint]);
+  }, [backgroundBinding?.fingerprint]);
 
   useEffect(() => {
     const url = challengeBinding?.url;
@@ -1308,20 +746,27 @@ export function RightStudioColumn({
   }, [challengeBinding?.fingerprint]);
 
   useEffect(() => {
+    return () => {
+      if (resolveTimerRef.current !== null) {
+        window.clearTimeout(resolveTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (playableNodes.length === 0 && playMode === 'playing') {
-      ++startRequest.current;
-      setLoadingBackgrounds(false);
-      visibleRef.current = [];
-      setVisibleMoments([]);
-      resolveTimerRef.current = null;
-      overlayTimerRef.current = null;
-      pauseLayoutRef.current = null;
-      pausedRef.current = false;
-      setPaused(false);
-      setReview(null);
-      setDraft(null);
+      if (resolveTimerRef.current !== null) {
+        window.clearTimeout(resolveTimerRef.current);
+        resolveTimerRef.current = null;
+      }
       setPlayMode('preview');
       setActiveNodeIds([]);
+      setFocusedNodeId(null);
+      setFocusedGroupId(null);
+      setUnlockedGroupIds([]);
+      setCompletedGroupIds([]);
+      setPendingGroupIds([]);
+      setCompletedNodeIds([]);
       setLastEdgeId(null);
       simRef.current.hazard = null;
     }
@@ -1339,83 +784,208 @@ export function RightStudioColumn({
     () =>
       activeNodeIds
         .map((id) => playableMap.get(id))
-        .filter((n): n is BoardNode => Boolean(n)),
+        .filter((n): n is BoardNode => Boolean(n && n.kind !== 'group')),
     [activeNodeIds, playableMap],
   );
-  const primaryNode = activeNodes[0] ?? null;
-
-  const outgoing = useMemo(
+  const primaryNode = useMemo(
     () =>
-      getEvaluatedOutgoing(
-        activeNodeIds,
-        nodes,
-        edges,
-        stats,
-        customFlags,
-        loopEdgeIds,
-        scopedVariables,
-      ),
-    [activeNodeIds, nodes, edges, stats, customFlags, loopEdgeIds, scopedVariables],
+      (focusedNodeId ? activeNodes.find((n) => n.id === focusedNodeId) : undefined) ??
+      activeNodes[0] ??
+      null,
+    [activeNodes, focusedNodeId],
   );
+
+  const activeSceneTheme = useMemo<SceneTheme>(() => {
+    if (playMode === 'playing') {
+      const themeNode =
+        (primaryNode && (primaryNode.kind === 'narration' || primaryNode.kind === 'challenge')
+          ? primaryNode
+          : undefined) ??
+        activeNodes.find((n) => n.kind === 'narration' || n.kind === 'challenge') ??
+        playableNodes.find((n) => n.kind === 'narration' || n.kind === 'challenge');
+      if (themeNode) return resolveSceneTheme(themeNode);
+    }
+    return previewSnapshot.sceneTheme;
+  }, [activeNodes, playMode, playableNodes, previewSnapshot.sceneTheme, primaryNode]);
+  const activeSceneThemeRef = useRef<SceneTheme>(activeSceneTheme);
+  activeSceneThemeRef.current = activeSceneTheme;
+
+  const buildRuntimeCtx = useCallback((): PlayRuntimeContext => {
+    const sim = simRef.current;
+    return {
+      runtimeEvents: runtimeEventsRef.current,
+      eventRecords: runtimeEventRecordsRef.current,
+      heroAssetId: heroAssetIdRef.current,
+      hazardAssetId: hazardAssetIdRef.current,
+      simulatedEvents: simulatedEventsRef.current,
+      numericParameters: collectNumericBoardParameters(nodesRef.current),
+      spatial: {
+        heroX: sim.heroX,
+        heroY: sim.heroY,
+        groundY: GROUND_Y,
+        heroVx: sim.heroVx,
+        heroVy: sim.heroVy,
+        onGround: sim.onGround,
+        shieldTimer: sim.shieldTimer,
+        dodgeTimer: sim.dodgeTimer,
+        hasHazard: Boolean(sim.hazard),
+        hazardX: sim.hazard?.x ?? 0,
+        hazardY: sim.hazard?.y ?? 0,
+        hazardVx: sim.hazard?.vx ?? 0,
+        hazardVy: sim.hazard?.vy ?? 0,
+        hazardKind: sim.hazard?.kind,
+        hazardResolved: sim.hazard?.resolved,
+      },
+    };
+  }, []);
+
+  const outgoing = useMemo(() => {
+    void simRevision;
+    return getEvaluatedOutgoing(
+      activeNodeIds,
+      nodes,
+      edges,
+      stats,
+      customFlags,
+      loopEdgeIds,
+      scopedVariables,
+      buildRuntimeCtx(),
+    );
+  }, [
+    activeNodeIds,
+    buildRuntimeCtx,
+    customFlags,
+    edges,
+    loopEdgeIds,
+    nodes,
+    scopedVariables,
+    simRevision,
+    simulatedEvents,
+    stats,
+  ]);
 
   const liveActionControls = useMemo<LiveActionControl[]>(() => {
     if (playMode !== 'playing') return [];
 
-    if (primaryNode?.kind === 'challenge') {
-      const wired = outgoing
-        .filter((item) => item.target.kind === 'action')
-        .map((item) => {
-          const cfg = resolveActionConfig(item.target);
-          return {
-            id: item.edge.id,
-            edgeId: item.edge.id,
-            fromNodeId: item.edge.fromId,
-            target: item.target,
-            mechanic: cfg.mechanic,
-            keyLabel: cfg.keyBinding,
-            control: cfg.control,
-            evaluation: item.evaluation,
-          };
-        });
-      if (wired.length > 0) return wired;
+    // Collect action controls for the focused mechanism AND any parallel mechanisms in the same chapter
+    const relevantActive = activeNodes.filter((n) => {
+      if (n.kind !== 'challenge' && n.kind !== 'action') return false;
+      if (!focusedGroupId) return true;
+      return n.parentId === focusedGroupId || isDescendantOf(n.id, focusedGroupId, nodeMap);
+    });
+    const mechanismPool =
+      relevantActive.length > 0
+        ? relevantActive
+        : primaryNode && (primaryNode.kind === 'challenge' || primaryNode.kind === 'action')
+          ? [primaryNode]
+          : [];
+    if (mechanismPool.length === 0) return [];
 
-      return playableNodes
-        .filter((n) => n.kind === 'action')
-        .map((actionNode) => {
+    // Order with focused primaryNode first
+    const orderedPool = [...mechanismPool].sort((a, b) => {
+      if (a.id === primaryNode?.id) return -1;
+      if (b.id === primaryNode?.id) return 1;
+      return 0;
+    });
+
+    const controls: LiveActionControl[] = [];
+    const showMechLabel = orderedPool.length > 1;
+    const runtimeCtx = buildRuntimeCtx();
+
+    for (const mechNode of orderedPool) {
+      const mechLabel = showMechLabel
+        ? mechNode.note.trim() || mechNode.title.trim() || mechNode.kind
+        : undefined;
+
+      if (mechNode.kind === 'challenge') {
+        const mechOut = getEvaluatedOutgoing(
+          [mechNode.id],
+          nodes,
+          edges,
+          stats,
+          customFlags,
+          loopEdgeIds,
+          scopedVariables,
+          runtimeCtx,
+        );
+        const wired = mechOut
+          .filter((item) => item.target.kind === 'action')
+          .map((item) => {
+            const cfg = resolveActionConfig(item.target);
+            return {
+              id: `${mechNode.id}::${item.edge.id}`,
+              edgeId: item.edge.id,
+              fromNodeId: item.edge.fromId,
+              ownerNodeId: mechNode.id,
+              ownerLabel: mechLabel,
+              target: item.target,
+              mechanic: cfg.mechanic,
+              keyLabel: cfg.keyBinding,
+              control: cfg.control,
+              evaluation: item.evaluation,
+            };
+          });
+        if (wired.length > 0) {
+          controls.push(...wired);
+          continue;
+        }
+
+        // Fallback to sibling actions inside same group, or board actions
+        const groupSiblingActions = playableNodes.filter(
+          (n) => n.kind === 'action' && n.parentId && n.parentId === mechNode.parentId,
+        );
+        const fallbackActions =
+          groupSiblingActions.length > 0
+            ? groupSiblingActions
+            : playableNodes.filter((n) => n.kind === 'action');
+        for (const actionNode of fallbackActions) {
           const cfg = resolveActionConfig(actionNode);
-          return {
-            id: `free-${actionNode.id}`,
+          controls.push({
+            id: `free-${mechNode.id}-${actionNode.id}`,
             edgeId: null,
-            fromNodeId: primaryNode.id,
+            fromNodeId: mechNode.id,
+            ownerNodeId: mechNode.id,
+            ownerLabel: mechLabel,
             target: actionNode,
             mechanic: cfg.mechanic,
             keyLabel: cfg.keyBinding,
             control: cfg.control,
             evaluation: PASSING_EVAL,
-          };
+          });
+        }
+      } else if (mechNode.kind === 'action') {
+        const cfg = resolveActionConfig(mechNode);
+        controls.push({
+          id: `sandbox-${mechNode.id}`,
+          edgeId: null,
+          fromNodeId: null,
+          ownerNodeId: mechNode.id,
+          ownerLabel: mechLabel,
+          target: mechNode,
+          mechanic: cfg.mechanic,
+          keyLabel: cfg.keyBinding,
+          control: cfg.control,
+          evaluation: PASSING_EVAL,
         });
+      }
     }
 
-    if (primaryNode?.kind === 'action') {
-      return playableNodes
-        .filter((n) => n.kind === 'action')
-        .map((actionNode) => {
-          const cfg = resolveActionConfig(actionNode);
-          return {
-            id: `sandbox-${actionNode.id}`,
-            edgeId: null,
-            fromNodeId: null,
-            target: actionNode,
-            mechanic: cfg.mechanic,
-            keyLabel: cfg.keyBinding,
-            control: cfg.control,
-            evaluation: PASSING_EVAL,
-          };
-        });
-    }
-
-    return [];
-  }, [outgoing, playMode, playableNodes, primaryNode]);
+    return controls;
+  }, [
+    activeNodes,
+    buildRuntimeCtx,
+    customFlags,
+    edges,
+    focusedGroupId,
+    loopEdgeIds,
+    nodeMap,
+    nodes,
+    playMode,
+    playableNodes,
+    primaryNode,
+    scopedVariables,
+    stats,
+  ]);
 
   const liveActionControlsRef = useRef(liveActionControls);
   liveActionControlsRef.current = liveActionControls;
@@ -1453,22 +1023,62 @@ export function RightStudioColumn({
     });
   }, []);
 
-  const spawnChallengeHazard = useCallback((challengeNode: BoardNode) => {
-    const cfg = resolveChallengeConfig(challengeNode);
-    const id = challengeId(challengeNode.id);
-    hazardLayoutId.current = id;
-    const sim = simRef.current;
-    sim.lastActionControlId = null;
-    sim.lastActionMechanic = null;
-    sim.waves = [];
+  const recordRuntimeEvent = useCallback(
+    (
+      eventId: string,
+      opts?: Omit<RuntimeEventRecord, 'eventId'>,
+    ): boolean => {
+      let added = false;
+      if (!runtimeEventsRef.current.has(eventId)) {
+        runtimeEventsRef.current.add(eventId);
+        added = true;
+      }
+      if (opts) {
+        const dup = runtimeEventRecordsRef.current.some(
+          (r) =>
+            r.eventId === eventId &&
+            r.subjectAssetId === opts.subjectAssetId &&
+            r.subjectRole === opts.subjectRole &&
+            r.targetAssetId === opts.targetAssetId &&
+            r.targetRole === opts.targetRole,
+        );
+        if (!dup) {
+          runtimeEventRecordsRef.current.push({ eventId, ...opts });
+          added = true;
+        }
+      } else if (added) {
+        runtimeEventRecordsRef.current.push({ eventId });
+      }
+      return added;
+    },
+    [],
+  );
 
-    if (cfg.isSceneOnly) {
-      sim.hazard = null;
-      return;
-    }
+  const spawnChallengeHazard = useCallback(
+    (challengeNode: BoardNode) => {
+      const cfg = resolveChallengeConfig(challengeNode);
+      const sim = simRef.current;
+      sim.lastActionControlId = null;
+      sim.lastActionMechanic = null;
+      sim.waves = [];
+      if (heroAssetIdRef.current) {
+        recordRuntimeEvent('appears', {
+          subjectAssetId: heroAssetIdRef.current,
+          subjectRole: 'hero',
+        });
+      }
 
-    const baseHorizontalSpeed =
-      (cfg.pattern === 'collectible' ? 125 : 148) * cfg.speedMultiplier;
+      if (cfg.isSceneOnly) {
+        sim.hazard = null;
+        return;
+      }
+
+      recordRuntimeEvent('appears', {
+        subjectAssetId: hazardAssetIdRef.current,
+        subjectRole: 'hazard',
+      });
+
+    const travelSpeed = cardPreviewTravelSpeed(cfg.direction, cfg.pattern, cfg.speedMultiplier);
     const baseY = cfg.pattern === 'collectible' ? GROUND_Y - 58 : GROUND_Y - 14;
     const radius = cfg.pattern === 'collectible' ? 14 : 13;
 
@@ -1478,7 +1088,7 @@ export function RightStudioColumn({
         y: -18,
         baseY: -18,
         vx: 0,
-        vy: 112 * cfg.speedMultiplier,
+        vy: travelSpeed,
         radius,
         kind: cfg.pattern,
         direction: cfg.direction,
@@ -1497,7 +1107,7 @@ export function RightStudioColumn({
         y: GROUND_Y + 12,
         baseY: GROUND_Y + 12,
         vx: 0,
-        vy: -102 * cfg.speedMultiplier,
+        vy: -travelSpeed,
         radius,
         kind: cfg.pattern,
         direction: cfg.direction,
@@ -1515,7 +1125,7 @@ export function RightStudioColumn({
         x: -24,
         y: baseY,
         baseY,
-        vx: baseHorizontalSpeed,
+        vx: travelSpeed,
         vy: 0,
         radius,
         kind: cfg.pattern,
@@ -1534,7 +1144,7 @@ export function RightStudioColumn({
         x: 248,
         y: baseY,
         baseY,
-        vx: -112 * cfg.speedMultiplier,
+        vx: -travelSpeed,
         vy: 0,
         radius,
         kind: cfg.pattern,
@@ -1573,7 +1183,7 @@ export function RightStudioColumn({
         x: WORLD_W + 24,
         y: baseY,
         baseY,
-        vx: -baseHorizontalSpeed,
+        vx: -travelSpeed,
         vy: 0,
         radius,
         kind: cfg.pattern,
@@ -1588,12 +1198,301 @@ export function RightStudioColumn({
         wasJumpedOver: false,
       };
     }
-    const configured = layoutRef.current.layout.placements[id];
-    if (configured?.x !== undefined) sim.hazard.x = configured.x;
-    if (configured?.y !== undefined) {
-      sim.hazard.y = configured.y;
-      sim.hazard.baseY = configured.y;
+    },
+    [recordRuntimeEvent],
+  );
+
+  const findOwningChapterId = useCallback((nodeId: string | null): string | null => {
+    if (!nodeId) return null;
+    const nodeMap = new Map(nodesRef.current.map((n) => [n.id, n]));
+    let curr = nodeMap.get(nodeId);
+    let topGroupId: string | null = curr?.kind === 'group' ? curr.id : null;
+    const seen = new Set<string>();
+    while (curr?.parentId && !seen.has(curr.parentId)) {
+      seen.add(curr.parentId);
+      const parent = nodeMap.get(curr.parentId);
+      if (!parent) break;
+      if (parent.kind === 'group') topGroupId = parent.id;
+      curr = parent;
     }
+    return topGroupId;
+  }, []);
+
+  const resolveTargetsExpandingGroups = useCallback(
+    (
+      targets: BoardNode[],
+      statsSnapshot: PlayStats,
+      varsSnapshot: ScopedStateVariable[],
+      runtimeCtx: PlayRuntimeContext,
+    ) => {
+      const leafEntries: BoardNode[] = [];
+      const unlockedGroups: string[] = [];
+      const pendingGroups: string[] = [];
+      const visitedGroups = new Set<string>();
+
+      const visit = (node: BoardNode) => {
+        if (node.kind !== 'group') {
+          if (!leafEntries.some((l) => l.id === node.id)) {
+            leafEntries.push(node);
+          }
+          return;
+        }
+        if (visitedGroups.has(node.id)) return;
+        visitedGroups.add(node.id);
+        const avail = evaluateGroupAvailability(
+          node,
+          nodesRef.current,
+          statsSnapshot,
+          customFlagsRef.current,
+          varsSnapshot,
+          runtimeCtx,
+        );
+        if (!avail.passed) {
+          if (!pendingGroups.includes(node.id)) pendingGroups.push(node.id);
+          return;
+        }
+        if (!unlockedGroups.includes(node.id)) unlockedGroups.push(node.id);
+        const localRoots = getGroupLocalRoots(node.id, nodesRef.current, edgesRef.current);
+        for (const root of localRoots) {
+          visit(root);
+        }
+      };
+
+      for (const target of targets) {
+        visit(target);
+      }
+      return { leafEntries, unlockedGroups, pendingGroups };
+    },
+    [],
+  );
+
+  const focusNodeVisuals = useCallback(
+    (node: BoardNode | null, isLoopStep = false) => {
+      focusedNodeIdRef.current = node?.id ?? null;
+      setFocusedNodeId(node?.id ?? null);
+
+      const chapterId = findOwningChapterId(node?.id ?? null);
+      if (chapterId) {
+        focusedGroupIdRef.current = chapterId;
+        setFocusedGroupId(chapterId);
+      }
+
+      if (!node) {
+        simRef.current.hazard = null;
+        challengeTimerRemainingRef.current = null;
+        lastTimerShownRef.current = null;
+        setChallengeTimeLeft(null);
+        return;
+      }
+
+      if (node.kind !== 'challenge') {
+        challengeTimerRemainingRef.current = null;
+        lastTimerShownRef.current = null;
+        setChallengeTimeLeft(null);
+      }
+
+      if (node.kind === 'narration' || node.kind === 'dialogue') {
+        simRef.current.hazard = null;
+        setEndSummary(null);
+        setPhase('overlay');
+        return;
+      }
+
+      if (node.kind === 'challenge') {
+        if (isLoopStep) {
+          setWaveNumber((w) => w + 1);
+        }
+        const limitSec = resolveChallengeTimeLimitSec(node, edgesRef.current);
+        challengeTimerRemainingRef.current = limitSec;
+        lastTimerShownRef.current = limitSec;
+        setChallengeTimeLeft(limitSec);
+        setEndSummary(null);
+        setPhase('live');
+        spawnChallengeHazard(node);
+        return;
+      }
+
+      if (node.kind === 'action') {
+        simRef.current.hazard = null;
+        pendingActionIdsRef.current.add(node.id);
+        if (heroAssetIdRef.current) {
+          recordRuntimeEvent('appears', {
+            subjectAssetId: heroAssetIdRef.current,
+            subjectRole: 'hero',
+          });
+        }
+        setEndSummary(null);
+        setPhase('live');
+      }
+    },
+    [findOwningChapterId, recordRuntimeEvent, spawnChallengeHazard],
+  );
+
+  const applyPendingAndGroupTransitions = useCallback(
+    (
+      statsSnapshot: PlayStats,
+      varsSnapshot: ScopedStateVariable[],
+      runtimeCtx: PlayRuntimeContext,
+    ): { newlyActivatedNodes: BoardNode[]; newFocusedGroupId: string | null } => {
+      const newlyActivatedNodes: BoardNode[] = [];
+      let newFocusedGroupId: string | null = null;
+      const playableAll = getPlayableNodes(nodesRef.current);
+      const playableAllMap = new Map(playableAll.map((n) => [n.id, n]));
+
+      // 1. Unlock any pending Groups whose Available When now passes
+      const stillPending: string[] = [];
+      for (const pId of pendingGroupIdsRef.current) {
+        const grp = playableAllMap.get(pId);
+        if (!grp || grp.kind !== 'group') continue;
+        const avail = evaluateGroupAvailability(
+          grp,
+          nodesRef.current,
+          statsSnapshot,
+          customFlagsRef.current,
+          varsSnapshot,
+          runtimeCtx,
+        );
+        if (!avail.passed) {
+          stillPending.push(pId);
+          continue;
+        }
+        const resolved = resolveTargetsExpandingGroups(
+          [grp],
+          statsSnapshot,
+          varsSnapshot,
+          runtimeCtx,
+        );
+        for (const uId of resolved.unlockedGroups) {
+          if (!unlockedGroupIdsRef.current.includes(uId)) {
+            unlockedGroupIdsRef.current = [...unlockedGroupIdsRef.current, uId];
+          }
+        }
+        for (const npId of resolved.pendingGroups) {
+          if (!stillPending.includes(npId)) stillPending.push(npId);
+        }
+        for (const leaf of resolved.leafEntries) {
+          if (!activeNodeIdsRef.current.includes(leaf.id)) {
+            activeNodeIdsRef.current = [...activeNodeIdsRef.current, leaf.id];
+            newlyActivatedNodes.push(leaf);
+          }
+        }
+        if (!newFocusedGroupId) newFocusedGroupId = grp.id;
+      }
+      pendingGroupIdsRef.current = stillPending;
+      setPendingGroupIds(stillPending);
+
+      // 2. Evaluate Group-to-Group outgoing progression (Completed When / Next Chapter)
+      const unlockedSnapshot = [...unlockedGroupIdsRef.current];
+      for (const uId of unlockedSnapshot) {
+        if (completedGroupIdsRef.current.includes(uId)) continue;
+        const grpNode = playableAllMap.get(uId);
+        if (!grpNode || grpNode.kind !== 'group') continue;
+
+        const grpOutgoing = getEvaluatedOutgoing(
+          [uId],
+          nodesRef.current,
+          edgesRef.current,
+          statsSnapshot,
+          customFlagsRef.current,
+          loopEdgeIdsRef.current,
+          varsSnapshot,
+          runtimeCtx,
+        );
+        if (grpOutgoing.length === 0) continue;
+
+        const descendantIds = getDescendantNodeIds(uId, nodesRef.current);
+        const playableLeafDescendants = descendantIds.filter((dId) => {
+          const dn = playableAllMap.get(dId);
+          return Boolean(dn && dn.kind !== 'group');
+        });
+        const allDescendantsDone =
+          playableLeafDescendants.length > 0 &&
+          playableLeafDescendants.every((dId) => completedNodeIdsRef.current.includes(dId));
+
+        const triggeredEdge = grpOutgoing.find((item) => {
+          if (!item.evaluation.passed) return false;
+          if (item.evaluation.hasCondition) return true;
+          return allDescendantsDone;
+        });
+        if (!triggeredEdge) continue;
+
+        // Mark source Group as having completed its core progression (keep unlocked for side exploration!)
+        completedGroupIdsRef.current = [...completedGroupIdsRef.current, uId];
+        setCompletedGroupIds(completedGroupIdsRef.current);
+        setLastEdgeId(triggeredEdge.edge.id);
+
+        const targetResolved = resolveTargetsExpandingGroups(
+          [triggeredEdge.target],
+          statsSnapshot,
+          varsSnapshot,
+          runtimeCtx,
+        );
+        for (const nextUId of targetResolved.unlockedGroups) {
+          if (!unlockedGroupIdsRef.current.includes(nextUId)) {
+            unlockedGroupIdsRef.current = [...unlockedGroupIdsRef.current, nextUId];
+          }
+        }
+        for (const nextPId of targetResolved.pendingGroups) {
+          if (!pendingGroupIdsRef.current.includes(nextPId)) {
+            pendingGroupIdsRef.current = [...pendingGroupIdsRef.current, nextPId];
+          }
+        }
+        setPendingGroupIds([...pendingGroupIdsRef.current]);
+        for (const leaf of targetResolved.leafEntries) {
+          if (!activeNodeIdsRef.current.includes(leaf.id)) {
+            activeNodeIdsRef.current = [...activeNodeIdsRef.current, leaf.id];
+            newlyActivatedNodes.push(leaf);
+          }
+        }
+        if (triggeredEdge.target.kind === 'group') {
+          newFocusedGroupId = triggeredEdge.target.id;
+        }
+        const srcLabel = grpNode.title.trim() || grpNode.note.trim() || t.chapterCompleted;
+        const dstLabel =
+          triggeredEdge.target.title.trim() || triggeredEdge.target.note.trim();
+        setHudToast({
+          text: dstLabel ? `${srcLabel} → ${dstLabel}` : `${srcLabel} · ${t.chapterCompleted}`,
+          tone: 'celebrate',
+        });
+      }
+
+      setUnlockedGroupIds([...unlockedGroupIdsRef.current]);
+      setActiveNodeIds([...activeNodeIdsRef.current]);
+      return { newlyActivatedNodes, newFocusedGroupId };
+    },
+    [resolveTargetsExpandingGroups, t.chapterCompleted],
+  );
+
+  const getArmedStandaloneTriggerEdges = useCallback(() => {
+    const playableAll = getPlayableNodes(nodesRef.current);
+    const playableAllMap = new Map(playableAll.map((n) => [n.id, n]));
+    const unlockedSet = new Set(unlockedGroupIdsRef.current);
+    const activeSet = new Set(activeNodeIdsRef.current);
+
+    return edgesRef.current
+      .filter((edge) => {
+        if (edge.fromId !== null) return false;
+        if (firedTriggerEdgeIdsRef.current.has(edge.id)) return false;
+        const target = playableAllMap.get(edge.toId);
+        if (!target) return false;
+        if (activeSet.has(target.id)) return false;
+        if (target.kind === 'group' && unlockedSet.has(target.id)) return false;
+
+        // If inside a Group, arm only once owning Group(s) are unlocked
+        let currParentId = target.parentId;
+        const seen = new Set<string>();
+        while (currParentId && !seen.has(currParentId)) {
+          seen.add(currParentId);
+          const parent = playableAllMap.get(currParentId);
+          if (!parent) break;
+          if (parent.kind === 'group' && !unlockedSet.has(parent.id)) {
+            return false;
+          }
+          currParentId = parent.parentId;
+        }
+        return true;
+      })
+      .map((edge) => ({ edge, target: playableAllMap.get(edge.toId)! }));
   }, []);
 
   const enterNodes = useCallback(
@@ -1601,216 +1500,469 @@ export function RightStudioColumn({
       targets: BoardNode[],
       triggeredEdgeId: string | null,
       isLoopStep = false,
+      options?: { replaceIds?: string[]; keepActive?: boolean },
     ) => {
-      resolveTimerRef.current = null;
-      overlayTimerRef.current = null;
+      if (resolveTimerRef.current !== null) {
+        window.clearTimeout(resolveTimerRef.current);
+        resolveTimerRef.current = null;
+      }
       if (targets.length === 0) return;
 
-      effectScheduler.current.enter();
-      const first = targets[0];
-      visitRef.current = { id: first.id, atMs: Math.round(simRef.current.time * 1000) };
-      setActiveNodeIds(targets.map((n) => n.id));
-      setLastEdgeId(triggeredEdgeId);
+      runtimeEventsRef.current.clear();
+      runtimeEventRecordsRef.current = [];
+      prevSpatialRef.current.wasTouching = false;
+      reactiveTransitionLockRef.current = false;
 
-      if (first.kind === 'narration' || first.kind === 'dialogue') {
-        setRunChallengeId(null);
-        simRef.current.hazard = null;
-        setEndSummary(null);
-        setPhase('overlay');
-        return;
-      }
+      const replaceSet = new Set(options?.replaceIds ?? []);
+      const runtimeCtx = buildRuntimeCtx();
 
-      if (first.kind === 'challenge') {
-        setRunChallengeId(first.id);
-        if (isLoopStep) {
-          setWaveNumber((w) => w + 1);
-        }
-        setEndSummary(null);
-        setPhase('live');
-        spawnChallengeHazard(first);
-        return;
-      }
-
-      if (first.kind === 'action') {
-        simRef.current.hazard = null;
-        setEndSummary(null);
-        setPhase('live');
-        return;
-      }
-
-      if (first.kind === 'outcome') {
-        let totalHpDelta = 0;
-        let totalScoreDelta = 0;
-        let primaryTone: 'celebrate' | 'hurt' | 'victory' | 'defeat' | 'neutral' =
-          'neutral';
-
-        for (const o of targets) {
-          const cfg = resolveOutcomeConfig(o);
-          totalHpDelta += cfg.hpDelta;
-          totalScoreDelta += cfg.scoreDelta;
-          if (cfg.visual === 'victory') primaryTone = 'victory';
-          else if (cfg.visual === 'defeat' && primaryTone !== 'victory')
-            primaryTone = 'defeat';
-          else if (cfg.visual === 'hurt' && primaryTone === 'neutral')
-            primaryTone = 'hurt';
-          else if (cfg.visual === 'celebrate' && primaryTone === 'neutral')
-            primaryTone = 'celebrate';
-        }
-
-        const nextStats: PlayStats = {
-          hp: Math.max(0, statsRef.current.hp + totalHpDelta),
-          score: Math.max(0, statsRef.current.score + totalScoreDelta),
-        };
-        statsRef.current = nextStats;
-        setStats(nextStats);
-
-        // Execute structured Outcome Related Properties rules (4 types x 4 operations)
-        let nextScopedVars = [...scopedVariablesRef.current];
-        const numericParams = collectNumericBoardParameters(nodesRef.current);
-        const appliedRuleVarIds = new Set<string>();
-        const simForPopups = simRef.current;
-
-        for (const o of targets) {
-          for (const rule of o.fields.relatedProperties ?? []) {
-            const idx = nextScopedVars.findIndex((v) => v.variable.id === rule.variableId);
-            if (idx === -1) continue;
-            const entry = nextScopedVars[idx];
-            const nextVal = applyOutcomePropertyRule(
-              rule,
-              entry,
-              nextScopedVars,
-              numericParams,
-            );
-            onUpdatePlayValue(entry.variable.id, nextVal);
-            nextScopedVars[idx] = { ...entry, playValue: nextVal };
-            appliedRuleVarIds.add(entry.variable.id);
-            pushPopup(
-              simForPopups.heroX,
-              simForPopups.heroY - 52,
-              `${entry.variable.name}: ${formatVariableValue(entry.variable, nextVal, lang)}`,
-              '#38BDF8',
-            );
+      // Expand any Group targets into their unlocked concurrent local roots
+      const hasGroupTarget = targets.some((tNode) => tNode.kind === 'group');
+      let effectiveTargets = targets;
+      if (hasGroupTarget) {
+        const expanded = resolveTargetsExpandingGroups(
+          targets,
+          statsRef.current,
+          scopedVariablesRef.current,
+          runtimeCtx,
+        );
+        for (const uId of expanded.unlockedGroups) {
+          if (!unlockedGroupIdsRef.current.includes(uId)) {
+            unlockedGroupIdsRef.current = [...unlockedGroupIdsRef.current, uId];
           }
         }
+        setUnlockedGroupIds([...unlockedGroupIdsRef.current]);
+        for (const pId of expanded.pendingGroups) {
+          if (!pendingGroupIdsRef.current.includes(pId)) {
+            pendingGroupIdsRef.current = [...pendingGroupIdsRef.current, pId];
+          }
+        }
+        setPendingGroupIds([...pendingGroupIdsRef.current]);
+        if (expanded.unlockedGroups.length > 0) {
+          const topG = expanded.unlockedGroups[0];
+          focusedGroupIdRef.current = topG;
+          setFocusedGroupId(topG);
+        }
+        effectiveTargets = expanded.leafEntries;
+      }
 
-        // Mirror legacy HP/Score outcome deltas into matching numeric variables not already updated by rules
-        if (totalHpDelta !== 0 || totalScoreDelta !== 0) {
-          nextScopedVars = nextScopedVars.map((entry) => {
-            if (entry.variable.type !== 'number' || appliedRuleVarIds.has(entry.variable.id)) {
-              return entry;
-            }
-            const n = entry.variable.name;
-            if (totalHpDelta !== 0 && /血量|血|生命|体力|\bhp\b|health|life/i.test(n)) {
-              const updated = clampNumberValue(
-                Number(entry.playValue) + totalHpDelta,
-                entry.variable,
-              );
-              onUpdatePlayValue(entry.variable.id, updated);
-              return { ...entry, playValue: updated };
-            }
-            if (
-              totalScoreDelta !== 0 &&
-              /分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(n)
-            ) {
-              const updated = clampNumberValue(
-                Number(entry.playValue) + totalScoreDelta,
-                entry.variable,
-              );
-              onUpdatePlayValue(entry.variable.id, updated);
-              return { ...entry, playValue: updated };
-            }
+      // If only locked pending Groups were reached, enter waiting state cleanly
+      if (effectiveTargets.length === 0) {
+        const remaining = activeNodeIdsRef.current.filter((id) => !replaceSet.has(id));
+        activeNodeIdsRef.current = remaining;
+        setActiveNodeIds(remaining);
+        setLastEdgeId(triggeredEdgeId);
+        if (remaining.length > 0) {
+          const nextNode =
+            nodesRef.current.find((n) => n.id === remaining[0]) ?? null;
+          focusNodeVisuals(nextNode, isLoopStep);
+        } else {
+          focusNodeVisuals(null);
+          setEndSummary(null);
+          setPhase('live');
+        }
+        setSimRevision((r) => r + 1);
+        return;
+      }
+
+      const first = effectiveTargets[0];
+
+      // Mark replaced nodes as completed (unless looping back to same node)
+      const nextIdsSet = new Set(effectiveTargets.map((n) => n.id));
+      for (const rId of replaceSet) {
+        pendingActionIdsRef.current.delete(rId);
+        if (!nextIdsSet.has(rId) && !completedNodeIdsRef.current.includes(rId)) {
+          completedNodeIdsRef.current = [...completedNodeIdsRef.current, rId];
+        }
+      }
+      setCompletedNodeIds([...completedNodeIdsRef.current]);
+
+      // Merge activeNodeIds: keep concurrent sibling mechanisms while replacing stepped slot
+      const baseActive =
+        replaceSet.size > 0
+          ? activeNodeIdsRef.current.filter((id) => !replaceSet.has(id))
+          : options?.keepActive || hasGroupTarget || unlockedGroupIdsRef.current.length > 0
+            ? [...activeNodeIdsRef.current]
+            : [];
+
+      const mergedActive = [...baseActive];
+      for (const tNode of effectiveTargets) {
+        if (tNode.kind !== 'outcome' && !mergedActive.includes(tNode.id)) {
+          mergedActive.push(tNode.id);
+        } else if (tNode.kind === 'outcome' && !mergedActive.includes(tNode.id)) {
+          mergedActive.push(tNode.id);
+        }
+      }
+
+      activeNodeIdsRef.current = mergedActive;
+      setActiveNodeIds(mergedActive);
+      setLastEdgeId(triggeredEdgeId);
+
+      if (first.kind !== 'outcome') {
+        focusNodeVisuals(first, isLoopStep);
+        setSimRevision((r) => r + 1);
+        return;
+      }
+
+      // Outcome Resolution
+      let totalHpDelta = 0;
+      let totalScoreDelta = 0;
+      let primaryTone: 'celebrate' | 'hurt' | 'victory' | 'defeat' | 'neutral' =
+        'neutral';
+
+      for (const o of effectiveTargets) {
+        const cfg = resolveOutcomeConfig(o);
+        totalHpDelta += cfg.hpDelta;
+        totalScoreDelta += cfg.scoreDelta;
+        if (cfg.visual === 'victory') primaryTone = 'victory';
+        else if (cfg.visual === 'defeat' && primaryTone !== 'victory')
+          primaryTone = 'defeat';
+        else if (cfg.visual === 'hurt' && primaryTone === 'neutral')
+          primaryTone = 'hurt';
+        else if (cfg.visual === 'celebrate' && primaryTone === 'neutral')
+          primaryTone = 'celebrate';
+      }
+
+      const nextStats: PlayStats = {
+        hp: Math.max(0, statsRef.current.hp + totalHpDelta),
+        score: Math.max(0, statsRef.current.score + totalScoreDelta),
+      };
+      statsRef.current = nextStats;
+      setStats(nextStats);
+
+      // Execute structured Outcome Related Properties rules (4 types x 4 operations)
+      let nextScopedVars = [...scopedVariablesRef.current];
+      const numericParams = collectNumericBoardParameters(nodesRef.current);
+      const appliedRuleVarIds = new Set<string>();
+      const simForPopups = simRef.current;
+
+      for (const o of effectiveTargets) {
+        for (const rule of o.fields.relatedProperties ?? []) {
+          const idx = nextScopedVars.findIndex((v) => v.variable.id === rule.variableId);
+          if (idx === -1) continue;
+          const entry = nextScopedVars[idx];
+          const nextVal = applyOutcomePropertyRule(
+            rule,
+            entry,
+            nextScopedVars,
+            numericParams,
+          );
+          onUpdatePlayValue(entry.variable.id, nextVal);
+          nextScopedVars[idx] = { ...entry, playValue: nextVal };
+          appliedRuleVarIds.add(entry.variable.id);
+          pushPopup(
+            simForPopups.heroX,
+            simForPopups.heroY - 52,
+            `${entry.variable.name}: ${formatVariableValue(entry.variable, nextVal, lang)}`,
+            '#38BDF8',
+          );
+        }
+      }
+
+      // Mirror legacy HP/Score outcome deltas into matching numeric variables
+      if (totalHpDelta !== 0 || totalScoreDelta !== 0) {
+        nextScopedVars = nextScopedVars.map((entry) => {
+          if (entry.variable.type !== 'number' || appliedRuleVarIds.has(entry.variable.id)) {
             return entry;
-          });
-        }
-        scopedVariablesRef.current = nextScopedVars;
+          }
+          const n = entry.variable.name;
+          if (totalHpDelta !== 0 && /血量|血|生命|体力|\bhp\b|health|life/i.test(n)) {
+            const updated = clampNumberValue(
+              Number(entry.playValue) + totalHpDelta,
+              entry.variable,
+            );
+            onUpdatePlayValue(entry.variable.id, updated);
+            return { ...entry, playValue: updated };
+          }
+          if (
+            totalScoreDelta !== 0 &&
+            /分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(n)
+          ) {
+            const updated = clampNumberValue(
+              Number(entry.playValue) + totalScoreDelta,
+              entry.variable,
+            );
+            onUpdatePlayValue(entry.variable.id, updated);
+            return { ...entry, playValue: updated };
+          }
+          return entry;
+        });
+      }
+      scopedVariablesRef.current = nextScopedVars;
 
-        const sim = simRef.current;
-        if (totalScoreDelta > 0) effectEventRef.current('score', { x: sim.heroX, y: sim.heroY - 30 }, targets.map(node => node.id));
-        if (primaryTone === 'victory') effectEventRef.current('victory', { x: WORLD_W / 2, y: 90 }, targets.map(node => node.id));
-        if (totalScoreDelta !== 0) {
-          pushPopup(
-            sim.heroX,
-            sim.heroY - 46,
-            `${totalScoreDelta > 0 ? '+' : ''}${totalScoreDelta} ${t.scoreLabel}`,
-            totalScoreDelta > 0 ? '#FBC53D' : '#FB7185',
-          );
-        }
-        if (totalHpDelta !== 0) {
-          pushPopup(
-            sim.heroX + 8,
-            sim.heroY - 30,
-            `${totalHpDelta > 0 ? '+' : ''}${totalHpDelta} ${t.hpLabel}`,
-            totalHpDelta > 0 ? '#34D399' : '#FB7185',
-          );
-        }
-
-        if (primaryTone === 'celebrate' || primaryTone === 'victory') {
-          sim.lanternFlare = 1.4;
-          spawnParticles(sim.heroX, sim.heroY - 22, '#FBC53D', 18);
-          spawnParticles(120, 48, '#FDE68A', 10);
-          spawnParticles(245, 48, '#FDE68A', 10);
-        }
-        if (primaryTone === 'victory') {
-          sim.victoryGlow = 1;
-          spawnParticles(WORLD_W / 2, 90, '#38BDF8', 22);
-        }
-        if (primaryTone === 'hurt' || primaryTone === 'defeat') {
-          sim.hurtTimer = 0.55;
-          sim.heroVx = -110;
-          spawnParticles(sim.heroX + 12, sim.heroY - 18, '#FB7185', 14);
-        }
-
-        const toastText = targets.map((o) => o.note).filter(Boolean).join(' · ');
-        if (toastText) setHudToast({ text: toastText, tone: primaryTone });
-
-        const nextOutgoing = getEvaluatedOutgoing(
-          targets.map((n) => n.id),
-          nodesRef.current,
-          edgesRef.current,
-          nextStats,
-          customFlagsRef.current,
-          loopEdgeIdsRef.current,
-          nextScopedVars,
+      const sim = simRef.current;
+      if (totalScoreDelta !== 0) {
+        pushPopup(
+          sim.heroX,
+          sim.heroY - 46,
+          `${totalScoreDelta > 0 ? '+' : ''}${totalScoreDelta} ${t.scoreLabel}`,
+          totalScoreDelta > 0 ? '#FBC53D' : '#FB7185',
         );
-        const passing = nextOutgoing.filter((e) => e.evaluation.passed);
+      }
+      if (totalHpDelta !== 0) {
+        pushPopup(
+          sim.heroX + 8,
+          sim.heroY - 30,
+          `${totalHpDelta > 0 ? '+' : ''}${totalHpDelta} ${t.hpLabel}`,
+          totalHpDelta > 0 ? '#34D399' : '#FB7185',
+        );
+      }
 
-        if (passing.length === 0) {
-          sim.hazard = null;
-          setPhase('ended');
-          setEndSummary({
-            text: toastText,
-            tone:
-              primaryTone === 'victory'
-                ? 'victory'
-                : primaryTone === 'defeat'
-                  ? 'defeat'
-                  : 'neutral',
+      if (primaryTone === 'celebrate' || primaryTone === 'victory') {
+        sim.lanternFlare = 1.4;
+        spawnParticles(sim.heroX, sim.heroY - 22, '#FBC53D', 18);
+        spawnParticles(120, 48, '#FDE68A', 10);
+        spawnParticles(245, 48, '#FDE68A', 10);
+      }
+      if (primaryTone === 'victory') {
+        sim.victoryGlow = 1;
+        spawnParticles(WORLD_W / 2, 90, '#38BDF8', 22);
+      }
+      if (primaryTone === 'hurt' || primaryTone === 'defeat') {
+        sim.hurtTimer = 0.55;
+        sim.heroVx = -110;
+        spawnParticles(sim.heroX + 12, sim.heroY - 18, '#FB7185', 14);
+      }
+
+      const toastText = effectiveTargets.map((o) => o.note).filter(Boolean).join(' · ');
+      if (toastText) setHudToast({ text: toastText, tone: primaryTone });
+
+      // Mark outcome targets completed
+      for (const o of effectiveTargets) {
+        if (!completedNodeIdsRef.current.includes(o.id)) {
+          completedNodeIdsRef.current = [...completedNodeIdsRef.current, o.id];
+        }
+      }
+      setCompletedNodeIds([...completedNodeIdsRef.current]);
+
+      const updatedRuntimeCtx = buildRuntimeCtx();
+      const nextOutgoing = getEvaluatedOutgoing(
+        effectiveTargets.map((n) => n.id),
+        nodesRef.current,
+        edgesRef.current,
+        nextStats,
+        customFlagsRef.current,
+        loopEdgeIdsRef.current,
+        nextScopedVars,
+        updatedRuntimeCtx,
+      );
+      const passing = nextOutgoing.filter((e) => e.evaluation.passed);
+
+      if (passing.length > 0) {
+        setPhase('resolving');
+        const nextEdge = passing[0];
+        const outcomeIds = effectiveTargets.map((n) => n.id);
+        resolveTimerRef.current = window.setTimeout(() => {
+          resolveTimerRef.current = null;
+          enterNodes([nextEdge.target], nextEdge.edge.id, nextEdge.isLoop, {
+            replaceIds: outcomeIds,
           });
-          return;
+        }, 950);
+        return;
+      }
+
+      // No internal outgoing arrow from this Outcome — remove this finished chain from active pool
+      const outcomeIdSet = new Set(effectiveTargets.map((o) => o.id));
+      const remainingAfterOutcome = activeNodeIdsRef.current.filter(
+        (id) => !outcomeIdSet.has(id),
+      );
+      activeNodeIdsRef.current = remainingAfterOutcome;
+      setActiveNodeIds(remainingAfterOutcome);
+
+      // Re-check pending Group Available When and Group-to-Group outgoing progression
+      const prog = applyPendingAndGroupTransitions(
+        nextStats,
+        nextScopedVars,
+        updatedRuntimeCtx,
+      );
+
+      const finalActiveIds = activeNodeIdsRef.current;
+      if (finalActiveIds.length > 0) {
+        const playableAllMap = new Map(
+          getPlayableNodes(nodesRef.current).map((n) => [n.id, n]),
+        );
+        const preferredNode =
+          prog.newlyActivatedNodes[0] ??
+          finalActiveIds
+            .map((id) => playableAllMap.get(id))
+            .find(
+              (n) =>
+                n &&
+                focusedGroupIdRef.current &&
+                (n.parentId === focusedGroupIdRef.current ||
+                  isDescendantOf(n.id, focusedGroupIdRef.current, playableAllMap)),
+            ) ??
+          playableAllMap.get(finalActiveIds[0]) ??
+          null;
+
+        if (prog.newFocusedGroupId) {
+          focusedGroupIdRef.current = prog.newFocusedGroupId;
+          setFocusedGroupId(prog.newFocusedGroupId);
         }
 
         setPhase('resolving');
-        const nextEdge = passing[0];
-        resolveTimerRef.current = {
-          at: sim.time + 0.95,
-          run: () => enterNodes([nextEdge.target], nextEdge.edge.id, nextEdge.isLoop),
-        };
+        resolveTimerRef.current = window.setTimeout(() => {
+          resolveTimerRef.current = null;
+          focusNodeVisuals(preferredNode, false);
+          setSimRevision((r) => r + 1);
+        }, 720);
+        return;
       }
+
+      if (pendingGroupIdsRef.current.length > 0 || getArmedStandaloneTriggerEdges().length > 0) {
+        sim.hazard = null;
+        focusNodeVisuals(null);
+        setEndSummary(null);
+        setPhase('live');
+        setSimRevision((r) => r + 1);
+        return;
+      }
+
+      sim.hazard = null;
+      setPhase('ended');
+      setEndSummary({
+        text: toastText,
+        tone:
+          primaryTone === 'victory'
+            ? 'victory'
+            : primaryTone === 'defeat'
+              ? 'defeat'
+              : 'neutral',
+      });
     },
     [
+      applyPendingAndGroupTransitions,
+      buildRuntimeCtx,
+      focusNodeVisuals,
+      getArmedStandaloneTriggerEdges,
+      lang,
       onUpdatePlayValue,
       pushPopup,
-      spawnChallengeHazard,
+      resolveTargetsExpandingGroups,
       spawnParticles,
       t.hpLabel,
       t.scoreLabel,
     ],
   );
 
+  const checkReactiveTransitions = useCallback((): boolean => {
+    if (
+      playModeRef.current !== 'playing' ||
+      phaseRef.current !== 'live' ||
+      reactiveTransitionLockRef.current
+    ) {
+      return false;
+    }
+
+    const runtimeCtx = buildRuntimeCtx();
+
+    // First check pending Available When groups and Group-to-Group progression
+    const prog = applyPendingAndGroupTransitions(
+      statsRef.current,
+      scopedVariablesRef.current,
+      runtimeCtx,
+    );
+    if (prog.newlyActivatedNodes.length > 0 || prog.newFocusedGroupId) {
+      reactiveTransitionLockRef.current = true;
+      if (prog.newFocusedGroupId) {
+        focusedGroupIdRef.current = prog.newFocusedGroupId;
+        setFocusedGroupId(prog.newFocusedGroupId);
+      }
+      if (prog.newlyActivatedNodes.length > 0) {
+        focusNodeVisuals(prog.newlyActivatedNodes[0], false);
+      }
+      reactiveTransitionLockRef.current = false;
+      setSimRevision((r) => r + 1);
+      return true;
+    }
+
+    const currentIds = activeNodeIdsRef.current;
+    const candidateIds = Array.from(
+      new Set([...currentIds, ...pendingActionIdsRef.current]),
+    );
+
+    if (candidateIds.length > 0) {
+      const evals = getEvaluatedOutgoing(
+        candidateIds,
+        nodesRef.current,
+        edgesRef.current,
+        statsRef.current,
+        customFlagsRef.current,
+        loopEdgeIdsRef.current,
+        scopedVariablesRef.current,
+        runtimeCtx,
+      );
+      const directTriggered = evals.find((item) => {
+        if (item.target.kind === 'action') return false;
+        if (!item.evaluation.passed) return false;
+        if (item.evaluation.hasCondition) return true;
+        return (
+          Boolean(item.edge.fromId) &&
+          pendingActionIdsRef.current.has(item.edge.fromId!) &&
+          !simRef.current.hazard
+        );
+      });
+      if (directTriggered && directTriggered.edge.fromId) {
+        reactiveTransitionLockRef.current = true;
+        const ownerChallengeId = actionOwnerMapRef.current.get(directTriggered.edge.fromId);
+        const replaceIds = [
+          directTriggered.edge.fromId,
+          ...(ownerChallengeId ? [ownerChallengeId] : []),
+        ];
+        enterNodes([directTriggered.target], directTriggered.edge.id, directTriggered.isLoop, {
+          replaceIds,
+        });
+        return true;
+      }
+    }
+
+    // Evaluate armed standalone ("from air") trigger arrows pointing to cards or Groups
+    const armedEntries = getArmedStandaloneTriggerEdges();
+    for (const { edge, target } of armedEntries) {
+      const ev = evaluateEdgeCondition(
+        edge.condition,
+        statsRef.current,
+        customFlagsRef.current,
+        scopedVariablesRef.current,
+        edge.conditionGroup,
+        runtimeCtx,
+      );
+      if (ev.passed) {
+        firedTriggerEdgeIdsRef.current.add(edge.id);
+        reactiveTransitionLockRef.current = true;
+        enterNodes([target], edge.id, false, { keepActive: true });
+        return true;
+      }
+    }
+
+    return false;
+  }, [
+    applyPendingAndGroupTransitions,
+    buildRuntimeCtx,
+    enterNodes,
+    focusNodeVisuals,
+    getArmedStandaloneTriggerEdges,
+  ]);
+
+  useEffect(() => {
+    if (playMode === 'playing' && phase === 'live') {
+      checkReactiveTransitions();
+    }
+  }, [checkReactiveTransitions, customFlags, phase, playMode, scopedVariables, simulatedEvents, stats]);
+
+  const hasUnconditionalOutgoing = useCallback((nodeId: string) => {
+    return edgesRef.current.some(
+      (e) =>
+        e.fromId === nodeId &&
+        !e.condition?.trim() &&
+        !(e.conditionGroup && e.conditionGroup.clauses.length > 0),
+    );
+  }, []);
+
   const resolveActionOutcome = useCallback(
-    (control: LiveActionControl) => {
+    (control: LiveActionControl): boolean => {
       const actionNode = control.target;
-      const fromAction = getEvaluatedOutgoing(
+      const evaluated = getEvaluatedOutgoing(
         [actionNode.id],
         nodesRef.current,
         edgesRef.current,
@@ -1818,7 +1970,13 @@ export function RightStudioColumn({
         customFlagsRef.current,
         loopEdgeIdsRef.current,
         scopedVariablesRef.current,
-      ).filter((e) => e.evaluation.passed);
+        buildRuntimeCtx(),
+      );
+      const fromAction = evaluated.filter((e) => e.evaluation.passed);
+      const replaceIds = [
+        actionNode.id,
+        ...(control.ownerNodeId ? [control.ownerNodeId] : []),
+      ];
 
       if (fromAction.length > 0) {
         const allOutcomes = fromAction.every((e) => e.target.kind === 'outcome');
@@ -1826,42 +1984,62 @@ export function RightStudioColumn({
           const uniqueTargets = Array.from(
             new Map(fromAction.map((e) => [e.target.id, e.target])).values(),
           );
-          enterNodes(uniqueTargets, fromAction[0].edge.id, false);
-          return;
+          enterNodes(uniqueTargets, fromAction[0].edge.id, false, { replaceIds });
+          return true;
         }
-        enterNodes([fromAction[0].target], fromAction[0].edge.id, fromAction[0].isLoop);
-        return;
+        enterNodes([fromAction[0].target], fromAction[0].edge.id, fromAction[0].isLoop, {
+          replaceIds,
+        });
+        return true;
       }
 
-      visitRef.current = { id: actionNode.id, atMs: Math.round(simRef.current.time * 1000) };
-      setActiveNodeIds([actionNode.id]);
+      if (evaluated.length > 0) {
+        return false;
+      }
+
+      setFocusedNodeId(actionNode.id);
+      focusedNodeIdRef.current = actionNode.id;
       setLastEdgeId(control.edgeId);
       setPhase('resolving');
-      resolveTimerRef.current = { at: simRef.current.time + 0.65, run: () => {
+      resolveTimerRef.current = window.setTimeout(() => {
         const parentChallenge = control.fromNodeId
           ? nodesRef.current.find((n) => n.id === control.fromNodeId)
           : null;
         if (parentChallenge && parentChallenge.kind === 'challenge') {
-          enterNodes([parentChallenge], null, true);
+          enterNodes([parentChallenge], null, true, { replaceIds: [actionNode.id] });
         } else {
-          enterNodes([actionNode], null, false);
+          enterNodes([actionNode], null, false, { replaceIds: [actionNode.id] });
         }
-      }};
+      }, 650);
+      return true;
     },
-    [enterNodes],
+    [buildRuntimeCtx, enterNodes],
   );
 
   const performLiveAction = useCallback(
     (control: LiveActionControl) => {
-      if (pausedRef.current || playModeRef.current !== 'playing') return;
+      if (playModeRef.current !== 'playing') return;
       if (phaseRef.current !== 'live' || !control.evaluation.passed) return;
       onUserTestedInPlay();
+
+      // If player clicked or hotkeyed a parallel mechanism that wasn't focused yet, switch focus cleanly
+      if (control.ownerNodeId && control.ownerNodeId !== focusedNodeIdRef.current) {
+        const ownerNode = nodesRef.current.find((n) => n.id === control.ownerNodeId) ?? null;
+        if (ownerNode && (ownerNode.kind === 'challenge' || ownerNode.kind === 'action')) {
+          focusNodeVisuals(ownerNode);
+        }
+      }
+      if (control.ownerNodeId) {
+        actionOwnerMapRef.current.set(control.target.id, control.ownerNodeId);
+      }
 
       const sim = simRef.current;
       sim.lastActionControlId = control.id;
       sim.lastActionMechanic = control.mechanic;
+      pendingActionIdsRef.current.add(control.target.id);
       setLastEdgeId(control.edgeId);
 
+      let recorded = false;
       if (control.mechanic === 'jump') {
         if (sim.onGround) {
           const jumpParam = (control.target.fields.relatedParameters ?? []).find((p) =>
@@ -1874,6 +2052,14 @@ export function RightStudioColumn({
           sim.heroVy = -335 * jumpScale;
           sim.onGround = false;
           spawnParticles(sim.heroX, GROUND_Y, '#CBD5E1', 7);
+          if (
+            recordRuntimeEvent('jumps', {
+              subjectAssetId: heroAssetIdRef.current,
+              subjectRole: 'hero',
+            })
+          ) {
+            recorded = true;
+          }
         }
       } else if (control.mechanic === 'shield') {
         sim.shieldTimer = 0.72;
@@ -1890,41 +2076,73 @@ export function RightStudioColumn({
           actionControlId: control.id,
         });
         spawnParticles(sim.heroX + 18, sim.heroY - 22, '#38BDF8', 10);
-      }
-
-      if (!sim.hazard) {
-        const hasOutgoingFromAction = edgesRef.current.some(
-          (e) => e.fromId === control.target.id,
-        );
-        if (hasOutgoingFromAction) {
-          resolveActionOutcome(control);
+        if (
+          recordRuntimeEvent('fires', {
+            subjectAssetId: heroAssetIdRef.current,
+            subjectRole: 'hero',
+            targetAssetId: hazardAssetIdRef.current,
+            targetRole: 'hazard',
+          })
+        ) {
+          recorded = true;
         }
       }
+
+      if (recorded) {
+        setSimRevision((r) => r + 1);
+      }
+
+      if (checkReactiveTransitions()) return;
+
+      if (!sim.hazard && hasUnconditionalOutgoing(control.target.id)) {
+        resolveActionOutcome(control);
+      }
     },
-    [onUserTestedInPlay, resolveActionOutcome, spawnParticles],
+    [
+      checkReactiveTransitions,
+      focusNodeVisuals,
+      hasUnconditionalOutgoing,
+      onUserTestedInPlay,
+      recordRuntimeEvent,
+      resolveActionOutcome,
+      spawnParticles,
+    ],
   );
 
   const resetSimulationState = useCallback(() => {
-    resolveTimerRef.current = null;
-    overlayTimerRef.current = null;
-    pauseLayoutRef.current = null;
-    pausedRef.current = false;
-    setPaused(false);
-    setReview(null);
-    setSavedNotice(false);
-    visibleRef.current = [];
-    setVisibleMoments([]);
-    visitRef.current = { atMs: 0 };
-    frameClockRef.current = INITIAL_CLOCK;
-    setClock(INITIAL_CLOCK);
+    if (resolveTimerRef.current !== null) {
+      window.clearTimeout(resolveTimerRef.current);
+      resolveTimerRef.current = null;
+    }
+    runtimeEventsRef.current.clear();
+    runtimeEventRecordsRef.current = [];
+    pendingActionIdsRef.current.clear();
+    firedTriggerEdgeIdsRef.current.clear();
+    actionOwnerMapRef.current.clear();
+    activeNodeIdsRef.current = [];
+    focusedNodeIdRef.current = null;
+    focusedGroupIdRef.current = null;
+    unlockedGroupIdsRef.current = [];
+    completedGroupIdsRef.current = [];
+    pendingGroupIdsRef.current = [];
+    completedNodeIdsRef.current = [];
+    setFocusedNodeId(null);
+    setFocusedGroupId(null);
+    setUnlockedGroupIds([]);
+    setCompletedGroupIds([]);
+    setPendingGroupIds([]);
+    setCompletedNodeIds([]);
+    challengeTimerRemainingRef.current = null;
+    lastTimerShownRef.current = null;
+    setChallengeTimeLeft(null);
+    prevSpatialRef.current = {
+      wasAirborne: false,
+      wasTouching: false,
+      wasBlocking: false,
+      wasDashing: false,
+    };
+    reactiveTransitionLockRef.current = false;
     const sim = simRef.current;
-    effectTimeRef.current = 0;
-    effectScheduler.current.reset();
-    setEffectOccurrences([]);
-    sim.time = 0;
-    setRunChallengeId(null);
-    sim.lastActionControlId = null;
-    sim.lastActionMechanic = null;
     sim.heroX = HERO_BASE_X;
     sim.heroY = GROUND_Y;
     sim.heroVx = 0;
@@ -1943,45 +2161,10 @@ export function RightStudioColumn({
     setEndSummary(null);
   }, []);
 
-  const startFromLayout = async (startLayout: StageLayout, savedMoments = moments) => {
+  const handleStartPlay = useCallback(() => {
     if (playableNodes.length === 0) return;
-    const request = ++startRequest.current;
-    const timeline = arrangeMoments(savedMoments);
-    const assetIds = [...new Set(timeline.flatMap(moment =>
-      moment.field === 'background' && moment.value.assetId ? [moment.value.assetId] : []))];
-    const needsLoad = assetIds.some(id => {
-      const url = getAssetVisualBinding(id)?.url;
-      return url && !backgroundImages.current.has(url);
-    });
-    if (needsLoad) {
-      if (playing && !paused) pauseRun();
-      setReview(null);
-      setLoadingBackgrounds(true);
-    }
-    const failures = needsLoad ? (await Promise.all(assetIds.map(async id => {
-      const url = getAssetVisualBinding(id)?.url;
-      return url && await loadBackground(url) ? '' : id;
-    }))).filter(Boolean) : assetIds.filter(id => !getAssetVisualBinding(id));
-    if (request !== startRequest.current) return;
-    setFailedBackgrounds(failures);
-    setLoadingBackgrounds(false);
     onUserTestedInPlay();
-    setDraft(null);
     resetSimulationState();
-    scheduledRef.current = timeline;
-    layoutRef.current = { ...layoutRef.current, layout: startLayout, base: startLayout, edits: [], draft: null };
-    setTrialHistory({ current: startLayout, edits: [], undo: [] });
-    customFlagsRef.current = {};
-    setCustomFlags({});
-    scopedVariablesRef.current = scopedVariablesRef.current.map(entry => ({
-      ...entry, playValue: entry.variable.initialValue,
-    }));
-    onResetPlayValues();
-
-    const hero = startLayout.placements.hero;
-    simRef.current.heroX = hero?.x ?? HERO_BASE_X;
-    simRef.current.heroY = hero?.y ?? GROUND_Y;
-    simRef.current.onGround = simRef.current.heroY >= GROUND_Y;
 
     const freshStats = { ...INITIAL_PLAY_STATS };
     statsRef.current = freshStats;
@@ -1989,136 +2172,179 @@ export function RightStudioColumn({
     setWaveNumber(1);
     setPlayMode('playing');
 
+    const topLevelGroups = playableNodes.filter(
+      (n) => n.kind === 'group' && (!n.parentId || !playableMap.has(n.parentId)),
+    );
+    const rootGroupsWithNoIncoming = topLevelGroups.filter(
+      (grp) =>
+        !edges.some(
+          (e) =>
+            e.toId === grp.id &&
+            e.fromId !== grp.id &&
+            (e.fromId === null || playableMap.has(e.fromId)),
+        ),
+    );
+
+    if (rootGroupsWithNoIncoming.length > 0) {
+      const sortedRoots = [...rootGroupsWithNoIncoming].sort((a, b) =>
+        Math.abs(a.y - b.y) > 40 ? a.y - b.y : a.x - b.x,
+      );
+      enterNodes(sortedRoots, null, false);
+      checkReactiveTransitions();
+      return;
+    }
+
     const startNode =
-      (startNodeId ? playableMap.get(startNodeId) : null) ?? playableNodes[0];
+      (startNodeId ? playableMap.get(startNodeId) : null) ??
+      (edges.some((e) => e.fromId === null) ? null : playableNodes[0]);
     if (startNode) {
       enterNodes([startNode], null, false);
+      checkReactiveTransitions();
+    } else {
+      // All playable nodes/groups are guarded by standalone trigger arrows -> start listening cleanly
+      phaseRef.current = 'live';
+      setPhase('live');
+      checkReactiveTransitions();
     }
-  };
+  }, [
+    checkReactiveTransitions,
+    edges,
+    enterNodes,
+    onUserTestedInPlay,
+    playableMap,
+    playableNodes,
+    resetSimulationState,
+    startNodeId,
+  ]);
 
-  const stopRun = () => {
-    ++startRequest.current;
-    setLoadingBackgrounds(false);
-    scheduledRef.current = [];
-    setTrialHistory({ ...EMPTY_TRIAL, undo: [] });
+  const handleStopPlay = useCallback(() => {
     resetSimulationState();
-    setDraft(null);
     setPlayMode('preview');
     setActiveNodeIds([]);
     setLastEdgeId(null);
-  };
+  }, [resetSimulationState]);
 
-  const pauseRun = () => {
-    setEditorCard(null);
-    setEditorSection('card');
-    setLayoutSelection('');
-    pauseLayoutRef.current = layoutRef.current.layout;
-    const stamp = readClock();
-    frameClockRef.current = stamp;
-    setClock(stamp);
-    pausedRef.current = true;
-    setPaused(true);
-  };
-
-  const resumeRun = () => {
-    const before = pauseLayoutRef.current;
-    const sim = simRef.current;
-    if (before) {
-      const hero = editedStagePosition(before.placements.hero, layout.placements.hero, { x: sim.heroX, y: sim.heroY });
-      if (sim.heroY !== hero.y) sim.onGround = hero.y >= GROUND_Y;
-      sim.heroX = hero.x;
-      sim.heroY = hero.y;
-      const id = hazardLayoutId.current;
-      if (id && sim.hazard && !sim.hazard.resolved) {
-        const next = editedStagePosition(before.placements[id], layout.placements[id], sim.hazard);
-        sim.hazard.x = next.x;
-        sim.hazard.baseY += next.y - sim.hazard.y;
-        sim.hazard.y = next.y;
+  const handleFocusActiveNode = useCallback(
+    (nodeId: string) => {
+      if (playModeRef.current !== 'playing') return;
+      const target = playableMap.get(nodeId);
+      if (!target || target.kind === 'group') return;
+      onUserTestedInPlay();
+      if (resolveTimerRef.current !== null) {
+        window.clearTimeout(resolveTimerRef.current);
+        resolveTimerRef.current = null;
       }
-    }
-    setDraft(null);
-    pauseLayoutRef.current = null;
-    pausedRef.current = false;
-    setPaused(false);
-  };
+      focusNodeVisuals(target);
+      setSimRevision((r) => r + 1);
+    },
+    [focusNodeVisuals, onUserTestedInPlay, playableMap],
+  );
 
-  const changeKey = ({ id, field }: LayoutChange) => id + '/' + field;
-  const openReview = (intent: 'save' | 'restart' | 'stop') => {
-    if (!paused) pauseRun();
-    setDraft(null);
-    setCheckedChanges([...changes.map(changeKey), ...pendingEdits.map(edit => edit.id)]);
-    setTimings(Object.fromEntries(pendingEdits.map(edit => [edit.id, 'run'])));
-    setReview(intent);
-  };
-  const handleStartPlay = () => {
-    if (loadingBackgrounds) return;
-    if (playing && dirty) openReview('restart');
-    else startFromLayout(layoutHistory.current);
-  };
-  const handleStopPlay = () => {
-    if (loadingBackgrounds) { stopRun(); return; }
-    if (dirty) openReview('stop');
-    else stopRun();
-  };
-  const confirmReview = () => {
-    const selected = changes.filter(change => checkedChanges.includes(changeKey(change)));
-    const selectedEdits = pendingEdits.filter(edit => checkedChanges.includes(edit.id));
-    if (selected.length === 0 && selectedEdits.length === 0) return;
-    const opening = selectedEdits.filter(edit => timings[edit.id] === 'opening');
-    const next = applyStageMoments(applyStageLayoutChanges(layoutHistory.current, trialHistory.current, selected), opening);
-    let nextMoments = moments;
-    for (const edit of selectedEdits) {
-      const timing = timings[edit.id];
-      if (timing === 'opening') continue;
-      const cardId = timing === 'card' ? edit.clock.cardId : undefined;
-      const point = { id: edit.id, target: edit.target, cardId, atMs: cardId ? edit.clock.cardMs : edit.clock.runMs };
-      nextMoments = upsertMoment(nextMoments, edit.field === 'background'
-        ? { ...point, field: 'background', value: edit.value }
-        : { ...point, field: 'size', value: edit.value });
-    }
-    setMoments(nextMoments);
-    if (selected.length || opening.length) {
-      setLayoutHistory(prev => ({ current: next, undo: [...prev.undo.slice(-49), prev.current] }));
-    }
-    // A later trial undo may expose a previous edit, but cannot unconfirm an already saved point.
-    setTrialHistory(prev => {
-      const confirmed = new Set(selectedEdits.map(edit => edit.id));
-      const mark = (edits: MomentEdit[]) => edits.map(edit => confirmed.has(edit.id) ? { ...edit, confirmed: true } : edit);
-      return { ...prev, current: applyStageMoments(prev.current, opening), edits: mark(prev.edits),
-        undo: prev.undo.map(snapshot => ({ ...snapshot, current: applyStageMoments(snapshot.current, opening),
-          edits: mark(snapshot.edits) })) };
-    });
-    if (review === 'restart') void startFromLayout(next, nextMoments);
-    else if (review === 'stop') stopRun();
-    else {
-      setReview(null);
-      setSavedNotice(true);
-    }
-  };
+  const handleFocusChapter = useCallback(
+    (groupId: string) => {
+      if (playModeRef.current !== 'playing') return;
+      onUserTestedInPlay();
+      if (resolveTimerRef.current !== null) {
+        window.clearTimeout(resolveTimerRef.current);
+        resolveTimerRef.current = null;
+      }
+      focusedGroupIdRef.current = groupId;
+      setFocusedGroupId(groupId);
+      const matchingActive = activeNodes.find(
+        (n) => n.parentId === groupId || isDescendantOf(n.id, groupId, nodeMap),
+      );
+      if (matchingActive) {
+        focusNodeVisuals(matchingActive);
+      } else {
+        focusNodeVisuals(null);
+        setPhase('live');
+      }
+      setSimRevision((r) => r + 1);
+    },
+    [activeNodes, focusNodeVisuals, nodeMap, onUserTestedInPlay],
+  );
 
   const handleAdvanceOverlay = useCallback(() => {
-    if (pausedRef.current || playModeRef.current !== 'playing' || phaseRef.current !== 'overlay') return;
+    if (playModeRef.current !== 'playing' || phaseRef.current !== 'overlay') return;
     onUserTestedInPlay();
-    const passing = outgoing.filter((e) => e.evaluation.passed);
+    const targetOverlay = primaryNode;
+    if (!targetOverlay) return;
+
+    const evalOut = getEvaluatedOutgoing(
+      [targetOverlay.id],
+      nodesRef.current,
+      edgesRef.current,
+      statsRef.current,
+      customFlagsRef.current,
+      loopEdgeIdsRef.current,
+      scopedVariablesRef.current,
+      buildRuntimeCtx(),
+    );
+    const passing = evalOut.filter((e) => e.evaluation.passed);
     if (passing.length > 0) {
-      enterNodes([passing[0].target], passing[0].edge.id, passing[0].isLoop);
+      enterNodes([passing[0].target], passing[0].edge.id, passing[0].isLoop, {
+        replaceIds: [targetOverlay.id],
+      });
       return;
     }
-    if (edgesRef.current.length === 0 && primaryNode) {
-      const idx = playableNodes.findIndex((n) => n.id === primaryNode.id);
+
+    if (edgesRef.current.length === 0 && unlockedGroupIdsRef.current.length === 0) {
+      const idx = playableNodes.findIndex((n) => n.id === targetOverlay.id);
       const next = playableNodes[idx + 1];
       if (next) {
-        enterNodes([next], null, false);
+        enterNodes([next], null, false, { replaceIds: [targetOverlay.id] });
         return;
       }
     }
-    overlayTimerRef.current = null;
+
+    // Remove finished narration/dialogue from active pool and keep sibling mechanisms alive
+    if (!completedNodeIdsRef.current.includes(targetOverlay.id)) {
+      completedNodeIdsRef.current = [...completedNodeIdsRef.current, targetOverlay.id];
+      setCompletedNodeIds([...completedNodeIdsRef.current]);
+    }
+    const remaining = activeNodeIdsRef.current.filter((id) => id !== targetOverlay.id);
+    activeNodeIdsRef.current = remaining;
+    setActiveNodeIds(remaining);
+
+    const prog = applyPendingAndGroupTransitions(
+      statsRef.current,
+      scopedVariablesRef.current,
+      buildRuntimeCtx(),
+    );
+
+    if (activeNodeIdsRef.current.length > 0) {
+      const nextNode =
+        prog.newlyActivatedNodes[0] ??
+        playableMap.get(activeNodeIdsRef.current[0]) ??
+        null;
+      focusNodeVisuals(nextNode);
+      setSimRevision((r) => r + 1);
+      return;
+    }
+
+    if (pendingGroupIdsRef.current.length > 0 || getArmedStandaloneTriggerEdges().length > 0) {
+      focusNodeVisuals(null);
+      setPhase('live');
+      setSimRevision((r) => r + 1);
+      return;
+    }
+
     setPhase('ended');
     setEndSummary({
-      text: primaryNode?.note ?? '',
+      text: targetOverlay.note ?? '',
       tone: 'neutral',
     });
-  }, [enterNodes, onUserTestedInPlay, outgoing, playableNodes, primaryNode]);
+  }, [
+    applyPendingAndGroupTransitions,
+    buildRuntimeCtx,
+    enterNodes,
+    focusNodeVisuals,
+    getArmedStandaloneTriggerEdges,
+    onUserTestedInPlay,
+    playableMap,
+    playableNodes,
+    primaryNode,
+  ]);
 
   useEffect(() => {
     if (
@@ -2164,19 +2390,19 @@ export function RightStudioColumn({
   const activeOverlayPlaybackRef = useRef(activeOverlayPlayback);
   activeOverlayPlaybackRef.current = activeOverlayPlayback;
 
-  const advanceOverlayRef = useRef(handleAdvanceOverlay);
-  advanceOverlayRef.current = handleAdvanceOverlay;
-
-  // Both timers use simulation time so waiting in the editor never consumes a game delay.
+  // Auto-play timer for Narration & Dialogue when Playback Settings mode === 'auto'
   useEffect(() => {
-    overlayTimerRef.current = activeOverlayPlayback?.mode === 'auto'
-      ? simRef.current.time + Math.max(0.5, activeOverlayPlayback.durationSec ?? 3)
-      : null;
-  }, [activeOverlayPlayback, activeNodeIds]);
+    if (!activeOverlayPlayback || activeOverlayPlayback.mode !== 'auto') return;
+    const ms = Math.max(500, Math.round((activeOverlayPlayback.durationSec ?? 3) * 1000));
+    const timer = window.setTimeout(() => {
+      handleAdvanceOverlay();
+    }, ms);
+    return () => window.clearTimeout(timer);
+  }, [activeOverlayPlayback, activeNodeIds, handleAdvanceOverlay]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (pausedRef.current || playModeRef.current !== 'playing') return;
+      if (playModeRef.current !== 'playing') return;
       const activeTag = (document.activeElement?.tagName ?? '').toLowerCase();
       if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
 
@@ -2200,13 +2426,22 @@ export function RightStudioColumn({
       const controls = liveActionControlsRef.current;
       if (controls.length === 0) return;
 
-      let matched = controls.find(
-        (c) =>
-          c.evaluation.passed &&
-          c.control.device === 'keyboard' &&
-          c.control.interactionType !== 'release' &&
-          matchesKeyEvent(c.keyLabel, e),
-      );
+      let matched =
+        controls.find(
+          (c) =>
+            c.ownerNodeId === focusedNodeIdRef.current &&
+            c.evaluation.passed &&
+            c.control.device === 'keyboard' &&
+            c.control.interactionType !== 'release' &&
+            matchesKeyEvent(c.keyLabel, e),
+        ) ??
+        controls.find(
+          (c) =>
+            c.evaluation.passed &&
+            c.control.device === 'keyboard' &&
+            c.control.interactionType !== 'release' &&
+            matchesKeyEvent(c.keyLabel, e),
+        );
       if (!matched && e.key >= '1' && e.key <= '4') {
         matched = controls[Number(e.key) - 1];
       }
@@ -2219,7 +2454,7 @@ export function RightStudioColumn({
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      if (pausedRef.current || playModeRef.current !== 'playing' || phaseRef.current !== 'live') return;
+      if (playModeRef.current !== 'playing' || phaseRef.current !== 'live') return;
       const activeTag = (document.activeElement?.tagName ?? '').toLowerCase();
       if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
       const matched = liveActionControlsRef.current.find(
@@ -2253,72 +2488,79 @@ export function RightStudioColumn({
       lastTs = now;
 
       const sim = simRef.current;
+      sim.time += dt;
       const isPlaying = playModeRef.current === 'playing';
-      const isPaused = isPlaying && pausedRef.current;
-      if (!isPaused) effectTimeRef.current += dt * 1000;
-      const running = isPlaying && !isPaused && phaseRef.current !== 'ended';
-      if (!isPlaying || running) sim.time += dt;
-      if (running) {
-        const pending = resolveTimerRef.current;
-        if (pending && sim.time >= pending.at) {
-          resolveTimerRef.current = null;
-          pending.run();
-        }
-        if (overlayTimerRef.current !== null && sim.time >= overlayTimerRef.current) {
-          overlayTimerRef.current = null;
-          advanceOverlayRef.current();
-        }
-      }
-      if (running) {
-        const stamp = readClock();
-        const dueEffects = effectScheduler.current.due(layoutRef.current.layout, stamp.runMs, stamp.cardMs, stamp.cardId);
-        if (dueEffects.length) fireEffectsRef.current(dueEffects, { x: sim.heroX, y: sim.heroY - 22 }, false);
-        const previous = frameClockRef.current;
-        if (Math.floor(previous.runMs / 100) !== Math.floor(stamp.runMs / 100) ||
-          previous.cardId !== stamp.cardId || stamp.runMs < previous.runMs) {
-          frameClockRef.current = stamp;
-          setClock(stamp);
-        }
-        const due = dueMoments(scheduledRef.current, stamp).filter(moment => {
-          if (moment.field !== 'background' || !moment.value.assetId) return true;
-          const url = currentBinding.current(moment.value.assetId)?.url;
-          return Boolean(url && backgroundImages.current.has(url));
-        });
-        if (due.length !== visibleRef.current.length || due.some((entry, index) => entry !== visibleRef.current[index])) {
-          visibleRef.current = due;
-          const current = layoutRef.current;
-          current.layout = applyStageMoments(applyStageMoments(current.base, due), current.edits);
-          setVisibleMoments(due);
-        }
-      }
       const preview = previewSnapshotRef.current;
-      const { layout, draft, selection } = layoutRef.current;
-      const hero = { ...HERO_POSE, ...layout.placements.hero, ...(draft?.id === 'hero' ? draft.pose : {}) };
-      const bg = currentBinding.current(layout.background.assetId);
-      const arrangedImage = bg && backgroundImages.current.get(bg.url);
-      const hasAnyPlayable = playableCountRef.current > 0 ||
-        Boolean(layout.background.color || arrangedImage || bgImgRef.current);
-      const previewTargets: { id: string; pose: StagePose }[] = [];
-      previewHits.current = previewTargets;
+      const hasAnyPlayable = playableCountRef.current > 0;
 
-      if (running) {
+      if (isPlaying) {
+        let recordedNewEvent = false;
+        const markEvt = (
+          evt: string,
+          opts?: Omit<RuntimeEventRecord, 'eventId'>,
+        ) => {
+          if (recordRuntimeEvent(evt, opts)) recordedNewEvent = true;
+        };
+
+        // Challenge countdown timer for time_up events & auto-time-limit parameter
+        if (
+          phaseRef.current === 'live' &&
+          challengeTimerRemainingRef.current !== null &&
+          challengeTimerRemainingRef.current > 0
+        ) {
+          const nextRem = Math.max(0, challengeTimerRemainingRef.current - dt);
+          challengeTimerRemainingRef.current = nextRem;
+          const rounded = Math.ceil(nextRem);
+          if (lastTimerShownRef.current !== rounded) {
+            lastTimerShownRef.current = rounded;
+            setChallengeTimeLeft(rounded);
+          }
+          if (nextRem <= 0) {
+            markEvt('time_up', {
+              subjectRole: 'timer',
+              subjectAssetId: backgroundAssetIdRef.current,
+            });
+          }
+        }
+
         if (!sim.onGround) {
+          prevSpatialRef.current.wasAirborne = true;
           sim.heroVy += 880 * dt;
           sim.heroY += sim.heroVy * dt;
           if (sim.heroY >= GROUND_Y) {
             sim.heroY = GROUND_Y;
             sim.heroVy = 0;
             sim.onGround = true;
+            if (prevSpatialRef.current.wasAirborne) {
+              markEvt('lands', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+              });
+              markEvt('was_airborne');
+              prevSpatialRef.current.wasAirborne = false;
+            }
           }
         }
 
         sim.heroX += sim.heroVx * dt;
-        sim.heroVx += (hero.x - sim.heroX) * 7.5 * dt;
+        sim.heroVx += (HERO_BASE_X - sim.heroX) * 7.5 * dt;
         sim.heroVx *= Math.pow(0.06, dt);
         sim.heroX = Math.max(38, Math.min(WORLD_W - 60, sim.heroX));
 
-        if (sim.shieldTimer > 0) sim.shieldTimer = Math.max(0, sim.shieldTimer - dt);
-        if (sim.dodgeTimer > 0) sim.dodgeTimer = Math.max(0, sim.dodgeTimer - dt);
+        if (sim.shieldTimer > 0) {
+          sim.shieldTimer = Math.max(0, sim.shieldTimer - dt);
+          prevSpatialRef.current.wasBlocking = sim.shieldTimer > 0;
+        } else {
+          prevSpatialRef.current.wasBlocking = false;
+        }
+
+        if (sim.dodgeTimer > 0) {
+          sim.dodgeTimer = Math.max(0, sim.dodgeTimer - dt);
+          prevSpatialRef.current.wasDashing = sim.dodgeTimer > 0;
+        } else {
+          prevSpatialRef.current.wasDashing = false;
+        }
+
         if (sim.hurtTimer > 0) sim.hurtTimer = Math.max(0, sim.hurtTimer - dt);
         if (sim.lanternFlare > 0)
           sim.lanternFlare = Math.max(0, sim.lanternFlare - dt * 1.1);
@@ -2329,18 +2571,43 @@ export function RightStudioColumn({
           if (sim.hazard && !sim.hazard.resolved) {
             const dist = Math.hypot(w.x - sim.hazard.x, w.y - sim.hazard.y);
             if (dist < sim.hazard.radius + 16) {
-              effectEventRef.current('collision', { x: sim.hazard.x, y: sim.hazard.y });
               sim.hazard.resolved = true;
+              markEvt('hits', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('touches', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('disappears', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
               spawnParticles(sim.hazard.x, sim.hazard.y, '#38BDF8', 16);
               const matchedCtrl = liveActionControlsRef.current.find(
                 (c) => c.id === w.actionControlId,
               );
               sim.waves.splice(i, 1);
-              if (matchedCtrl) resolveActionOutcome(matchedCtrl);
+              if (checkReactiveTransitions()) {
+                continue;
+              }
+              if (matchedCtrl && hasUnconditionalOutgoing(matchedCtrl.target.id)) {
+                resolveActionOutcome(matchedCtrl);
+              }
               continue;
             }
           }
-          if (w.x > WORLD_W + 30) sim.waves.splice(i, 1);
+          if (w.x > WORLD_W + 30) {
+            markEvt('leaves_stage', {
+              subjectRole: 'projectile',
+            });
+            sim.waves.splice(i, 1);
+          }
         }
 
         if (phaseRef.current === 'live' && sim.hazard && !sim.hazard.resolved) {
@@ -2350,9 +2617,7 @@ export function RightStudioColumn({
           if (h.direction === 'down' || h.direction === 'up') {
             h.y += h.vy * dt;
           } else if (h.bounces) {
-            const bounceOffset =
-              Math.abs(Math.sin(h.age * 5.0 * Math.sqrt(Math.max(0.4, h.speedMultiplier)))) * 26;
-            h.y = h.baseY - bounceOffset;
+            h.y = h.baseY - cardPreviewBounce(h.age, h.speedMultiplier);
           } else {
             h.y = h.baseY;
           }
@@ -2386,6 +2651,8 @@ export function RightStudioColumn({
           const resetHazardPosition = () => {
             h.resolved = false;
             h.age = 0;
+            h.wasJumpedOver = false;
+            prevSpatialRef.current.wasTouching = false;
             if (h.direction === 'right') {
               h.x = -24;
               h.y = h.baseY;
@@ -2403,27 +2670,59 @@ export function RightStudioColumn({
               h.x = WORLD_W + 28;
               h.y = h.baseY;
             }
-            const configured = hazardLayoutId.current ? layout.placements[hazardLayoutId.current] : undefined;
-            if (configured?.x !== undefined) h.x = configured.x;
-            if (configured?.y !== undefined) h.y = configured.y;
           };
 
           const heroCenterY = sim.heroY - 22;
           const dist = Math.hypot(h.x - sim.heroX, h.y - heroCenterY);
+          const isCurrentlyTouching = dist < h.radius + 22;
+          if (isCurrentlyTouching) {
+            prevSpatialRef.current.wasTouching = true;
+            markEvt('touches', {
+              subjectAssetId: heroAssetIdRef.current,
+              subjectRole: 'hero',
+              targetAssetId: hazardAssetIdRef.current,
+              targetRole: 'hazard',
+            });
+            markEvt('touches', {
+              subjectAssetId: hazardAssetIdRef.current,
+              subjectRole: 'hazard',
+              targetAssetId: heroAssetIdRef.current,
+              targetRole: 'hero',
+            });
+          } else {
+            prevSpatialRef.current.wasTouching = false;
+          }
 
           if (h.kind === 'collectible') {
             if (dist < h.radius + 22) {
               h.resolved = true;
-              effectEventRef.current('collect', { x: h.x, y: h.y });
+              markEvt('touches', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('is_collected', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('disappears', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
               spawnParticles(h.x, h.y, '#FBC53D', 16);
-              const ctrl =
-                liveActionControlsRef.current.find(
-                  (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
-                ) ?? liveActionControlsRef.current.find((c) => c.evaluation.passed);
-              if (ctrl) {
-                resolveActionOutcome(ctrl);
-              } else {
-                resetHazardPosition();
+              if (!checkReactiveTransitions()) {
+                const ctrl =
+                  liveActionControlsRef.current.find(
+                    (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
+                  ) ?? liveActionControlsRef.current.find((c) => c.evaluation.passed);
+                if (ctrl && hasUnconditionalOutgoing(ctrl.target.id)) {
+                  resolveActionOutcome(ctrl);
+                } else {
+                  resetHazardPosition();
+                }
               }
             } else if (
               (h.direction === 'left' && h.x < -28) ||
@@ -2431,68 +2730,155 @@ export function RightStudioColumn({
               (h.direction === 'down' && h.y > GROUND_Y + 16) ||
               (h.direction === 'up' && h.y < -28)
             ) {
-              resetHazardPosition();
+              markEvt('leaves_stage', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              if (!checkReactiveTransitions()) {
+                resetHazardPosition();
+              }
             }
           } else if (h.direction === 'down') {
             if (dist < h.radius + 17 && sim.dodgeTimer <= 0) {
-              effectEventRef.current('collision', { x: h.x, y: h.y });
               h.resolved = true;
+              markEvt('touches', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
               if (sim.shieldTimer > 0) {
-                const shieldCtrl =
+                markEvt('blocks', {
+                  subjectAssetId: heroAssetIdRef.current,
+                  subjectRole: 'hero',
+                  targetAssetId: hazardAssetIdRef.current,
+                  targetRole: 'hazard',
+                });
+                markEvt('disappears', {
+                  subjectAssetId: hazardAssetIdRef.current,
+                  subjectRole: 'hazard',
+                });
+                if (!checkReactiveTransitions()) {
+                  const shieldCtrl =
+                    liveActionControlsRef.current.find(
+                      (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
+                    ) ??
+                    liveActionControlsRef.current.find(
+                      (c) => c.mechanic === 'shield' && c.evaluation.passed,
+                    );
+                  if (shieldCtrl && hasUnconditionalOutgoing(shieldCtrl.target.id)) {
+                    resolveActionOutcome(shieldCtrl);
+                  } else {
+                    resetHazardPosition();
+                  }
+                }
+              } else {
+                markEvt('hits', {
+                  subjectAssetId: hazardAssetIdRef.current,
+                  subjectRole: 'hazard',
+                  targetAssetId: heroAssetIdRef.current,
+                  targetRole: 'hero',
+                });
+                sim.hurtTimer = 0.55;
+                spawnParticles(sim.heroX, heroCenterY, '#F43F5E', 16);
+                if (!checkReactiveTransitions()) {
+                  resetHazardPosition();
+                }
+              }
+            } else if (h.y > GROUND_Y + 6) {
+              h.resolved = true;
+              markEvt('passes', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('avoids', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('leaves_stage', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              markEvt('disappears', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              spawnParticles(h.x, GROUND_Y, '#F97316', 10);
+              if (!checkReactiveTransitions()) {
+                const dodgeCtrl =
                   liveActionControlsRef.current.find(
                     (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
                   ) ??
                   liveActionControlsRef.current.find(
-                    (c) => c.mechanic === 'shield' && c.evaluation.passed,
+                    (c) =>
+                      (c.mechanic === 'dodge' || c.mechanic === 'jump') &&
+                      c.evaluation.passed,
                   );
-                if (shieldCtrl) {
-                  resolveActionOutcome(shieldCtrl);
+                if (dodgeCtrl && hasUnconditionalOutgoing(dodgeCtrl.target.id)) {
+                  resolveActionOutcome(dodgeCtrl);
                 } else {
                   resetHazardPosition();
                 }
-              } else {
-                sim.hurtTimer = 0.55;
-                spawnParticles(sim.heroX, heroCenterY, '#F43F5E', 16);
-                resetHazardPosition();
-              }
-            } else if (h.y > GROUND_Y + 6) {
-              h.resolved = true;
-              spawnParticles(h.x, GROUND_Y, '#F97316', 10);
-              const dodgeCtrl =
-                liveActionControlsRef.current.find(
-                  (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
-                ) ??
-                liveActionControlsRef.current.find(
-                  (c) =>
-                    (c.mechanic === 'dodge' || c.mechanic === 'jump') &&
-                    c.evaluation.passed,
-                ) ??
-                liveActionControlsRef.current.find((c) => c.evaluation.passed);
-              if (dodgeCtrl) {
-                resolveActionOutcome(dodgeCtrl);
-              } else {
-                resetHazardPosition();
               }
             }
           } else if (h.direction === 'up') {
             if (dist < h.radius + 17 && sim.dodgeTimer <= 0) {
-              effectEventRef.current('collision', { x: h.x, y: h.y });
               h.resolved = true;
+              markEvt('touches', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('hits', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
               sim.hurtTimer = 0.55;
               spawnParticles(sim.heroX, heroCenterY, '#F43F5E', 16);
-              resetHazardPosition();
+              if (!checkReactiveTransitions()) {
+                resetHazardPosition();
+              }
             } else if (h.y < -24) {
               h.resolved = true;
-              const clearedCtrl =
-                sim.lastActionControlId
-                  ? liveActionControlsRef.current.find(
-                      (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
-                    )
-                  : undefined;
-              if (clearedCtrl) {
-                resolveActionOutcome(clearedCtrl);
-              } else {
-                resetHazardPosition();
+              markEvt('passes', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('avoids', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('leaves_stage', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              markEvt('disappears', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              if (!checkReactiveTransitions()) {
+                const clearedCtrl =
+                  sim.lastActionControlId
+                    ? liveActionControlsRef.current.find(
+                        (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
+                      )
+                    : undefined;
+                if (clearedCtrl && hasUnconditionalOutgoing(clearedCtrl.target.id)) {
+                  resolveActionOutcome(clearedCtrl);
+                } else {
+                  resetHazardPosition();
+                }
               }
             }
           } else {
@@ -2503,35 +2889,71 @@ export function RightStudioColumn({
               !h.wasJumpedOver
             ) {
               h.wasJumpedOver = true;
+              markEvt('passes', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('passes', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('avoids', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
             }
 
             if (dist < h.radius + 17 && sim.dodgeTimer <= 0) {
-              effectEventRef.current('collision', { x: h.x, y: h.y });
               h.resolved = true;
+              markEvt('touches', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
               if (sim.shieldTimer > 0) {
+                markEvt('blocks', {
+                  subjectAssetId: heroAssetIdRef.current,
+                  subjectRole: 'hero',
+                  targetAssetId: hazardAssetIdRef.current,
+                  targetRole: 'hazard',
+                });
+                markEvt('disappears', {
+                  subjectAssetId: hazardAssetIdRef.current,
+                  subjectRole: 'hazard',
+                });
                 spawnParticles(sim.heroX + 14, heroCenterY, '#38BDF8', 16);
-                const shieldCtrl =
-                  liveActionControlsRef.current.find(
-                    (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
-                  ) ??
-                  liveActionControlsRef.current.find(
-                    (c) => c.mechanic === 'shield' && c.evaluation.passed,
-                  );
-                if (shieldCtrl) {
-                  resolveActionOutcome(shieldCtrl);
-                } else {
-                  resetHazardPosition();
+                if (!checkReactiveTransitions()) {
+                  const shieldCtrl =
+                    liveActionControlsRef.current.find(
+                      (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
+                    ) ??
+                    liveActionControlsRef.current.find(
+                      (c) => c.mechanic === 'shield' && c.evaluation.passed,
+                    );
+                  if (shieldCtrl && hasUnconditionalOutgoing(shieldCtrl.target.id)) {
+                    resolveActionOutcome(shieldCtrl);
+                  } else {
+                    resetHazardPosition();
+                  }
                 }
               } else {
+                markEvt('hits', {
+                  subjectAssetId: hazardAssetIdRef.current,
+                  subjectRole: 'hazard',
+                  targetAssetId: heroAssetIdRef.current,
+                  targetRole: 'hero',
+                });
                 sim.hurtTimer = 0.55;
                 sim.heroVx = h.direction === 'right' ? 115 : -115;
                 spawnParticles(sim.heroX, heroCenterY, '#F43F5E', 16);
-                const shieldFallback = liveActionControlsRef.current.find(
-                  (c) => c.mechanic === 'shield',
-                );
-                if (shieldFallback) {
-                  resolveActionOutcome(shieldFallback);
-                } else {
+                if (!checkReactiveTransitions()) {
                   resetHazardPosition();
                 }
               }
@@ -2540,22 +2962,50 @@ export function RightStudioColumn({
               (h.direction === 'right' && h.x > WORLD_W + 26)
             ) {
               h.resolved = true;
-              const clearedCtrl =
-                liveActionControlsRef.current.find(
-                  (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
-                ) ??
-                liveActionControlsRef.current.find(
-                  (c) =>
-                    (c.mechanic === 'jump' || c.mechanic === 'dodge') &&
-                    c.evaluation.passed,
-                ) ??
-                liveActionControlsRef.current.find((c) => c.evaluation.passed);
-              if (clearedCtrl) {
-                resolveActionOutcome(clearedCtrl);
-              } else {
-                resetHazardPosition();
+              markEvt('passes', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+                targetAssetId: heroAssetIdRef.current,
+                targetRole: 'hero',
+              });
+              markEvt('avoids', {
+                subjectAssetId: heroAssetIdRef.current,
+                subjectRole: 'hero',
+                targetAssetId: hazardAssetIdRef.current,
+                targetRole: 'hazard',
+              });
+              markEvt('leaves_stage', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              markEvt('disappears', {
+                subjectAssetId: hazardAssetIdRef.current,
+                subjectRole: 'hazard',
+              });
+              if (!checkReactiveTransitions()) {
+                const clearedCtrl =
+                  liveActionControlsRef.current.find(
+                    (c) => c.id === sim.lastActionControlId && c.evaluation.passed,
+                  ) ??
+                  liveActionControlsRef.current.find(
+                    (c) =>
+                      (c.mechanic === 'jump' || c.mechanic === 'dodge') &&
+                      c.evaluation.passed,
+                  );
+                if (clearedCtrl && hasUnconditionalOutgoing(clearedCtrl.target.id)) {
+                  resolveActionOutcome(clearedCtrl);
+                } else {
+                  resetHazardPosition();
+                }
               }
             }
+          }
+        }
+
+        if (phaseRef.current === 'live') {
+          const transitioned = checkReactiveTransitions();
+          if (!transitioned && recordedNewEvent) {
+            setSimRevision((r) => r + 1);
           }
         }
 
@@ -2591,17 +3041,10 @@ export function RightStudioColumn({
 
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          const frame = timelineRender.current;
-          const drawingLayout = frame.layout ?? layout;
-          const showLiveScene = isPlaying && !frame.sample;
-          const hero = { ...HERO_POSE, ...drawingLayout.placements.hero, ...(!frame.layout && draft?.id === 'hero' ? draft.pose : {}) };
-          const bg = frame.layout ? frame.background : currentBinding.current(layout.background.assetId);
-          const arrangedImage = bg && backgroundImages.current.get(bg.url);
-          const fallback = frame.card ? null : bgImgRef.current;
           ctx.save();
           ctx.scale((cssW * dpr) / WORLD_W, (cssH * dpr) / WORLD_H);
 
-          if (!hasAnyPlayable && !frame.layout) {
+          if (!hasAnyPlayable) {
             // Truly blank, clean neutral stage canvas (zero pre-baked scenery!)
             ctx.fillStyle = '#F1F5F9';
             ctx.fillRect(0, 0, WORLD_W, WORLD_H);
@@ -2625,46 +3068,26 @@ export function RightStudioColumn({
               ? 0.55 + 0.25 * Math.sin(sim.time * 3.5)
               : 0;
           const flare = isPlaying ? sim.lanternFlare : previewFlare;
-          if (arrangedImage && (arrangedBgBakeRef.current?.image !== arrangedImage ||
-            arrangedBgBakeRef.current.fingerprint !== bg.fingerprint)) {
-            arrangedBgBakeRef.current = {
-              image: arrangedImage,
-              fingerprint: bg.fingerprint,
-              baked: bakeStaticEffectsToCanvas(arrangedImage, bg.effects),
-            };
-          }
 
           drawStageBackdrop(
             ctx,
-            preview.sceneTheme,
+            isPlaying ? activeSceneThemeRef.current : preview.sceneTheme,
             WORLD_W,
             WORLD_H,
             GROUND_Y,
             sim.time,
             flare,
-            arrangedImage || fallback,
-            arrangedImage ? arrangedBgBakeRef.current?.baked ?? null : bgBakedRef.current,
-            arrangedImage ? bg.effects : bgEffectsRef.current,
+            bgImgRef.current,
+            bgBakedRef.current,
+            bgEffectsRef.current,
           );
 
-          if (drawingLayout.background.color) {
-            ctx.fillStyle = drawingLayout.background.color;
-            ctx.fillRect(0, 0, WORLD_W, WORLD_H);
-          }
-
           // Hero Character (Only drawn when student has explicitly bound/selected a Character asset)
-          if (heroImgRef.current && (isPlaying || composedItemsRef.current.some(item => item.group === 'actor'))) {
-            const position = frame.sample ? hero : frame.layout && isPaused ? { x: sim.heroX, y: sim.heroY } : isPaused
-              ? editedStagePosition(pauseLayoutRef.current?.placements.hero,
-                { ...layout.placements.hero, ...(draft?.id === 'hero' ? draft.pose : {}) }, { x: sim.heroX, y: sim.heroY })
-              : isPlaying ? { x: sim.heroX, y: sim.heroY } : hero;
-            const hx = position.x;
+          if (heroImgRef.current && (isPlaying || preview.showHero)) {
+            const hx = isPlaying ? sim.heroX : HERO_BASE_X;
             const idleBob =
               !isPlaying || sim.onGround ? Math.sin(sim.time * 4.5) * 1.5 : 0;
-            const hy = position.y + (!isPlaying || isPaused ? 0 : idleBob);
-            if ((!isPlaying || isPaused) && !isHiddenByEffect(heroEffectsRef.current)) {
-              previewTargets.push({ id: 'hero', pose: { ...hero, x: hx, y: hy } });
-            }
+            const hy = (isPlaying ? sim.heroY : GROUND_Y) + idleBob;
 
             const heightAboveGround = Math.max(
               0,
@@ -2701,9 +3124,9 @@ export function RightStudioColumn({
               heroImgRef.current,
               heroBakedRef.current,
               hx,
-              hy - 2 - hero.height / 2,
-              hero.width,
-              hero.height,
+              hy - 23,
+              42,
+              42,
               heroEffectsRef.current,
               sim.time,
               0,
@@ -2733,25 +3156,135 @@ export function RightStudioColumn({
             ctx.restore();
           }
 
-          if (!showLiveScene) {
-            for (const item of composedItemsRef.current) {
-              if (item.group !== 'gameplay') continue;
-              const card = nodesRef.current.find(node => node.id === item.cardId);
-              if (!card) continue;
-              const cfg = resolveChallengeConfig(card);
-              const placement = frame.layout
-                ? { ...challengePose(cfg.pattern === 'collectible'), ...drawingLayout.placements[item.id] }
-                : { ...item.pose, ...(draft?.id === item.id ? draft.pose : {}) };
-              const binding = currentBinding.current(item.assetId);
-              const image = binding && backgroundImages.current.get(binding.url);
-              drawChallengeEntity(ctx, placement.x, placement.y, 13, cfg.visual, sim.time,
-                image || null, 0, null, binding?.effects, placement);
-              previewTargets.push({ id: item.id, pose: placement });
+          // Build Preview: Live Challenge Entity + Animated Direction/Speed Guide
+          if (!isPlaying && preview.challenge && preview.challengeCfg && !preview.challengeCfg.isSceneOnly) {
+            const cfg = preview.challengeCfg;
+            const cycle = cardPreviewCycle(sim.time, cfg.speedMultiplier);
+            const basePreviewY = cfg.pattern === 'collectible' ? GROUND_Y - 60 : GROUND_Y - 14;
+            const bounceOffset = cfg.bounces ? cardPreviewBounce(sim.time, cfg.speedMultiplier, true) : 0;
+
+            let px = 248;
+            let py = basePreviewY - bounceOffset;
+            let arrowFromX = 0;
+            let arrowFromY = 0;
+            let arrowToX = 0;
+            let arrowToY = 0;
+            let hasArrow = true;
+            let doubleArrow = false;
+            let previewRotateDir: -1 | 0 | 1 = 0;
+
+            if (cfg.direction === 'right') {
+              px = 112 + cycle * 196;
+              py = basePreviewY - bounceOffset;
+              arrowFromX = px + 18;
+              arrowFromY = py;
+              arrowToX = Math.min(WORLD_W - 14, px + 62);
+              arrowToY = py;
+              previewRotateDir = cfg.rotates || cfg.visual === 'rock' ? 1 : 0;
+            } else if (cfg.direction === 'down') {
+              px = HERO_BASE_X + 98;
+              py = 26 + cycle * (GROUND_Y - 44);
+              arrowFromX = px;
+              arrowFromY = py + 18;
+              arrowToX = px;
+              arrowToY = Math.min(GROUND_Y - 6, py + 56);
+              previewRotateDir = cfg.rotates ? 1 : 0;
+            } else if (cfg.direction === 'up') {
+              px = HERO_BASE_X + 98;
+              py = GROUND_Y - 16 - cycle * (GROUND_Y - 46);
+              arrowFromX = px;
+              arrowFromY = py - 18;
+              arrowToX = px;
+              arrowToY = Math.max(12, py - 56);
+              previewRotateDir = cfg.rotates ? -1 : 0;
+            } else if (cfg.direction === 'patrol') {
+              const patrol = cardPreviewPatrol(sim.time, cfg.speedMultiplier);
+              px = 222 + patrol.offset * 66;
+              py = basePreviewY - bounceOffset;
+              arrowFromX = 152;
+              arrowFromY = basePreviewY + 1;
+              arrowToX = 292;
+              arrowToY = basePreviewY + 1;
+              doubleArrow = true;
+              previewRotateDir = cfg.rotates || cfg.visual === 'rock' ? patrol.direction : 0;
+            } else if (cfg.direction === 'static') {
+              px = 236;
+              py = basePreviewY - bounceOffset;
+              hasArrow = false;
+              previewRotateDir = cfg.rotates ? 1 : 0;
+            } else {
+              // 'left'
+              px = 308 - cycle * 196;
+              py = basePreviewY - bounceOffset;
+              arrowFromX = px - 18;
+              arrowFromY = py;
+              arrowToX = Math.max(46, px - 62);
+              arrowToY = py;
+              previewRotateDir = cfg.rotates || cfg.visual === 'rock' ? -1 : 0;
             }
+
+            const guideColor =
+              cfg.pattern === 'collectible'
+                ? 'rgba(251, 197, 61, 0.85)'
+                : 'rgba(251, 146, 60, 0.85)';
+
+            ctx.save();
+            ctx.strokeStyle = guideColor;
+            ctx.fillStyle = guideColor;
+            ctx.lineWidth = 2;
+
+            if (hasArrow) {
+              const drawHead = (x1: number, y1: number, x2: number, y2: number) => {
+                const ang = Math.atan2(y2 - y1, x2 - x1);
+                const len = 6.5;
+                ctx.beginPath();
+                ctx.moveTo(x2, y2);
+                ctx.lineTo(x2 - len * Math.cos(ang - 0.5), y2 - len * Math.sin(ang - 0.5));
+                ctx.lineTo(x2 - len * Math.cos(ang + 0.5), y2 - len * Math.sin(ang + 0.5));
+                ctx.closePath();
+                ctx.fill();
+              };
+
+              ctx.setLineDash([4, 4]);
+              ctx.beginPath();
+              ctx.moveTo(arrowFromX, arrowFromY);
+              ctx.lineTo(arrowToX, arrowToY);
+              ctx.stroke();
+              ctx.setLineDash([]);
+
+              if (Math.hypot(arrowToX - arrowFromX, arrowToY - arrowFromY) > 10) {
+                drawHead(arrowFromX, arrowFromY, arrowToX, arrowToY);
+                if (doubleArrow) {
+                  drawHead(arrowToX, arrowToY, arrowFromX, arrowFromY);
+                }
+              }
+            } else {
+              // Static hazard subtle anchor ring
+              const pulseR = 17 + Math.sin(sim.time * 3.2) * 2.5;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.arc(px, py, pulseR, 0, Math.PI * 2);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+            ctx.restore();
+
+            drawChallengeEntity(
+              ctx,
+              px,
+              py,
+              13,
+              cfg.visual,
+              sim.time,
+              hazardImgRef.current,
+              previewRotateDir,
+              hazardBakedRef.current,
+              hazardEffectsRef.current,
+            );
           }
 
           // Live Play Entities
-          if (showLiveScene) {
+          if (isPlaying) {
             sim.waves.forEach((w) => {
               ctx.save();
               ctx.strokeStyle = '#38BDF8';
@@ -2770,20 +3303,10 @@ export function RightStudioColumn({
                     ? 1
                     : -1
                   : 0;
-              const id = hazardLayoutId.current;
-              const arrangement = id ? { ...drawingLayout.placements[id], ...(!frame.layout && draft?.id === id ? draft.pose : {}) } : undefined;
-              const point = !frame.layout && id && isPaused
-                ? editedStagePosition(pauseLayoutRef.current?.placements[id], arrangement, sim.hazard)
-                : sim.hazard;
-              if (id && isPaused) previewTargets.push({ id, pose: {
-                x: point.x, y: point.y,
-                width: arrangement?.width ?? sim.hazard.radius * 2.5,
-                height: arrangement?.height ?? sim.hazard.radius * 2.5,
-              } });
               drawChallengeEntity(
                 ctx,
-                point.x,
-                point.y,
+                sim.hazard.x,
+                sim.hazard.y,
                 sim.hazard.radius,
                 sim.hazard.visual,
                 sim.time,
@@ -2791,7 +3314,6 @@ export function RightStudioColumn({
                 liveRotateDir,
                 hazardBakedRef.current,
                 hazardEffectsRef.current,
-                arrangement,
               );
             }
 
@@ -2827,7 +3349,41 @@ export function RightStudioColumn({
 
     rafId = window.requestAnimationFrame(stepAndRender);
     return () => window.cancelAnimationFrame(rafId);
-  }, [resolveActionOutcome, spawnParticles]);
+  }, [
+    checkReactiveTransitions,
+    hasUnconditionalOutgoing,
+    recordRuntimeEvent,
+    resolveActionOutcome,
+    spawnParticles,
+  ]);
+
+  if (!isOpen) {
+    return (
+      <aside className="relative h-full w-11 shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col items-center py-3 gap-3 z-20">
+        {isDimmed && (
+          <div
+            aria-hidden="true"
+            className="absolute inset-0 bg-[#0F172A]/24 pointer-events-none"
+          />
+        )}
+        <button
+          type="button"
+          onClick={onToggle}
+          title={t.expand}
+          aria-label={t.expand}
+          className="relative w-8 h-8 rounded-lg text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
+        >
+          <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
+        </button>
+        <div
+          className="relative text-[11px] font-bold tracking-wider uppercase text-[#64748B] select-none"
+          style={{ writingMode: 'vertical-rl' }}
+        >
+          {t.title}
+        </div>
+      </aside>
+    );
+  }
 
   const activeDialogueNode =
     playMode === 'playing'
@@ -2862,266 +3418,12 @@ export function RightStudioColumn({
     : 'bottom';
 
   const canPlay = playableNodes.length > 0;
-  const editing = playMode === 'preview' || paused;
-  const stageItems: PlacementItem[] = [];
-  const zh = lang === 'zh';
-  const addItem = (id: string, label: string, pose: StagePose, symbol: string, active: boolean, cardId?: string, fallbackId?: string) => {
-    const placement = getStagePlacement(layout, id);
-    const assetId = placement.assetId || fallbackId;
-    const arrangement = { ...placement, ...(draft?.id === id ? draft.pose : {}) };
-    const sim = simRef.current;
-    const runtimePosition = paused && id === hazardLayoutId.current && sim.hazard && !sim.hazard.resolved
-      ? sim.hazard : null;
-    const position = runtimePosition
-      ? editedStagePosition(pauseLayoutRef.current?.placements[id], arrangement, runtimePosition)
-      : {};
-    const item: PlacementItem = {
-      id, label, symbol, active, cardId, assetId,
-      group: id.startsWith('challenge:') ? 'gameplay' : id.startsWith('decoration:') ? 'decoration' : 'base',
-      pose: { ...pose, ...arrangement, ...position },
-      image: getAssetVisualBinding(assetId)?.url,
-    };
-    stageItems.push(item);
-    return item;
-  };
-  for (const card of playableNodes) {
-    if (card.kind !== 'challenge') continue;
-    const config = resolveChallengeConfig(card);
-    if (config.isSceneOnly) continue;
-    const visual = challengeAppearance(card) ?? (card.id === previewSnapshot.challenge?.id ? challengeBinding : null);
-    const id = challengeId(card.id);
-    const activeHazard = paused && id === hazardLayoutId.current && simRef.current.hazard && !simRef.current.hazard.resolved
-      ? simRef.current.hazard : null;
-    const pose = challengePose(config.pattern === 'collectible');
-    if (activeHazard) pose.width = pose.height = activeHazard.radius * 2.5;
-    addItem(id, card.note || (zh ? '挑战物件' : 'Challenge object'),
-      pose, config.pattern === 'collectible' ? '★' : '◆',
-      paused ? Boolean(activeHazard) : card.id === previewSnapshot.challenge?.id, card.id, visual?.assetId);
-  }
-  const decorations = layout.decorations.map(id => addItem(id,
-    assetMap.get(layout.placements[id]?.assetId ?? '')?.name ?? (zh ? '装饰' : 'Decoration'),
-    DECORATION_POSE, '◇', true,
-  ));
-  const narrationId = activeNarrationNode && cardOverlayId('narration', activeNarrationNode.id);
-  const dialogueId = activeDialogueNode && cardOverlayId('dialogue', activeDialogueNode.id);
-  const endingId = endSummary && phase === 'ended' && primaryNode ? cardOverlayId('ending', primaryNode.id) : null;
-  for (const card of playableNodes) {
-    if (card.kind === 'narration') {
-      const id = cardOverlayId('narration', card.id);
-      addItem(id, zh ? '字幕' : 'Subtitle',
-        { x: 180, y: resolveSubtitlePosition(card) === 'top' ? 29 : 218, width: 320, height: 40 }, '≡', id === narrationId, card.id);
-    }
-    if (card.kind === 'dialogue') {
-      const id = cardOverlayId('dialogue', card.id);
-      addItem(id, zh ? '对话框' : 'Dialogue box',
-        { x: 180, y: 212, width: 320, height: 52 }, '…', id === dialogueId, card.id);
-    }
-    const id = cardOverlayId('ending', card.id);
-    if (endingId === id || layout.placements[id]) {
-      addItem(id, zh ? '结尾画面' : 'Ending screen', { x: 180, y: 125, width: 240, height: 110 }, '⚑', id === endingId, card.id);
-    }
-  }
-  const effectItems = effectEntries(layout).map(([id, placement]) => {
-    const item = addItem(id, assetMap.get(placement.assetId ?? '')?.name ?? (zh ? '重新选择特效' : 'Choose effect'),
-      {x:180, y:125, width:64, height:64}, '✦', true, undefined, placement.assetId);
-    item.group = 'effect';
-    return item;
-  });
-  const interfaceItems = Object.entries(layout.placements).filter(([id,p])=>id.startsWith('interface:') && p.ui).map(([id,p])=>{
-    const item = addItem(id,p.ui!.text || assetMap.get(p.assetId ?? '')?.name || 'Interface',{x:180,y:30,width:100,height:30},'▣',true,undefined,p.assetId);
-    item.group = 'interface'; return item;
-  });
-  const overlayItems = stageItems.filter(item => item.group === 'base' && (!playing || item.active));
-  const cardOnStage = playing ? primaryNode : previewSnapshot.selectedNode;
-  const editCard = playing && editorCard ? playableMap.get(editorCard) ?? cardOnStage : cardOnStage;
-  const actorCard = editCard?.kind === 'action' ? editCard
-    : (playing ? actionsByChallenge.get(runChallengeId ?? '')?.[0]
-      : previewSnapshot.challenge ? actionsByChallenge.get(previewSnapshot.challenge.id)?.[0] : undefined) ??
-      playableNodes.find(card => card.kind === 'action' &&
-        Boolean(getAssetVisualBinding(card.promptInput?.actorAssetId) ||
-          getNodeVisualBindingByCategories(card, ['characters'], true)));
-  let actorChallengeId: string | undefined;
-  if (actorCard) {
-    const parents = challengesForAction(actorCard.id);
-    const isCurrentAction = !playing || actorCard.id === primaryNode?.id ||
-      Boolean(runChallengeId && parents.includes(runChallengeId));
-    actorChallengeId = playing && runChallengeId && parents.includes(runChallengeId)
-      ? runChallengeId : !playing && previewSnapshot.challenge && parents.includes(previewSnapshot.challenge.id)
-        ? previewSnapshot.challenge.id : parents.length === 1 ? parents[0] : undefined;
-    const inherited = challengeRole(actorChallengeId).actorId;
-    const boundActor = getAssetVisualBinding(inherited ?? actorCard.promptInput?.actorAssetId) ??
-      getNodeVisualBindingByCategories(actorCard, ['characters'], true);
-    const appearance = boundActor && isCurrentAction ? characterBinding ?? boundActor : boundActor;
-    if (appearance) {
-      const name = assetMap.get(appearance.assetId)?.name ?? (zh ? '操控角色' : 'Player character');
-      const player = addItem('hero', name, HERO_POSE, '●', isCurrentAction, actorCard.id, appearance.assetId);
-      player.group = 'actor';
-      player.assetId = appearance.assetId;
-      player.image = appearance.url;
-      player.readOnly = !isCurrentAction;
-      if (paused && isCurrentAction) {
-        player.pose = { ...player.pose, ...editedStagePosition(pauseLayoutRef.current?.placements.hero,
-          { ...layout.placements.hero, ...(draft?.id === 'hero' ? draft.pose : {}) },
-          { x: simRef.current.heroX, y: simRef.current.heroY }) };
-      }
-    }
-  }
-  composedItemsRef.current = stageItems;
-  const editorItems = editorSection === 'effect' ? effectItems : editorSection === 'interface' ? [...interfaceItems, ...stageItems.filter(item=>item.id.startsWith('overlay:'))] : editorSection === 'card'
-    ? stageItems.filter(item => item.cardId === editCard?.id && item.group !== 'decoration')
-    : editorSection === 'decoration' ? decorations : [];
-  const selectedLayoutItem = editorItems.find(item => item.id === layoutSelection)?.id ??
-    editorItems.find(item => item.active)?.id ?? editorItems[0]?.id ?? '';
-  const selectEditorCard = (id: string) => {
-    setEditorSection('card');
-    setLayoutSelection('');
-    setDraft(null);
-    setEditorCard(id);
-  };
-  const selectStageElement = (id: string) => {
-    const item = stageItems.find(element => element.id === id);
-    if (id === 'hero' && !item) return;
-    if (item?.group === 'interface' || item?.group === 'effect') {
-      setEditorSection(item.group);
-      setEditTab(item.group === 'interface' ? 'interface' : 'effects');
-    } else if (item?.cardId && !(editorSection === 'interface' && item.group === 'base')) {
-      selectEditorCard(item.cardId);
-      setEditTab('arrange');
-    } else if (item?.group !== 'base' || editorSection !== 'interface') {
-      setEditorSection(item?.group === 'decoration' ? 'decoration' : 'background');
-      setEditTab('arrange');
-    }
-    setLayoutSelection(id);
-  };
-  const getOverlayStyle = (id: string | null | undefined) => {
-    if (!id) return {};
-    const item = overlayItems.find(element => element.id === id);
-    if (!item) return {};
-    const pose = item.pose;
-    const arranged = getStagePlacement(layout, id);
-    const moved = arranged.x !== undefined || arranged.y !== undefined || arranged.width !== undefined ||
-      arranged.height !== undefined || draft?.id === id;
-    const geometry = moved ? {
-      inset: 'auto', left: pose.x / WORLD_W * 100 + '%', top: pose.y / WORLD_H * 100 + '%',
-      width: pose.width / WORLD_W * 100 + '%', minHeight: pose.height / WORLD_H * 100 + '%',
-      transform: 'translate(-50%, -50%)',
-    } : {};
-    return { ...geometry, color: arranged.textColor, fontSize: arranged.fontSize, backgroundImage: arranged.assetId && getAssetVisualBinding(arranged.assetId)?.url ? `url("${getAssetVisualBinding(arranged.assetId)?.url}")` : undefined, backgroundSize: '100% 100%', backgroundColor: arranged.panelColor };
-  };
-  const narrationStyle = narrationId ? getStagePlacement(layout, narrationId) : {};
-  const dialogueStyle = dialogueId ? getStagePlacement(layout, dialogueId) : {};
-  const endingStyle = endingId ? getStagePlacement(layout, endingId) : {};
   const showStatsBar = usedStats.usesHp || usedStats.usesScore;
-  const cardName = (id: string) => {
-    const card = playableMap.get(id);
-    return card?.title || card?.note || (zh ? '卡片' : 'Card');
-  };
-  const targetName = (id: string) => stageItems.find(item => item.id === id)?.label ||
-    (id === 'background' ? (zh ? '背景' : 'Background') : id === 'hero' ? (zh ? '主角' : 'Hero') : zh ? '物件' : 'Object');
-  const timedEffects = effectEntries(layout).filter(([, item]) => item.effect?.trigger === 'run' || item.effect?.trigger === 'card');
-  const timelineEffectFrames = viewingTimeline ? timedEffects.flatMap(([id, item]) => {
-    const effect = item.effect!;
-    const asset = assetMap.get(item.assetId ?? '');
-    if (!asset || (effect.cardId && viewingTimeline.cardId !== effect.cardId)) return [];
-    if (effect.trigger === 'card' && !effect.cardId) return [];
-    const age = (effect.trigger === 'card' ? timelineTime : timelineRunTime) - effect.atMs;
-    if (age < 0 || age >= effect.durationMs) return [];
-    const hero = timelineRender.current.sample || !playing
-      ? { ...HERO_POSE, ...timelineLayout?.placements.hero }
-      : { x: simRef.current.heroX, y: simRef.current.heroY };
-    const point = effect.anchor === 'fixed' ? { x: item.x ?? 180, y: item.y ?? 125 } : { x: hero.x, y: hero.y - 22 };
-    const auditioning = effectOccurrences.some(occurrence => occurrence.preview && occurrence.placement === item &&
-      performance.now() - occurrence.at < effect.durationMs);
-    if (auditioning) return [];
-    return [<TimelineEffectFrame key={id} asset={asset} placement={item} point={point} age={age} />];
-  }) : [];
-  const timelineEntries: TimelineEntry[] = [
-    ...moments.map(moment => ({ id: moment.id, cardId: moment.cardId, atMs: moment.atMs,
-      track: moment.target + ':' + moment.field,
-      label: targetName(moment.target) + (moment.field === 'size' ? (zh ? ' · 外观大小' : ' · Size') : '') })),
-    ...timedEffects.map(([id, item]) => ({ id, cardId: item.effect!.trigger === 'card' ? item.effect!.cardId : undefined,
-      atMs: item.effect!.atMs, durationMs: item.effect!.durationMs, track: id,
-      label: (assetMap.get(item.assetId ?? '')?.name ?? (zh ? '缺少特效素材' : 'Missing effect asset')) +
-        (item.effect!.trigger === 'run' && item.effect!.cardId ? ' · ' + cardName(item.effect!.cardId!) : '') })),
-  ];
-  const timelineCards = [...new Set([...playableNodes.map(card => card.id), ...timelineEntries.flatMap(item => item.cardId ? [item.cardId] : [])])]
-    .map(id => ({ id, name: playableMap.has(id) ? cardName(id) : (zh ? '已移除的卡片' : 'Missing card') }));
-
-  const role = challengeRole(playing ? runChallengeId : previewSnapshot.challenge?.id);
-  const challengeRoleName = (actorId?: string) => actorId ? assetMap.get(actorId)?.name : undefined;
-  const clockLabel = (ms: number) => paused ? momentSecond(ms) : (Math.floor(ms / 100) / 10).toFixed(1);
-  const undoLayout = () => {
-    if (playing) {
-      setTrialHistory(prev => ({ ...(prev.undo.at(-1) ?? prev), undo: prev.undo.slice(0, -1) }));
-    } else {
-      setLayoutHistory(prev => ({ current: prev.undo.at(-1) ?? prev.current, undo: prev.undo.slice(0, -1) }));
-    }
-  };
-
-  const selectedItem = editorItems.find(item => item.id === selectedLayoutItem);
-  const placement = selectedItem && layout.placements[selectedItem.id];
-  const relatesToCard = Boolean(selectedItem?.cardId || placement?.ui?.cardId || placement?.effect?.cardId);
-  const actorRole = challengeRole(actorChallengeId);
-  const sharedActionIds = selectedItem?.group === 'actor'
-    ? actorRole.actions.filter(action => {
-      const assetId = action.promptInput?.actorAssetId ??
-        getNodeAssetIds(action).find(id => assetMap.get(id)?.categoryId === 'characters') ?? actorRole.actorId;
-      return assetId === selectedItem.assetId;
-    }).map(action => action.id)
-    : [];
-  const scopedCardId = placement?.ui?.cardId ?? placement?.effect?.cardId;
-  const backgroundOwner = editorSection === 'background' && !layout.background.assetId && !layout.background.color
-    ? cardBackgroundSource?.id : undefined;
-  const referencedCardIds = [...new Set([
-    ...sharedActionIds,
-    ...[selectedItem?.cardId, scopedCardId, backgroundOwner].filter((id): id is string => Boolean(id)),
-  ])];
-  const visibleRelationIds = referencedCardIds.filter(id => playableMap.has(id));
-  const editingPlacement = editing && editTab !== 'moments';
-  const relationKey = editingPlacement ? JSON.stringify(visibleRelationIds) : '[]';
-  useEffect(() => {
-    if (isOpen) onStageCardsChange(JSON.parse(relationKey));
-  }, [isOpen, onStageCardsChange, relationKey]);
-  const relationLabel = sharedActionIds.length > 1 ? (zh ? '共用角色' : 'Shared character')
-    : placement?.effect && scopedCardId ? (zh ? '受此卡片触发限制' : 'Trigger limited to this card')
-    : placement?.ui && scopedCardId ? (zh ? '在此卡片出现' : 'Shown on this card')
-    : selectedItem?.group === 'gameplay' ? (zh ? '来自挑战卡' : 'From challenge card')
-    : relatesToCard || backgroundOwner ? (zh ? '来自卡片' : 'From card')
-    : selectedItem?.group === 'decoration' ? (zh ? '舞台装饰' : 'Stage decoration')
-    : (zh ? '整局使用' : 'Used throughout the game');
-
-  if (!isOpen) {
-    return (
-      <aside className="relative h-full w-11 shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col items-center py-3 gap-3 z-20">
-        {isDimmed && (
-          <div
-            aria-hidden="true"
-            className="absolute inset-0 bg-[#0F172A]/24 pointer-events-none"
-          />
-        )}
-        <button
-          type="button"
-          onClick={onToggle}
-          title={t.expand}
-          aria-label={t.expand}
-          className="relative w-8 h-8 rounded-lg text-[#475569] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
-        >
-          <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
-        </button>
-        <div
-          className="relative text-[11px] font-bold tracking-wider uppercase text-[#64748B] select-none"
-          style={{ writingMode: 'vertical-rl' }}
-        >
-          {t.title}
-        </div>
-      </aside>
-    );
-  }
 
   return (
     <aside
-      style={{ width: `${width}px` }}
-      className={`relative h-full shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col min-h-0 overflow-hidden transition-shadow duration-300 max-[767px]:absolute max-[767px]:inset-0 max-[767px]:!w-full ${
+      style={{ width: fullscreen ? '100%' : `${width}px`, ...(fullscreen ? { position: 'fixed', inset: 0, zIndex: 1000 } : {}) }}
+      className={`relative h-full shrink-0 bg-white border-l border-[#E2E8F0] flex flex-col min-h-0 overflow-hidden transition-shadow duration-300 ${
         isSpotlighted ? 'z-30 ring-2 ring-inset ring-[#FBC53D]/85' : 'z-10'
       }`}
     >
@@ -3139,11 +3441,16 @@ export function RightStudioColumn({
             {t.title}
           </h2>
           <span className="text-[11px] font-medium text-[#64748B] truncate">
-            · {paused ? (zh ? '已暂停' : 'Paused') : playMode === 'playing' ? t.liveLabel : t.previewLabel}
+            · {playMode === 'playing' ? t.liveLabel : t.previewLabel}
           </span>
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {playMode === 'preview' && (
+            <button type="button" onClick={onEditScene} className="px-2 py-1.5 text-xs font-semibold rounded-lg hover:bg-[#F1F5F9] text-[#14244B]">
+              {lang === 'zh' ? '编辑场景' : 'Edit scene'}
+            </button>
+          )}
           {playMode === 'preview' ? (
             <button
               type="button"
@@ -3160,16 +3467,6 @@ export function RightStudioColumn({
             </button>
           ) : (
             <>
-              <button
-                type="button"
-                disabled={loadingBackgrounds}
-                onClick={paused ? resumeRun : pauseRun}
-                className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-sky-50 text-sky-800 border border-sky-200 text-xs font-semibold cursor-pointer"
-                title={paused ? (zh ? '继续试玩' : 'Resume play') : (zh ? '暂停并编辑' : 'Pause and edit')}
-              >
-                {paused ? <Play size={12} /> : <Pause size={12} />}
-                {paused ? (zh ? '继续试玩' : 'Resume play') : (zh ? '暂停并编辑' : 'Pause and edit')}
-              </button>
               <button
                 type="button"
                 onClick={handleStopPlay}
@@ -3190,9 +3487,14 @@ export function RightStudioColumn({
             </>
           )}
 
+          <button type="button" onClick={() => setFullscreen(value => !value)}
+            aria-label={fullscreen ? (lang === 'zh' ? '退出全屏' : 'Exit fullscreen') : (lang === 'zh' ? '全屏' : 'Fullscreen')}
+            className="w-7 h-7 rounded-lg text-[#475569] hover:bg-[#F1F5F9] flex items-center justify-center cursor-pointer shrink-0">
+            <Maximize className="w-3.5 h-3.5" aria-hidden="true" />
+          </button>
           <button
             type="button"
-            onClick={() => { setDraft(null); onToggle(); }}
+            onClick={() => { setFullscreen(false); onToggle(); }}
             title={t.collapse}
             aria-label={t.collapse}
             className="w-7 h-7 rounded-lg text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
@@ -3430,33 +3732,10 @@ export function RightStudioColumn({
 
       {/* Main Play Viewport Body */}
       <div className="flex-1 min-h-0 overflow-y-auto p-3.5 flex flex-col gap-3">
-        {cardOnStage && <div className="min-w-0 text-xs text-slate-600">
-          <p className="truncate font-semibold" title={cardName(cardOnStage.id)}>
-            {zh ? (playing ? '正在试玩 · ' : '正在预览 · ') : (playing ? 'Playing · ' : 'Previewing · ')}
-            {cardName(cardOnStage.id)}
-          </p>
-          {role.conflict ? <p role="status" className="text-amber-800">
-            {zh ? '这张挑战的动作绑定了不同角色，请到画板核对。' : 'Actions in this challenge name different characters. Check the Design Board.'}
-          </p> : challengeRoleName(role.actorId) && <p>
-            {zh ? '操控 ' : 'Play as '}{challengeRoleName(role.actorId)}
-          </p>}
-        </div>}
         {/* Live 2D Stage Canvas */}
         <div
           ref={canvasHostRef}
-          onClick={event => {
-            if (viewingTimeline) return;
-            if (playMode === 'preview' || paused) {
-              const rect = canvasRef.current?.getBoundingClientRect();
-              if (!rect) return;
-              const point = stagePoint(rect, event.clientX, event.clientY);
-              const hit = [...previewHits.current, ...decorations.filter(item => item.image), ...overlayItems].reverse().find(item => {
-                const { left, top } = stageBounds(item.pose, item.id === 'hero');
-                return point.x >= left && point.x <= left + item.pose.width && point.y >= top && point.y <= top + item.pose.height;
-              });
-              selectStageElement(hit?.id ?? 'background');
-              return;
-            }
+          onClick={(e) => {
             if (playMode === 'playing' && phase === 'overlay') {
               if (!activeOverlayPlayback || activeOverlayPlayback.mode === 'click') {
                 handleAdvanceOverlay();
@@ -3464,6 +3743,65 @@ export function RightStudioColumn({
               return;
             }
             if (playMode === 'playing' && phase === 'live') {
+              const host = canvasHostRef.current;
+              const sim = simRef.current;
+              let clickedHero = false;
+              let clickedHazard = false;
+              if (host) {
+                const rect = host.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                  const wx = ((e.clientX - rect.left) / rect.width) * WORLD_W;
+                  const wy = ((e.clientY - rect.top) / rect.height) * WORLD_H;
+                  if (Math.hypot(wx - sim.heroX, wy - (sim.heroY - 22)) < 28) {
+                    clickedHero = true;
+                  }
+                  if (
+                    sim.hazard &&
+                    !sim.hazard.resolved &&
+                    Math.hypot(wx - sim.hazard.x, wy - sim.hazard.y) <
+                      sim.hazard.radius + 16
+                  ) {
+                    clickedHazard = true;
+                  }
+                }
+              }
+
+              let recordedClick = false;
+              if (clickedHero) {
+                if (
+                  recordRuntimeEvent('is_clicked', {
+                    subjectAssetId: heroAssetIdRef.current,
+                    subjectRole: 'hero',
+                  })
+                ) {
+                  recordedClick = true;
+                }
+              }
+              if (clickedHazard) {
+                if (
+                  recordRuntimeEvent('is_clicked', {
+                    subjectAssetId: hazardAssetIdRef.current,
+                    subjectRole: 'hazard',
+                  })
+                ) {
+                  recordedClick = true;
+                }
+              }
+              if (!clickedHero && !clickedHazard) {
+                if (
+                  recordRuntimeEvent('is_clicked', {
+                    subjectAssetId: backgroundAssetIdRef.current,
+                    subjectRole: 'timer',
+                  })
+                ) {
+                  recordedClick = true;
+                }
+              }
+
+              if (recordedClick) {
+                setSimRevision((r) => r + 1);
+                if (checkReactiveTransitions()) return;
+              }
               const mouseCtrl = liveActionControls.find(
                 (c) =>
                   c.evaluation.passed &&
@@ -3475,7 +3813,7 @@ export function RightStudioColumn({
             }
           }}
           onDoubleClick={() => {
-            if (paused || playMode !== 'playing' || phase !== 'live') return;
+            if (playMode !== 'playing' || phase !== 'live') return;
             const dblCtrl = liveActionControls.find(
               (c) =>
                 c.evaluation.passed &&
@@ -3485,7 +3823,7 @@ export function RightStudioColumn({
             if (dblCtrl) performLiveAction(dblCtrl);
           }}
           onContextMenu={(e) => {
-            if (paused || playMode !== 'playing' || phase !== 'live') return;
+            if (playMode !== 'playing' || phase !== 'live') return;
             const rightCtrl = liveActionControls.find(
               (c) =>
                 c.evaluation.passed &&
@@ -3504,18 +3842,9 @@ export function RightStudioColumn({
           } ${playMode === 'playing' && (phase === 'overlay' || phase === 'live') ? 'cursor-pointer' : ''}`}
         >
           <canvas ref={canvasRef} className="w-full h-full block" />
-          {decorations.map(item => {
-            if (!item.image) return null;
-            const pose = timelineLayout ? { ...DECORATION_POSE, ...timelineLayout.placements[item.id] } : item.pose;
-            const bounds = stageBounds(pose, false);
-            return <img key={item.id} src={item.image} alt=""
-              className="pointer-events-none absolute"
-              style={{ left: (bounds.left/WORLD_W)*100+'%', top: (bounds.top/WORLD_H)*100+'%',
-                width: (pose.width/WORLD_W)*100+'%', height: (pose.height/WORLD_H)*100+'%' }} />;
-          })}
 
           {/* Clean Blank Stage Zero-State */}
-          {playableNodes.length === 0 && !layout.background.color && !backgroundBinding && decorations.length === 0 && (
+          {playableNodes.length === 0 && (
             <div className="absolute inset-0 flex flex-col items-center justify-center p-5 text-center">
               <div className="font-display text-sm font-bold text-[#14244B]">
                 {t.stageEmptyTitle}
@@ -3525,22 +3854,6 @@ export function RightStudioColumn({
               </p>
             </div>
           )}
-
-          {!playing && overlayItems.map(item => {
-            const card = playableMap.get(item.cardId ?? '');
-            if (!card) return null;
-            const style = getStagePlacement(layout, item.id);
-            const bounds = stageBounds(item.pose, false);
-            const text = card.kind === 'dialogue' ? resolveDialogueContent(card).body : card.note;
-            return <div key={item.id} data-preview-element={item.id}
-              className="pointer-events-none absolute flex items-center justify-center overflow-hidden rounded-lg px-2 text-center text-white"
-              style={{ left: bounds.left / WORLD_W * 100 + '%', top: bounds.top / WORLD_H * 100 + '%',
-                width: item.pose.width / WORLD_W * 100 + '%', height: item.pose.height / WORLD_H * 100 + '%',
-                backgroundColor: style.panelColor ?? '#0f172ae6', color: style.textColor ?? '#ffffff',
-                fontSize: style.fontSize ?? 13 }}>
-              {text}
-            </div>;
-          })}
 
           {/* Build Preview: Outcome Stat/FX Preview Tag */}
           {playMode === 'preview' && previewSnapshot.outcome && previewSnapshot.outcomeCfg && (
@@ -3571,6 +3884,13 @@ export function RightStudioColumn({
             </div>
           )}
 
+          {/* Live Play: Challenge Countdown HUD */}
+          {playMode === 'playing' && phase === 'live' && challengeTimeLeft !== null && (
+            <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-lg bg-[#0F172A]/82 backdrop-blur-xs border border-white/15 text-white font-mono text-[11px] font-bold tabular-nums shadow-md pointer-events-none">
+              {challengeTimeLeft}s
+            </div>
+          )}
+
           {/* Live Play: Outcome HUD Banner */}
           {playMode === 'playing' && hudToast && phase !== 'ended' && (
             <div className="absolute top-2.5 left-1/2 -translate-x-1/2 max-w-[92%] px-3 py-1 rounded-lg bg-[#0F172A]/85 backdrop-blur-xs border border-white/15 text-white text-[11px] font-semibold text-center shadow-md pointer-events-none truncate">
@@ -3579,17 +3899,14 @@ export function RightStudioColumn({
           )}
 
           {/* Pure In-Game Cinema Subtitle Overlay (Narration Card) */}
-          {playing && activeNarrationNode && activeNarrationNode.note.trim() && (
+          {activeNarrationNode && activeNarrationNode.note.trim() && (
             <div
-              style={getOverlayStyle(narrationId)}
-              className={`absolute inset-x-3 flex flex-col items-center gap-1.5 rounded-lg ${
+              className={`absolute inset-x-3 flex flex-col items-center gap-1.5 ${
                 activeNarrationPos === 'top' ? 'top-2.5' : 'bottom-2.5'
               }`}
             >
-              <div style={{ backgroundColor: narrationStyle.panelColor }}
-                className="w-full px-3.5 py-2 rounded-lg bg-[#090F22]/82 backdrop-blur-xs text-center border border-white/10 shadow-lg">
-                <p style={{ color: narrationStyle.textColor, fontSize: narrationStyle.fontSize }}
-                  className="text-[12.5px] leading-snug text-white font-medium tracking-wide">
+              <div className="w-full px-3.5 py-2 rounded-lg bg-[#090F22]/82 backdrop-blur-xs text-center border border-white/10 shadow-lg">
+                <p className="text-[12.5px] leading-snug text-white font-medium tracking-wide">
                   {activeNarrationNode.note}
                 </p>
               </div>
@@ -3610,10 +3927,9 @@ export function RightStudioColumn({
           )}
 
           {/* Pure In-Game Character Dialogue Box Overlay (Dialogue Card) */}
-          {playing && activeDialogueNode && activeDialogueParsed && activeDialogueParsed.body && (
-            <div style={getOverlayStyle(dialogueId)} className="absolute inset-x-2.5 bottom-2.5 rounded-xl">
-              <div style={{ backgroundColor: dialogueStyle.panelColor }}
-                className="flex items-end gap-2.5 p-2.5 rounded-xl bg-[#0F172A]/90 backdrop-blur-xs border border-[#F43F5E]/60 shadow-lg">
+          {activeDialogueNode && activeDialogueParsed && activeDialogueParsed.body && (
+            <div className="absolute inset-x-2.5 bottom-2.5">
+              <div className="flex items-end gap-2.5 p-2.5 rounded-xl bg-[#0F172A]/90 backdrop-blur-xs border border-[#F43F5E]/60 shadow-lg">
                 {activeDialoguePortraitBinding ? (
                   activeDialoguePortraitVisible ? (
                     <div className="relative w-11 h-11 rounded-lg bg-white/95 p-1 shrink-0 border border-white/20 flex items-center justify-center overflow-hidden">
@@ -3643,8 +3959,7 @@ export function RightStudioColumn({
                       {activeDialogueParsed.speaker}
                     </div>
                   )}
-                  <p style={{ color: dialogueStyle.textColor, fontSize: dialogueStyle.fontSize }}
-                    className="mt-0.5 text-[12px] leading-snug text-white font-medium">
+                  <p className="mt-0.5 text-[12px] leading-snug text-white font-medium">
                     {activeDialogueParsed.body}
                   </p>
                   {playMode === 'playing' && (
@@ -3663,30 +3978,34 @@ export function RightStudioColumn({
             </div>
           )}
 
-          {interfaceItems.filter(item=> !layout.placements[item.id].ui?.cardId || layout.placements[item.id].ui?.cardId===cardOnStage?.id).map(item=>{
-            const p=layout.placements[item.id]; const ui=p.ui!;const asset=assetMap.get(p.assetId ?? '');
-            const value=ui.usage==='score'?stats.score:stats.hp;
-            const enabled=ui.action==='start'? !playing : ui.action==='advance'? playing && !paused && phase==='overlay' : !playing || phase==='ended';
-            return <div key={item.id} style={{position:'absolute',left:item.pose.x/WORLD_W*100+'%',top:item.pose.y/WORLD_H*100+'%',width:item.pose.width/WORLD_W*100+'%',height:item.pose.height/WORLD_H*100+'%',transform:'translate(-50%,-50%)',zIndex:30,color:p.textColor,fontSize:p.fontSize,backgroundColor:p.panelColor,display:'flex',alignItems:'center',justifyContent:'center'}} onClick={event=>{event.stopPropagation();if(ui.usage==='button' && enabled){if(ui.action==='advance') handleAdvanceOverlay(); else handleStartPlay();}else if(!playing || paused)selectStageElement(item.id);}}>
-              {(ui.usage==='icon' || ui.display==='icon' || ui.usage==='button' || asset?.interfaceMode==='image') && item.image && <img src={item.image} alt="" className="absolute inset-0 w-full h-full object-contain pointer-events-none" />}
-              <span style={{position:'relative',width:'100%',textAlign:'center'}}>{ui.usage==='score'||ui.usage==='hp' ? ui.display==='bar'? <><span>{ui.text} {value}</span><progress aria-label={ui.text} max={ui.maximum} value={value} className="w-full" /></> : ui.text+' '+value : ui.usage==='icon'? '' : ui.text}</span>
-              {ui.usage==='button' && <button type="button" aria-label={ui.text} disabled={!enabled && playing && !paused} className="absolute inset-0 rounded border border-current disabled:opacity-40" />}
-            </div>;
-          })}
-          {viewingTimeline && <div role="status" className="pointer-events-none absolute left-2 top-2 z-50 rounded bg-slate-950/85 px-2 py-1 text-xs text-white">
-            {zh ? '画面预览' : 'Scene preview'} · {momentSecond(selectedTime)} {zh ? '秒' : 's'}
-            {viewingTimeline.before && (zh ? ' · 变化前' : ' · Before')}
-            {timelineRender.current.sample && (zh ? ' · 示例：假设开局进入此卡' : ' · Example: card entered at start')}
-          </div>}
-          {viewingTimeline && <div className="pointer-events-none absolute inset-0 z-40" aria-label={zh ? '定时特效画面' : 'Timed effects preview'}>{timelineEffectFrames}</div>}
-          <StageEffectLayer occurrences={effectOccurrences.filter(item =>
-            viewingTimeline ? item.preview : (item.preview || item.placement.effect?.trigger !== 'card' || item.placement.effect.cardId === visitRef.current.id))} assets={assetItems}
-            readRunTime={readEffectRunTime} readPreviewTime={readEffectPreviewTime} />
+          {/* Locked Chapter Waiting Overlay */}
+          {playMode === 'playing' &&
+            phase === 'live' &&
+            !primaryNode &&
+            pendingGroupIds.length > 0 && (
+              <div className="absolute inset-0 bg-[#0B132B]/72 backdrop-blur-[1px] flex flex-col items-center justify-center p-4 text-center gap-1.5">
+                <Lock className="w-5 h-5 text-[#FBC53D]" aria-hidden="true" />
+                <div className="text-xs font-bold text-white">
+                  {t.chapterLockedHint}
+                </div>
+                <div className="text-[11px] text-[#CBD5E1] max-w-[240px]">
+                  {pendingGroupIds
+                    .map((gId) => {
+                      const g = playableMap.get(gId);
+                      if (!g) return '';
+                      const name = g.title.trim() || g.note.trim();
+                      return g.availableWhen ? `${name} (${g.availableWhen})` : name;
+                    })
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
+              </div>
+            )}
+
           {/* Ending Overlay */}
           {playMode === 'playing' && phase === 'ended' && endSummary && (
-            <div className="absolute inset-0 bg-[#0B132B]/78 backdrop-blur-[2px] flex items-center justify-center">
-              <div style={getOverlayStyle(endingId)} className="absolute flex flex-col items-center justify-center gap-2.5 rounded-xl p-3 text-center">
-              <div style={{ color: endingStyle.textColor, fontSize: endingStyle.fontSize }}
+            <div className="absolute inset-0 bg-[#0B132B]/78 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-center gap-2.5">
+              <div
                 className={`text-xs font-bold uppercase tracking-wider ${
                   endSummary.tone === 'victory'
                     ? 'text-[#FBC53D]'
@@ -3708,15 +4027,14 @@ export function RightStudioColumn({
                       : 'Scene Complete'}
               </div>
               {endSummary.text && (
-                <p style={{ color: endingStyle.textColor, fontSize: endingStyle.fontSize }}
-                  className="text-sm font-semibold text-white leading-snug max-w-[260px]">
+                <p className="text-sm font-semibold text-white leading-snug max-w-[260px]">
                   {endSummary.text}
                 </p>
               )}
               <div className="mt-1 flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={event => { event.stopPropagation(); handleStartPlay(); }}
+                  onClick={handleStartPlay}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#FBC53D] hover:bg-[#F59E0B] text-[#14244B] text-xs font-bold transition-colors cursor-pointer"
                 >
                   <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
@@ -3724,199 +4042,209 @@ export function RightStudioColumn({
                 </button>
                 <button
                   type="button"
-                  onClick={event => { event.stopPropagation(); handleStopPlay(); }}
+                  onClick={handleStopPlay}
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold transition-colors cursor-pointer"
                 >
                   <Square className="w-3 h-3 fill-current" aria-hidden="true" />
                   <span>{t.stopBtn}</span>
                 </button>
               </div>
-              </div>
             </div>
           )}
         </div>
 
-        {playing && <div className="text-xs text-slate-600" aria-label={zh ? '试玩时间' : 'Play time'}>
-          {zh ? '本局 ' : 'Run '}{clockLabel(clock.runMs)} {zh ? '秒' : 's'}
-          {clock.cardId && <span className="block">
-            {zh ? '进入「' + cardName(clock.cardId) + '」后 ' : 'In ' + cardName(clock.cardId) + ' for '}
-            {clockLabel(clock.cardMs)} {zh ? '秒' : 's'}
-          </span>}
-        </div>}
-        {loadingBackgrounds && <p role="status" className="text-xs text-slate-600">{zh ? '正在预载背景…' : 'Loading backgrounds…'}</p>}
-        {paused && <div className="flex flex-wrap items-center gap-2 text-xs">
-          <button type="button" disabled={!dirty || loadingBackgrounds} onClick={() => openReview('save')}
-            className="rounded-lg bg-[#14244B] px-2.5 py-1.5 font-semibold text-white disabled:opacity-40">
-            {zh ? '保存到下次试玩' : 'Save for next play'}
-          </button>
-          <button type="button" onClick={handleStartPlay} className="rounded-lg border border-slate-300 px-2.5 py-1.5 font-semibold">
-            {zh ? '从头试玩已保存版本' : 'Play saved version from start'}
-          </button>
-          {savedNotice && <span role="status" className="text-emerald-700">{zh ? '已保存到下次试玩' : 'Saved for next play'}</span>}
-        </div>}
-        {editing && <div className="flex flex-wrap gap-2" aria-label={zh ? '舞台编辑' : 'Stage editor'}>
-          <button type="button" aria-pressed={editTab === 'arrange'} onClick={() => { setEditTab('arrange'); setEditorSection('card'); setLayoutSelection(''); }}
-            className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs aria-pressed:bg-sky-100">
-            {zh ? '布置' : 'Arrange'}
-          </button>
-          <button type="button" onClick={()=>{setEditTab('interface');setEditorSection('interface');setLayoutSelection('');}} className="rounded-lg border px-2.5 py-1.5 text-xs">{zh ? '游戏界面' : 'Game interface'}</button>
-          <button type="button" aria-pressed={editTab === 'effects'} onClick={()=>{setEditTab('effects');setEditorSection('effect');setLayoutSelection('');}} className="rounded-lg border px-2.5 py-1.5 text-xs">{zh ? '特效' : 'Effects'}</button>
-          <button type="button" aria-pressed={editTab === 'moments'} onClick={() => setEditTab('moments')}
-            className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs aria-pressed:bg-sky-100">
-            {zh ? '变化' : 'Changes'}{timelineEntries.length > 0 && ' (' + timelineEntries.length + ')'}
-          </button>
-        </div>}
-        {timelineActive && <StageTimeline lang={lang} entries={timelineEntries} cards={timelineCards}
-          cursor={viewingTimeline} onCursor={setTimelineCursor} onInspect={setTimelineDetail}
-          paused={paused ? { cardId: clock.cardId, atMs: clock.cardMs, runMs: clock.runMs } : undefined}
-          onPlayEffect={id => {
-            const item = layout.placements[id];
-            if (item?.effect) fireEffectsRef.current([[id, item]], { x: simRef.current.heroX, y: simRef.current.heroY - 22 }, true);
-          }}
-          onRestart={handleStartPlay} canPlay={canPlay && !loadingBackgrounds} />}
-        {editing && editTab === 'moments' && <StageEffectTimeline lang={lang} layout={layout} onlyId={timelineDetail} cards={playableNodes} onUpdate={updatePlacement} onSelect={selectStageElement} onRemove={id => commitLayout(current => { const placements={...current.placements}; delete placements[id]; return {...current,placements}; })} />}
-        {editing && editTab === 'moments' && <StageMomentList lang={lang} moments={moments} onlyId={timelineDetail}
-          opening={layoutHistory.current} assets={assetItems} cardName={cardName} targetName={targetName}
-          cardBackground={cardBackgroundBinding?.url} targetImage={id => stageItems.find(item => item.id === id)?.image}
-          missingCard={id => !playableMap.has(id)} failedBackgrounds={failedBackgrounds}
-          getImage={id => getAssetVisualBinding(id)?.url}
-          onUpdate={moment => setMoments(prev => upsertMoment(prev, moment))}
-          onDelete={id => setMoments(prev => prev.filter(moment => moment.id !== id))}
-          onRestart={handleStartPlay} canPlay={canPlay && !loadingBackgrounds}
-        />}
-        {editingPlacement && (selectedItem || editorSection === 'background') && <section
-          aria-label={zh ? '画板关联' : 'Design Board links'} className="grid gap-2 rounded-xl border border-teal-200 bg-teal-50 p-3 text-xs">
-          <p className="break-words"><strong>{selectedItem?.label ?? (zh ? '背景' : 'Background')}</strong> · {relationLabel}</p>
-          {referencedCardIds.map(id => playableMap.has(id)
-            ? <button key={id} type="button" onClick={() => onLocateCard(id)}
-                className="justify-self-start rounded border border-teal-300 bg-white px-2 py-1 text-left text-teal-900">
-                {zh ? '查看卡片' : 'View card'} · {cardName(id)}
-              </button>
-            : <span key={id} className="text-amber-800">{zh ? '关联卡片已移除' : 'Linked card was removed'}</span>)}
-        </section>}
-        {editing && (editTab === 'arrange' || editTab === 'interface' || editTab === 'effects') && <StagePlacementEditor lang={lang} items={stageItems} editorItems={editorItems}
-          selection={selectedLayoutItem} onSelect={selectStageElement} layout={layout}
-          section={editorSection} onSection={section => { setEditorSection(section); setLayoutSelection(''); }}
-          cards={playableNodes} cardId={editCard?.id} onSelectCard={selectEditorCard}
-          backgroundSource={!layout.background.assetId && !layout.background.color && cardBackgroundSource
-            ? cardName(cardBackgroundSource.id) : undefined}
-          isOffstage={playing && Boolean(editCard && editCard.id !== cardOnStage?.id)}
-          backgroundImage={backgroundBinding && !isHiddenByEffect(backgroundBinding.effects) ? {
-            url: backgroundBinding.url,
-            filter: buildCssFilterString(backgroundBinding.effects) || undefined,
-            opacity: getStaticOpacity(backgroundBinding.effects),
-          } : undefined}
-          assets={assetItems.filter(asset => Boolean(getAssetVisualBinding(asset.id)))}
-          canUndo={(playing ? trialHistory.undo : layoutHistory.undo).length > 0}
-          onUndo={undoLayout}
-          onOpenAsset={onOpenAsset}
-          cardName={cardName} backgroundName={assetMap.get(backgroundBinding?.assetId ?? '')?.name}
-          onUpdate={updatePlacement} onPreview={(id, pose) => setDraft(pose ? { id, pose } : null)}
-          onBackground={background => {
-            if (playing) recordMoment('background', { field: 'background', value: background });
-            else commitLayout(current => ({ ...current, background }));
-          }}
-          onPreviewEffect={id => {
-            const placement = layout.placements[id];
-            if (placement?.effect) fireEffectsRef.current([[id, placement]], { x: simRef.current.heroX, y: simRef.current.heroY - 22 }, true);
-          }}
-          onAddEffect={assetId => {
-            const id = 'effect:' + crypto.randomUUID();
-            commitLayout(current => ({...current, placements:{...current.placements,[id]:{assetId,x:180,y:125,width:64,height:64,effect:{...DEFAULT_STAGE_EFFECT}}}}));
-            setEditorSection('effect'); setLayoutSelection(id);
-          }}
-          onAddInterface={assetId => {
-            const id = 'interface:' + crypto.randomUUID();
-            const asset = assetMap.get(assetId);
-            commitLayout(current=>({...current,placements:{...current.placements,[id]:{assetId,x:180,y:30,width:100,height:30,ui:{usage:'text',text:asset?.typography?.text ?? asset?.name ?? '',display:'number',maximum:100,action:'start'},fontSize:asset?.typography?.fontSize ?? 16,textColor:asset?.typography?.textColor ?? '#ffffff'}}}));
-            setEditorSection('interface');setLayoutSelection(id);
-          }}
-          onAddDecoration={assetId => {
-            const id = 'decoration:' + crypto.getRandomValues(new Uint32Array(2)).join('-');
-            commitLayout(current => ({
-              ...current, decorations: [...current.decorations, id],
-              placements: { ...current.placements, [id]: { assetId } },
-            }));
-            setLayoutSelection(id);
-          }}
-          onRemove={id => {
-            commitLayout(current => {
-              const placements = { ...current.placements };
-              delete placements[id];
-              return { ...current, placements, decorations: current.decorations.filter(item => item !== id) };
-            });
-            setLayoutSelection('');
-          }}
-        />}
+        {/* Unlocked Chapters & Parallel Mechanisms Switcher */}
+        {playMode === 'playing' &&
+          (unlockedGroupIds.length > 0 ||
+            pendingGroupIds.length > 0 ||
+            activeNodes.length > 1) && (
+            <div className="px-3 py-2 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2">
+              {(unlockedGroupIds.length > 0 || pendingGroupIds.length > 0) && (
+                <div className="space-y-1">
+                  <div className="text-[10.5px] font-bold uppercase tracking-wider text-[#64748B] flex items-center justify-between">
+                    <span>{t.chaptersLabel}</span>
+                    <span className="font-mono tabular-nums font-normal">
+                      {unlockedGroupIds.length}
+                      {pendingGroupIds.length > 0
+                        ? ` / ${unlockedGroupIds.length + pendingGroupIds.length}`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {unlockedGroupIds.map((gId) => {
+                      const grp = playableMap.get(gId);
+                      if (!grp) return null;
+                      const isFocused = focusedGroupId === gId;
+                      const isCoreDone = completedGroupIds.includes(gId);
+                      return (
+                        <button
+                          key={gId}
+                          type="button"
+                          onClick={() => handleFocusChapter(gId)}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                            isFocused
+                              ? 'bg-[#14244B] border-[#14244B] text-white'
+                              : 'bg-white border-[#CBD5E1] text-[#14244B] hover:border-[#14244B]'
+                          }`}
+                        >
+                          <Layers className="w-3 h-3 shrink-0" aria-hidden="true" />
+                          <span className="font-mono text-[10px] font-bold opacity-75 shrink-0">
+                            {resolveGroupCode(grp, nodes)}
+                          </span>
+                          <span className="truncate max-w-[130px]">
+                            {grp.title.trim() || grp.note.trim() || COPY[lang].studio.board.groupUntitled}
+                          </span>
+                          {isCoreDone && (
+                            <Check
+                              className={`w-3 h-3 shrink-0 ${isFocused ? 'text-[#FBC53D]' : 'text-[#059669]'}`}
+                              aria-hidden="true"
+                            />
+                          )}
+                        </button>
+                      );
+                    })}
+                    {pendingGroupIds.map((gId) => {
+                      const grp = playableMap.get(gId);
+                      if (!grp) return null;
+                      return (
+                        <div
+                          key={gId}
+                          title={grp.availableWhen || t.chapterLockedHint}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-[#E2E8F0] bg-[#F1F5F9] text-[#64748B] text-[11px] font-medium whitespace-nowrap"
+                        >
+                          <Lock className="w-3 h-3 shrink-0" aria-hidden="true" />
+                          <span className="font-mono text-[10px] font-bold opacity-75 shrink-0">
+                            {resolveGroupCode(grp, nodes)}
+                          </span>
+                          <span className="truncate max-w-[110px]">
+                            {grp.title.trim() || grp.note.trim() || COPY[lang].studio.board.groupUntitled}
+                          </span>
+                          {grp.availableWhen && (
+                            <span className="text-[10px] text-[#94A3B8] truncate max-w-[90px]">
+                              · {grp.availableWhen}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
-        {review && <dialog ref={reviewDialogRef} aria-labelledby="stage-save-title"
-          onCancel={event => { event.preventDefault(); setReview(null); }}
-          className="m-auto max-h-[85vh] w-[min(90vw,380px)] overflow-auto rounded-xl bg-white p-4 text-sm shadow-xl backdrop:bg-slate-950/40">
-            <h3 id="stage-save-title" className="font-bold">{zh ? '确认本局改动' : 'Review this run’s changes'}</h3>
-            <p className="mt-1 text-xs text-slate-600">{zh ? '勾选要用于下一局的改动。' : 'Choose the changes to keep for the next run.'}</p>
-            <div className="my-3 space-y-2">
-              {pendingEdits.map(edit => {
-                const timing = timings[edit.id] ?? 'run';
-                const seconds = momentSecond(timing === 'card' ? edit.clock.cardMs : edit.clock.runMs);
-                return <div key={edit.id} className="space-y-1.5 rounded-lg bg-slate-50 p-2 text-xs">
-                  <label className="flex items-center gap-2 font-semibold">
-                    <input type="checkbox" checked={checkedChanges.includes(edit.id)} onChange={event => {
-                      setCheckedChanges(prev => event.target.checked ? [...prev, edit.id] : prev.filter(id => id !== edit.id));
-                    }} />
-                    {targetName(edit.target)}{edit.field === 'size' && (zh ? ' · 外观大小' : ' · Appearance size')}
-                  </label>
-                  <label className="grid gap-1">
-                    {zh ? '何时变化' : 'When to change'}
-                    <select value={timing} onChange={event => {
-                      const value = event.currentTarget.value as MomentTiming;
-                      setTimings(prev => ({ ...prev, [edit.id]: value }));
-                    }} className="min-w-0 rounded border border-slate-300 bg-white p-1.5">
-                      <option value="run">{zh ? '本局第 ' + momentSecond(edit.clock.runMs) + ' 秒' : momentSecond(edit.clock.runMs) + ' s from start'}</option>
-                      {edit.clock.cardId && <option value="card">{zh ? '进入「' + cardName(edit.clock.cardId) + '」后 ' + momentSecond(edit.clock.cardMs) + ' 秒'
-                        : momentSecond(edit.clock.cardMs) + ' s after entering ' + cardName(edit.clock.cardId)}</option>}
-                      <option value="opening">{zh ? '从开局起使用' : 'Use as opening layout'}</option>
-                    </select>
-                  </label>
-                  {timing !== 'opening' && <p className="text-slate-600">{zh ? seconds + ' 秒时立即切换' : 'Switch at ' + seconds + ' s'}</p>}
-                </div>;
-              })}
-              {changes.map(change => {
-                const key = changeKey(change);
-                const names = {
-                  position: zh ? '下局位置' : 'Next-run position', size: zh ? '外观大小' : 'Appearance size',
-                  style: zh ? '界面样式' : 'Overlay style', assetId: zh ? '造型' : 'Appearance',
-                  background: zh ? '背景' : 'Background', add: zh ? '新增装饰' : 'New decoration',
-                  effect: zh ? '特效设置' : 'Effect settings', remove: zh ? '移除装饰' : 'Remove decoration', ui: zh ? '游戏界面设置' : 'Game interface settings',
-                };
-                const name = stageItems.find(item => item.id === change.id)?.label
-                  ?? assetMap.get(layoutHistory.current.placements[change.id]?.assetId ?? '')?.name;
-                const pose = layout.placements[change.id];
-                return <label key={key} className="flex items-start gap-2 text-xs">
-                  <input type="checkbox" checked={checkedChanges.includes(key)} onChange={event => {
-                    setCheckedChanges(prev => event.target.checked ? [...prev, key] : prev.filter(value => value !== key));
-                  }} />
-                  <span>{name ? name + ' · ' : ''}{change.id === 'hero' && change.field === 'position'
-                    ? (zh ? '下局起点' : 'Next-run starting point') : names[change.field]}
-                    {change.field === 'position' && pose && ' (' + (pose.x ?? '–') + ', ' + (pose.y ?? '–') + ')'}
-                    {change.field === 'size' && pose && ' ' + (pose.width ?? '–') + ' × ' + (pose.height ?? '–')}
-                  </span>
-                </label>;
+              {(() => {
+                const scopedActive = focusedGroupId
+                  ? activeNodes.filter(
+                      (n) =>
+                        n.parentId === focusedGroupId ||
+                        isDescendantOf(n.id, focusedGroupId, nodeMap),
+                    )
+                  : activeNodes;
+                const scopedDoneIds = focusedGroupId
+                  ? completedNodeIds.filter((id) => {
+                      const dn = playableMap.get(id);
+                      return Boolean(
+                        dn &&
+                          dn.kind !== 'group' &&
+                          (dn.parentId === focusedGroupId ||
+                            isDescendantOf(dn.id, focusedGroupId, nodeMap)),
+                      );
+                    })
+                  : [];
+                if (scopedActive.length === 0 && scopedDoneIds.length === 0) {
+                  return unlockedGroupIds.length > 0 ? (
+                    <div className="text-[11px] text-[#64748B]">{t.noActiveMechInGroup}</div>
+                  ) : null;
+                }
+                return (
+                  <div className="space-y-1">
+                    <div className="text-[10.5px] font-bold uppercase tracking-wider text-[#64748B] flex items-center justify-between">
+                      <span>{t.mechanismsLabel}</span>
+                      <span className="font-mono tabular-nums font-normal">
+                        {scopedActive.length} {t.mechanismReady}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {scopedActive.map((mNode) => {
+                        const isFocused = primaryNode?.id === mNode.id;
+                        const label =
+                          mNode.note.trim() ||
+                          mNode.title.trim() ||
+                          COPY[lang].studio.board[
+                            mNode.kind === 'challenge'
+                              ? 'patternLabel'
+                              : mNode.kind === 'dialogue'
+                                ? 'speakerLabel'
+                                : 'title'
+                          ];
+                        return (
+                          <button
+                            key={mNode.id}
+                            type="button"
+                            onClick={() => handleFocusActiveNode(mNode.id)}
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                              isFocused
+                                ? 'bg-[#EFF6FF] border-[#2563EB] text-[#1D4ED8]'
+                                : 'bg-white border-[#CBD5E1] text-[#334155] hover:border-[#2563EB]'
+                            }`}
+                          >
+                            <span className="truncate max-w-[155px]">{label}</span>
+                          </button>
+                        );
+                      })}
+                      {scopedDoneIds.slice(-3).map((dId) => {
+                        const dn = playableMap.get(dId);
+                        if (!dn || dn.kind === 'outcome') return null;
+                        return (
+                          <span
+                            key={`done-${dId}`}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] text-[#94A3B8] text-[10.5px] font-medium whitespace-nowrap"
+                          >
+                            <Check className="w-2.5 h-2.5 text-[#10B981] shrink-0" aria-hidden="true" />
+                            <span className="truncate max-w-[110px]">
+                              {dn.note.trim() || dn.title.trim()}
+                            </span>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+        {/* Simulated Special Events (◇) Switchboard */}
+        {simulatedEventList.length > 0 && (
+          <div className="px-3 py-2 rounded-xl bg-[#FFFBEB] border border-[#FDE68A] space-y-1.5">
+            <div className="text-[10.5px] font-bold uppercase tracking-wider text-[#B45309]">
+              {t.simEventsBar}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {simulatedEventList.map((evt) => {
+                const active = Boolean(simulatedEvents[evt.key]);
+                return (
+                  <button
+                    key={evt.key}
+                    type="button"
+                    onClick={() =>
+                      setSimulatedEvents((prev) => ({ ...prev, [evt.key]: !prev[evt.key] }))
+                    }
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-[#ECFDF5] border-[#10B981] text-[#047857]'
+                        : 'bg-white border-[#FCD34D] text-[#92400E] hover:border-[#D97706]'
+                    }`}
+                  >
+                    <span>◇ {evt.label}</span>
+                    <span className="font-mono text-[10px]">
+                      · {active ? t.simTriggered : t.simIdle}
+                    </span>
+                  </button>
+                );
               })}
             </div>
-            <div className="flex flex-wrap gap-2 text-xs">
-              <button type="button" disabled={checkedChanges.length === 0} onClick={confirmReview}
-                className="rounded-lg bg-[#14244B] px-2.5 py-1.5 font-semibold text-white disabled:opacity-40">
-                {review === 'restart' ? (zh ? '保存并重开' : 'Save and restart')
-                  : review === 'stop' ? (zh ? '保存并停止' : 'Save and stop') : (zh ? '确认保存' : 'Confirm save')}
-              </button>
-              {review !== 'save' && <button type="button"
-                onClick={() => review === 'restart' ? startFromLayout(layoutHistory.current) : stopRun()}
-                className="rounded-lg border border-slate-300 px-2.5 py-1.5 font-semibold">
-                {review === 'restart' ? (zh ? '舍弃并重开' : 'Discard and restart') : (zh ? '舍弃并停止' : 'Discard and stop')}
-              </button>}
-              <button type="button" autoFocus onClick={() => setReview(null)} className="rounded-lg border border-slate-300 px-2.5 py-1.5">{zh ? '返回' : 'Back'}</button>
-            </div>
-        </dialog>}
+          </div>
+        )}
 
         {/* Custom Text-Condition Switchboard */}
         {customFlagNames.length > 0 && (
@@ -4021,6 +4349,11 @@ export function RightStudioColumn({
                         <div className="min-w-0">
                           <div className="text-xs font-bold truncate">
                             {ctrl.target.note || ctrl.mechanic}
+                            {ctrl.ownerLabel && (
+                              <span className="ml-1.5 font-normal text-[10.5px] text-[#64748B]">
+                                · {ctrl.ownerLabel}
+                              </span>
+                            )}
                           </div>
                           {ctrl.evaluation.hasCondition && (
                             <div

@@ -23,7 +23,7 @@ interface CardPromptFrontProps {
   autoFocus?: boolean;
   onUpdateNode: (
     id: string,
-    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput' | 'challengeAssetId'>>,
+    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
   ) => void;
   onUpdateNodeField: <K extends keyof CardFieldConfig>(
     id: string,
@@ -678,7 +678,6 @@ export function CardPromptFront({
                     obstacle: asset.name,
                     obstacleAssetId: asset.id,
                   },
-                  challengeAssetId: asset.id,
                   assetIds: swapSlotAsset(prompt.obstacleAssetId, asset.id),
                 });
               }}
