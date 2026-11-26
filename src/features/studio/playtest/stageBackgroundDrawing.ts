@@ -1,5 +1,5 @@
 import type { AssetItem } from '../asset-library/assetLibraryModel';
-import { buildCssFilterString, getStaticOpacity, isHiddenByEffect } from '../asset-library/effects/visualEffectsModel';
+import { buildCssFilterString, evaluateDynamicEffects, getOutcomeVisualEffects, getStaticOpacity, isHiddenByEffect, type RunningVisual } from '../asset-library/effects/visualEffectsModel';
 import { backgroundImageExtent, backgroundImagePlacement, backgroundSegments, getBackgroundImage, type BackgroundImageDraft, type BackgroundSegment } from './stageBackground';
 import { VIEW_HEIGHT, VIEW_WIDTH, type Scene } from './stageProject';
 
@@ -20,6 +20,7 @@ export function drawSceneBackground(
   ctx: CanvasRenderingContext2D, scene: Scene, pan: number, zoom: number,
   assets: AssetItem[], images: Map<string, HTMLImageElement>,
   draft?: BackgroundImageDraft,
+  visuals?: Record<string, RunningVisual>, time = 0,
 ) {
   const background = scene.background;
   if (!background || background.mode === 'inherit') return;
@@ -41,15 +42,24 @@ export function drawSceneBackground(
     const asset = assets.find(item => item.id === segment.assetId && item.categoryId === 'backgrounds');
     const slot = asset && getBackgroundImage(asset);
     const image = loadStageImage(slot?.mediaUrl, images);
-    if (!image || isHiddenByEffect(slot?.visualEffects)) return;
+    const visual = visuals?.[segment.assetId];
+    const effects = getOutcomeVisualEffects(slot?.visualEffects, visual, time);
+    if (!image || isHiddenByEffect(effects)) return;
     const box = draft?.sceneId === scene.id && draft.segmentId === segment.id && draft.assetId === segment.assetId
       ? draft.image : backgroundImagePlacement(segment, start, end, height, image.naturalWidth, image.naturalHeight);
     target.save();
     target.beginPath();
     target.rect(clipStart, 0, clipEnd - clipStart, visibleHeight);
     target.clip();
-    target.globalAlpha = getStaticOpacity(slot?.visualEffects);
-    target.filter = buildCssFilterString(slot?.visualEffects) || 'none';
+    target.globalAlpha = getStaticOpacity(effects);
+    target.filter = buildCssFilterString(effects) || 'none';
+    if (visual && effects !== slot?.visualEffects) {
+      const frame = evaluateDynamicEffects([visual.effect], Math.min(time - visual.start, visual.duration), false);
+      target.globalAlpha *= frame.opacityMul;
+      target.translate(box.x + box.width / 2 + frame.offsetX, box.y + box.height / 2 + frame.offsetY);
+      target.scale(frame.scale, frame.scale);
+      target.translate(-box.x - box.width / 2, -box.y - box.height / 2);
+    }
     target.drawImage(image, box.x, box.y, box.width, box.height);
     target.restore();
   };

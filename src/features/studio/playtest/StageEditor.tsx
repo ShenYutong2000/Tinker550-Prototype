@@ -1,20 +1,26 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
-import { Image as ImageIcon, Maximize, Minimize, PanelRightClose, PanelRightOpen, Plus, Settings2 } from 'lucide-react';
-import type { Language } from '../../../shared/i18n';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type PointerEvent } from 'react';
+import { Image as ImageIcon, Lock, Maximize, Minimize, PanelRightClose, PanelRightOpen, Play, Plus, RotateCcw, Settings2, Square } from 'lucide-react';
+import { COPY, type Language } from '../../../shared/i18n';
 import type { AssetItem } from '../asset-library/assetLibraryModel';
-import { bakeStaticEffectsToCanvas, drawSpriteWithEffects, getStaticEffectsFingerprint, isHiddenByEffect } from '../asset-library/effects/visualEffectsModel';
-import type { BoardEdge, BoardNode } from '../design-board/studioModel';
+import { bakeStaticEffectsToCanvas, drawSpriteWithEffects, getOutcomeVisualEffects, getStaticEffectsFingerprint, isHiddenByEffect } from '../asset-library/effects/visualEffectsModel';
+import { getAncestorGroupIds, getDescendantNodeIds, getNodeAssetIds, isDescendantOf } from '../design-board/studioModel';
+import type { BoardComboFrame, BoardEdge, BoardNode, SpotlightStage } from '../design-board/studioModel';
 import { extractSimulatedEventsFromEdges, formatEventClauseSummary, formatPropertyClauseSummary } from '../design-board/arrowConditionModel';
-import type { ScopedStateVariable } from '../properties/stateModel';
-import { resolveDialogueContent, resolvePlaybackSettings, resolveSubtitlePosition } from './boardPlayEngine';
+import { coerceVariableValue, type ScopedStateVariable, type StateVariableValue } from '../properties/stateModel';
+import { detectUsedStats, extractCustomFlagConditions, getPlayableNodes, resolvePlaybackSettings, resolveSubtitlePosition } from './boardPlayEngine';
 import { drawChallengeEntity, drawStageBackdrop } from './cardPreviewDrawing';
 import { cardPreviewBehavior, cardPreviewTimeLimit, challengeMotion, challengeSpeed } from './cardPreviewMotion';
-import { activateStageEvent, advanceOverlay, beginSceneRules, calculateStageReward, clickStageObject, isActive, restoreSceneCheckpoint, sceneCamera, setStageEntityHidden, stageEditPose, startScene, stepScene, syncRunScenes, type StageEntity, type StageRun } from './sceneRuntime';
+import { activateStageEvent, advanceOverlay, beginSceneRules, calculateStageReward, clickStageObject, focusStageChapter, isActive, restoreSceneCheckpoint, sceneCamera, setStageEntityHidden, stageEditPose, startScene, stepScene, syncRunScenes, syncStageRules, type StageEntity, type StageRun } from './sceneRuntime';
 import { anchoredPosition, colliderBox, COLLIDER_SIDES, copyPlacements, createLibraryPlacement, createScene, exposedParameters, makeId, patchScenePlacement, placementBox, projectBoardScenes, RESIZE_CORNERS, resizeCollider, resizePlacement, retainChallengeAnchors, rotatePlacement, rotateStagePoint, VIEW_HEIGHT, VIEW_WIDTH, type ColliderSide, type Placement, type Point, type ResizeCorner, type Scene, type StageKind } from './stageProject';
 import { StageBackgroundSettings, type BackgroundTool } from './StageBackgroundSettings';
 import { StageBackgroundTrack } from './StageBackgroundTrack';
-import { backgroundBoundaries, backgroundImageExtent, backgroundImagePlacement, backgroundRangeAt, backgroundSegments, DEFAULT_SCENE_BACKGROUND, dragBackgroundBoundary, getBackgroundImage, resizeBackgroundImage, type BackgroundBoundary, type BackgroundImageDraft, type BackgroundImagePlacement, type BackgroundSegment, type SceneBackground } from './stageBackground';
+import { backgroundBoundaries, backgroundImageExtent, backgroundImagePlacement, backgroundRangeForDrop, backgroundRangeInView, backgroundSegments, DEFAULT_SCENE_BACKGROUND, dragBackgroundBoundary, getBackgroundImage, insertBackgroundSegment, moveBackgroundSegment, resizeBackgroundImage, type BackgroundBoundary, type BackgroundImageDraft, type BackgroundImagePlacement, type BackgroundSegment, type SceneBackground } from './stageBackground';
 import { drawSceneBackground, loadStageImage } from './stageBackgroundDrawing';
+import { StageActionControls } from './StageActionControls';
+import { StagePlayProperties } from './StagePlayProperties';
+import { StagePlaySwitches } from './StagePlaySwitches';
+import { StageCutscene } from './StageCutscene';
+import { StagePlayChapters } from './StagePlayChapters';
 import './stageEditor.css';
 
 export interface StageEditorProps {
@@ -23,6 +29,13 @@ export interface StageEditorProps {
   width: number;
   nodes: BoardNode[];
   edges: BoardEdge[];
+  comboFrames: BoardComboFrame[];
+  sceneDrafts: Scene[];
+  onScenesChange: Dispatch<SetStateAction<Scene[]>>;
+  onPlayVariables: Dispatch<SetStateAction<Record<string, StateVariableValue>>>;
+  onUpdatePlayValue: (variableId: string, value: StateVariableValue) => void;
+  playValueEdit?: { variableId?: string; value?: StateVariableValue };
+  spotlightStage: SpotlightStage;
   assets: AssetItem[];
   variables: ScopedStateVariable[];
   selectedNodeId: string | null;
@@ -33,7 +46,7 @@ export interface StageEditorProps {
   assetPick: 'picking' | { assetId: string } | null;
   onAssetPickChange: (pick: 'picking' | { assetId: string } | null) => void;
   onOpenLibrary: () => void;
-  onActive: (nodes: string[], edge: string | null) => void;
+  onActive: (nodes: string[], edge: string | null, edges?: string[]) => void;
   onPlay: () => void;
 }
 
@@ -79,14 +92,17 @@ function stageHandles(item: Placement, scale: number, showCollider: boolean): St
 
 export function StageEditor(props: StageEditorProps) {
   const zh = props.lang === 'zh';
+  const t = COPY[props.lang].studio.play;
   const l = (en: string, cn: string) => zh ? cn : en;
-  const [sceneDrafts, setScenes] = useState(() => [createScene(l('Level 1', '第一关'), l('Player spawn', '玩家出生点'))]);
+  const { sceneDrafts, onScenesChange: setScenes } = props;
   const scenes = useMemo(() => projectBoardScenes(sceneDrafts, props.nodes, props.assets), [sceneDrafts, props.nodes, props.assets]);
   const previousScenes = useRef(scenes);
   const [sceneId, setSceneId] = useState(sceneDrafts[0].id);
   const [mode, setMode] = useState<Mode>('edit');
+  const [playFlags, setPlayFlags] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [inspectedId, setInspectedId] = useState<string>();
+  const [inspectedEdgeId, setInspectedEdgeId] = useState<string>();
   const [assetMenu, setAssetMenu] = useState(false);
   const [editPanel, setEditPanel] = useState<'background' | 'settings' | null>(null);
   const [segmentId, setSegmentId] = useState<string>();
@@ -100,7 +116,7 @@ export function StageEditor(props: StageEditorProps) {
   const [grid, setGrid] = useState(false);
   const [bounds, setBounds] = useState(true);
   const [full, setFull] = useState(false);
-  const [pan, setPan] = useState(0);
+  const [requestedPan, setPan] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [notice, setNotice] = useState('');
   const [, redraw] = useState(0);
@@ -115,20 +131,27 @@ export function StageEditor(props: StageEditorProps) {
   const fullButton = useRef<HTMLButtonElement>(null);
   const native = useRef(false);
   const run = useRef<StageRun | undefined>(undefined);
+  const playEntryId = useRef<string | undefined>(undefined);
   const checkpoint = useRef<StageRun | undefined>(undefined);
   const keys = useRef(new Set<string>());
   const pressed = useRef(new Set<string>());
-  const drags = useRef<{ pin: number; x: number; y: number; item?: Placement; handle?: StageHandle; backgroundTap?: { id: string; y: number } } | undefined>(undefined);
+  const released = useRef(new Set<string>());
+  const drags = useRef<{ pin: number; x: number; y: number; item?: Placement; handle?: StageHandle } | undefined>(undefined);
   const mapDrag = useRef<{ pointerId: number; offset: number } | undefined>(undefined);
   const frameDrag = useRef<{ pointerId: number; origin: Point; image: BackgroundImagePlacement; corner?: ResizeCorner } | undefined>(undefined);
+  const sectionDrag = useRef<{ pointerId: number; id: string; offset: number; clientX: number; original: BackgroundSegment[]; moved: boolean } | undefined>(undefined);
   const detailPan = useRef(0);
   const trial = useRef(new Map<string, Partial<Placement>>());
   const images = useRef(new Map<string, HTMLImageElement>());
   const bakedSprites = useRef(new WeakMap<HTMLImageElement, Map<string, ReturnType<typeof bakeStaticEffectsToCanvas>>>());
   const audio = useRef<HTMLAudioElement | null>(null);
-  const graph = { scenes, nodes: props.nodes, edges: props.edges };
+  const graph = { scenes, nodes: props.nodes, edges: props.edges, comboFrames: props.comboFrames };
   const scene = scenes.find(item => item.id === sceneId) ?? scenes[0];
+  const pan = Math.max(0, Math.min(requestedPan, maxPan(scene, zoom)));
   const playScene = scenes.find(item => item.id === run.current?.sceneId) ?? scene;
+  const playableNodes = useMemo(() => getPlayableNodes(props.nodes), [props.nodes]);
+  const emptyPreview = !playableNodes.length && playScene.placements.every(isHelper)
+    && (!playScene.background || playScene.background.mode === 'inherit');
   const sceneDraft = sceneDrafts.find(item => item.id === scene.id)!;
   const background = scene.background ?? DEFAULT_SCENE_BACKGROUND;
   const hasBackgroundSections = background.mode === 'segments' || background.mode === 'tile';
@@ -145,8 +168,27 @@ export function StageEditor(props: StageEditorProps) {
   const visibleMapWidth = Math.min(scene.width, VIEW_WIDTH / zoom);
   const wholeMapVisible = scene.width - visibleMapWidth < .01;
   const { assetPick, onAssetPickChange } = props;
-  const controls = useRef({ graph, scene, props, mode, pan, zoom, selectedId, inspectedId, bounds, grid, zh, backgroundDraft });
-  controls.current = { graph, scene, props, mode, pan, zoom, selectedId, inspectedId, bounds, grid, zh, backgroundDraft };
+  const backgroundSelection = editPanel === 'background' && !pendingBackgroundAsset ? selectedSegment : undefined;
+  const controls = useRef({ graph, scene, props, mode, pan, zoom, selectedId, inspectedId, bounds, grid, zh, backgroundDraft, backgroundSelection, emptyPreview });
+  controls.current = { graph, scene, props, mode, pan, zoom, selectedId, inspectedId, bounds, grid, zh, backgroundDraft, backgroundSelection, emptyPreview };
+  useLayoutEffect(() => {
+    if (run.current) syncStageRules(run.current, controls.current.graph);
+  }, [props.nodes, props.edges]);
+
+  const lastPlayValueEdit = useRef(props.playValueEdit);
+  useLayoutEffect(() => {
+    const edit = props.playValueEdit !== lastPlayValueEdit.current ? props.playValueEdit : undefined;
+    lastPlayValueEdit.current = props.playValueEdit;
+    const active = run.current;
+    if (!active) return;
+    const previous = new Map(active.variables.map(entry => [entry.variable.id, entry.playValue]));
+    active.variables = props.variables.map(entry => {
+      const useEdit = edit && (!edit.variableId || edit.variableId === entry.variable.id);
+      const value = useEdit ? edit.value ?? entry.variable.initialValue : previous.get(entry.variable.id) ?? entry.variable.initialValue;
+      return { ...entry, playValue: coerceVariableValue(entry.variable, value) };
+    });
+    if (edit) redraw(value => value + 1);
+  }, [props.playValueEdit, props.variables]);
 
   const updateScene = (change: Partial<Scene>) => setScenes(current => current.map(item => item.id === scene.id ? { ...item, ...change } : item));
   const updateBackgroundSections = (change: (items: BackgroundSegment[]) => BackgroundSegment[]) => {
@@ -214,14 +256,13 @@ export function StageEditor(props: StageEditorProps) {
       setPan(Math.max(0, Math.min(maxPan(scene, zoom), x - visibleMapWidth / 2)));
     }
   }
-  function chooseBackgroundSegment(id: string) {
+  function chooseBackgroundSegment(id: string, reveal = true) {
     const item = segments.find(segment => segment.id === id);
     if (!item) return;
     resetBackgroundSelection();
     setSelectedId(undefined);
     setSegmentId(id);
-    revealMapPosition((item.start + item.end) / 2);
-    if (!item.imagePlacement) beginBackgroundImageEdit(item);
+    if (reveal) revealMapPosition((item.start + item.end) / 2);
   }
   function chooseBackgroundBoundary(next: BackgroundBoundary) {
     resetBackgroundSelection();
@@ -232,6 +273,10 @@ export function StageEditor(props: StageEditorProps) {
   function moveBackgroundBoundary(item: BackgroundBoundary, x: number, snap = 0) {
     if (!Number.isFinite(x)) return;
     updateBackgroundSections(items => dragBackgroundBoundary(items, item, scene.width, x, snap));
+  }
+  function moveBackgroundSection(id: string, x: number, snap = 0, original?: BackgroundSegment[]) {
+    if (!Number.isFinite(x)) return;
+    updateBackgroundSections(items => moveBackgroundSegment(original ?? items, id, scene.width, x, snap));
   }
   function editBackgroundSegment(id: string, patch: Partial<BackgroundSegment>) {
     updateBackgroundSections(items => items.map(item => item.id === id ? { ...item, ...patch } : item));
@@ -246,19 +291,22 @@ export function StageEditor(props: StageEditorProps) {
       setBackgroundNotice('');
     }
   }
-  function placeBackgroundAt(at: number) {
+  function placeBackgroundAt(at?: number) {
     if (!pendingBackgroundAsset) return;
-    const range = backgroundRangeAt(segments, scene.width, at, VIEW_WIDTH);
+    const range = at === undefined
+      ? backgroundRangeInView(segments, scene.width, pan, visibleMapWidth, VIEW_WIDTH)
+      : backgroundRangeForDrop(segments, scene.width, at, VIEW_WIDTH);
     if (!range) {
       setBackgroundNotice(l('Choose an empty part of the map or drag an edge to make space.', '请选择地图的空白处，或拖动背景边界留出位置。'));
       return;
     }
     const added = { ...range, id: makeId(), assetId: pendingBackgroundAsset, transition: 0 };
-    updateBackgroundSections(items => [...items, added].sort((a, b) => a.start - b.start));
+    const fragment = makeId();
+    updateBackgroundSections(items => insertBackgroundSegment(items, added, fragment));
     resetBackgroundSelection();
     setSelectedId(undefined);
     setSegmentId(added.id);
-    revealMapPosition((added.start + added.end) / 2);
+    if (added.end <= pan || added.start >= pan + visibleMapWidth) revealMapPosition(added.start);
   }
   useLayoutEffect(() => {
     setScenes(drafts => retainChallengeAnchors(drafts, scenes));
@@ -416,16 +464,20 @@ export function StageEditor(props: StageEditorProps) {
       return;
     }
     const next = startScene(startingScene, props.variables.map(entry => ({ ...entry, playValue: entry.variable.initialValue })));
+    next.flags = [...playFlags];
     beginSceneRules(next, startingScene, graph);
     run.current = next;
+    playEntryId.current = startingScene.id;
     checkpoint.current = undefined;
     trial.current.clear();
     keys.current.clear();
     pressed.current.clear();
     setNotice('');
+    props.onPlayVariables({});
     setAssetMenu(false);
     onAssetPickChange(null);
     setInspectedId(undefined);
+    setInspectedEdgeId(undefined);
     setMode('play');
     playViewport.current?.focus();
     props.onPlay();
@@ -437,7 +489,9 @@ export function StageEditor(props: StageEditorProps) {
     trial.current.clear();
     setMode('edit');
     props.onActive([], null);
+    props.onPlayVariables({});
   };
+  const restart = () => start(scenes.find(item => item.id === playEntryId.current) ?? scene);
   const resume = () => {
     keys.current.clear();
     pressed.current.clear();
@@ -471,11 +525,15 @@ export function StageEditor(props: StageEditorProps) {
       const key = name(event);
       if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'space'].includes(key)) event.preventDefault();
       if (!keys.current.has(key)) pressed.current.add(key);
+      else if (event.repeat) pressed.current.add('repeat:' + key);
       keys.current.add(key);
       if (run.current?.overlayId && !event.repeat) advanceOverlay(run.current, controls.current.graph, key === 'space' ? 'space' : key);
     };
-    const up = (event: KeyboardEvent) => keys.current.delete(name(event));
-    const clear = () => { keys.current.clear(); pressed.current.clear(); };
+    const up = (event: KeyboardEvent) => {
+      const key = name(event);
+      if (keys.current.delete(key)) released.current.add(key);
+    };
+    const clear = () => { keys.current.clear(); pressed.current.clear(); released.current.clear(); };
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     window.addEventListener('blur', clear);
@@ -511,8 +569,10 @@ export function StageEditor(props: StageEditorProps) {
             left: keys.current.has('arrowleft') || keys.current.has('a'),
             right: keys.current.has('arrowright') || keys.current.has('d'),
             keys: pressed.current,
+            released: released.current,
           }, 1 / 120);
           pressed.current.clear();
+          released.current.clear();
           if (active.sceneId !== oldScene) {
             trial.current.clear();
             setInspectedId(undefined);
@@ -525,10 +585,20 @@ export function StageEditor(props: StageEditorProps) {
           lastEdge = active.edgeId;
           const activeNodes = active.entities.filter(item => !item.collected && item.nodeId && isActive(item, active)).map(item => item.nodeId!);
           const activeScene = live.graph.scenes.find(item => item.id === active.sceneId);
-          if (activeScene?.entryGroupId) activeNodes.push(activeScene.entryGroupId);
-          if (active.actionId && active.time - active.actionTime < .4) activeNodes.push(active.actionId);
+          if (active.groupId ?? activeScene?.entryGroupId) activeNodes.push((active.groupId ?? activeScene?.entryGroupId)!);
+          for (const [id, action] of Object.entries(active.activeActions)) {
+            if (active.time - action.at < .4) activeNodes.push(id);
+          }
+          activeNodes.push(...active.pendingOutcomes.map(outcome => outcome.nodeId));
           if (active.overlayId) activeNodes.push(active.overlayId);
-          live.props.onActive([...new Set(activeNodes)], active.time - (active.edgeTime ?? -Infinity) < 1.4 ? active.edgeId ?? null : null);
+          const edges = Object.entries(active.firedEdges).filter(([, at]) => active.time - at < 1.4).map(([id]) => id);
+          for (const edge of live.graph.edges) {
+            if (edges.includes(edge.id) && live.graph.nodes.some(node => node.id === edge.toId && node.kind === 'outcome')) activeNodes.push(edge.toId);
+          }
+          live.props.onActive([...new Set(activeNodes)], active.time - (active.edgeTime ?? -Infinity) < 1.4 ? active.edgeId ?? null : null, edges);
+          const values = Object.fromEntries(active.variables.map(entry => [entry.variable.id, entry.playValue]));
+          live.props.onPlayVariables(before => Object.keys(values).length === Object.keys(before).length
+            && Object.entries(values).every(([id, value]) => Object.is(value, before[id])) ? before : values);
           redraw(value => value + 1);
         }
         if (active.sound && active.sound.id !== lastSound) {
@@ -588,13 +658,14 @@ export function StageEditor(props: StageEditorProps) {
     const item = createLibraryPlacement(asset, scene, world, screen);
     const useAsBackground = item.kind === 'background' && Boolean(getBackgroundImage(asset));
     const sections = backgroundSegments(scene.background ?? DEFAULT_SCENE_BACKGROUND, scene.width);
-    const range = useAsBackground && at ? backgroundRangeAt(sections, scene.width, at.x, VIEW_WIDTH) : null;
+    const range = useAsBackground && at ? backgroundRangeForDrop(sections, scene.width, at.x, VIEW_WIDTH) : null;
     const added = range ? { ...range, id: makeId(), assetId: asset.id, transition: 0 } : undefined;
+    const fragment = added ? makeId() : '';
     setScenes(current => current.map(draft => {
       if (draft.id !== scene.id) return draft;
       if (useAsBackground) {
         const background = draft.background ?? DEFAULT_SCENE_BACKGROUND;
-        const segments = added ? [...sections, added].sort((a, b) => a.start - b.start) : sections;
+        const segments = added ? insertBackgroundSegment(sections, added, fragment) : sections;
         return { ...draft, background: { ...background, mode: 'segments', segments } };
       }
       const placements = item.kind === 'background' ? draft.placements.filter(placement => placement.kind !== 'background') : draft.placements;
@@ -631,8 +702,8 @@ export function StageEditor(props: StageEditorProps) {
     frameDrag.current = undefined;
   }
   function mapPosition(event: PointerEvent<HTMLSpanElement>) {
-    const rect = event.currentTarget.getBoundingClientRect();
-    return (event.clientX - rect.left) * scene.width / rect.width;
+    const rail = event.currentTarget;
+    return (event.clientX - rail.getBoundingClientRect().left - rail.clientLeft) * scene.width / rail.clientWidth;
   }
   function startMapDrag(event: PointerEvent<HTMLSpanElement>) {
     if (wholeMapVisible || event.button !== 0) return;
@@ -663,9 +734,12 @@ export function StageEditor(props: StageEditorProps) {
     const p = point(event);
     if (backgroundDraft) {
       const corner = backgroundCornerAt(p, backgroundDraft.image);
-      if (!corner && !insideBackgroundSection(p)) return;
       frameDrag.current = { pointerId: event.pointerId, origin: p, image: backgroundDraft.image, corner };
       event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (editPanel === 'background' && pendingBackgroundAsset && p.y <= scene.height - 28) {
+      placeBackgroundAt(p.x);
       return;
     }
     const handle = editHandleAt(p);
@@ -680,14 +754,20 @@ export function StageEditor(props: StageEditorProps) {
       .filter(item => !item.collected && !item.open && isActive(item, active));
     const liveHit = liveObjects && pickObject(liveObjects, p, screen);
     const hit = (liveHit && objects.find(item => item.id === liveHit.id)) ?? pickObject(objects, p, screen);
-    const backgroundHit = !hit && editPanel === 'background' && hasBackgroundSections && backgroundTool === null &&
-      assetPick !== 'picking' && p.y <= scene.height - 28
-      ? segments.find(segment => p.x >= segment.start && p.x < segment.end) : undefined;
+    const backgroundHit = backgroundSectionUnderPointer(p);
+    if (backgroundHit && (!hit || backgroundHit.id === segmentId)) {
+      chooseBackgroundSegment(backgroundHit.id, false);
+      sectionDrag.current = {
+        pointerId: event.pointerId, id: backgroundHit.id, clientX: event.clientX,
+        offset: p.x - backgroundHit.start, original: segments, moved: false,
+      };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (hit && segmentId) resetBackgroundSelection();
     setSelectedId(hit?.id);
-    drags.current = hit ? { pin: event.pointerId, x: p.x, y: p.y, item: hit } : {
-      pin: event.pointerId, x: event.clientX, y: pan,
-      backgroundTap: backgroundHit && { id: backgroundHit.id, y: event.clientY },
-    };
+    drags.current = hit ? { pin: event.pointerId, x: p.x, y: p.y, item: hit }
+      : { pin: event.pointerId, x: event.clientX, y: pan };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
   function playPointerDown(event: PointerEvent<HTMLCanvasElement>) {
@@ -702,10 +782,50 @@ export function StageEditor(props: StageEditorProps) {
     } else if (mode === 'play') {
       if (active.overlayId) advanceOverlay(active, graph);
       else {
-        pressed.current.add(event.button === 2 ? 'right button' : 'left button');
+        const key = event.button === 2 ? 'right button' : 'left button';
+        pressed.current.add(key);
+        keys.current.add(key);
         if (event.button === 0) clickStageObject(active, graph, p.x, p.y);
       }
     }
+  }
+  function chooseAction(actionId: string) {
+    const active = run.current;
+    if (!active || mode !== 'play') return;
+    stepScene(active, graph, { left: false, right: false, keys: new Set(), actionId }, 0);
+    playViewport.current?.focus({ preventScroll: true });
+    redraw(value => value + 1);
+  }
+  function renderHud(stageScene: Scene, active?: StageRun, editing = false) {
+    const variables = active?.variables ?? props.variables;
+    const placements = (editing ? stageScene.placements : active?.entities ?? stageScene.placements)
+      .filter(item => item.kind === 'hud');
+    return props.assets.flatMap(asset => {
+      const binding = asset.categoryId === 'interface' ? asset.displayBinding : undefined;
+      const entry = binding && variables.find(item => item.variable.id === binding.variableId);
+      if (!binding || !entry) return [];
+      const state = asset.states.find(slot => slot.id === asset.activeStateId) ?? asset.states[0];
+      const effects = getOutcomeVisualEffects(state?.visualEffects, active?.visualOutcomes[asset.id], active?.time ?? 0);
+      if (isHiddenByEffect(effects)) return [];
+      const value = active ? entry.playValue : entry.variable.initialValue;
+      const percent = Math.max(0, Math.min(100, Number(value) / Math.max(1, binding.max) * 100));
+      const instances = placements.filter(item => item.assetId === asset.id);
+      return (instances.length ? instances.filter(item => !item.isHidden) : [undefined]).map(item => {
+        const box = item && placementBox(item);
+        const style = item && box ? {
+          left: box.x / VIEW_WIDTH * 100 + '%', top: box.y / VIEW_HEIGHT * 100 + '%',
+          width: box.width / VIEW_WIDTH * 100 + '%', minHeight: box.height / VIEW_HEIGHT * 100 + '%',
+          transform: `rotate(${item.rotation}deg)`, zIndex: Math.max(0, item.layer),
+        } : { left: binding.x + '%', top: binding.y + '%' };
+        return <div key={item?.id ?? asset.id} style={style}
+          className={'absolute pointer-events-none rounded-lg bg-slate-950/75 px-3 py-2 text-white shadow-lg' + (item ? '' : ' w-[40%] max-w-44')}>
+          <div className="flex justify-between gap-2 text-xs"><span className="truncate">{entry.fullKey}</span><strong>{String(value)}</strong></div>
+          {binding.style === 'bar' && entry.variable.type === 'number' && <div className="mt-1.5 h-2 rounded-full overflow-hidden bg-white/20">
+            <div style={{ width: percent + '%', background: binding.color }} className="h-full transition-[width] duration-200" />
+          </div>}
+        </div>;
+      });
+    });
   }
   function pickObject(items: Placement[], p: Point, screen: Point) {
     return [...items].reverse().sort((a, b) => Number(screenObject(b.kind)) - Number(screenObject(a.kind)) || b.layer - a.layer).find(item => {
@@ -737,8 +857,10 @@ export function StageEditor(props: StageEditorProps) {
     }
     return closest;
   }
-  function insideBackgroundSection(p: Point) {
-    return Boolean(selectedSegment && p.x >= selectedSegment.start && p.x <= selectedSegment.end && p.y >= 0 && p.y <= scene.height - 28);
+  function backgroundSectionUnderPointer(p: Point) {
+    if (editPanel !== 'background' || !hasBackgroundSections || backgroundTool !== null ||
+      assetPick === 'picking' || p.y < 0 || p.y > scene.height - 28) return undefined;
+    return segments.find(segment => p.x >= segment.start && p.x < segment.end);
   }
   function backgroundCornerAt(p: Point, image: BackgroundImagePlacement) {
     return backgroundScaleHandles(image, pan, zoom).find(handle => Math.hypot(p.x - handle.x, p.y - handle.y) <= 8 / zoom)?.corner;
@@ -748,29 +870,30 @@ export function StageEditor(props: StageEditorProps) {
       const drag = frameDrag.current;
       const p = point(event);
       const corner = drag?.corner ?? backgroundCornerAt(p, backgroundDraft.image);
-      if (drag?.pointerId === event.pointerId) {
-        const delta = { x: p.x - drag.origin.x, y: p.y - drag.origin.y };
-        const image = drag.corner ? resizeBackgroundImage(drag.image, drag.corner, delta)
-          : { ...drag.image, x: drag.image.x + delta.x, y: drag.image.y + delta.y };
-        setBackgroundDraft({ ...backgroundDraft, image });
-      }
+      if (drag?.pointerId === event.pointerId) updateBackgroundDrag(drag, p);
       event.currentTarget.style.cursor = corner ? corner.x === corner.y ? 'nwse-resize' : 'nesw-resize'
-        : drag ? 'grabbing' : insideBackgroundSection(p) ? 'grab' : '';
+        : drag ? 'grabbing' : 'grab';
+      return;
+    }
+    const section = sectionDrag.current;
+    if (section?.pointerId === event.pointerId) {
+      dragBackgroundSection(section, event);
+      event.currentTarget.style.cursor = 'grabbing';
       return;
     }
     const drag = drags.current;
     if (!drag) {
-      const handle = editHandleAt(point(event));
+      const p = point(event);
+      const handle = editHandleAt(p);
       if (handle?.kind === 'rotation') event.currentTarget.style.cursor = 'grab';
       else if (handle?.kind === 'collision') event.currentTarget.style.cursor = handle.side.x ? 'ew-resize' : 'ns-resize';
       else if (handle?.kind === 'size') event.currentTarget.style.cursor = handle.corner.x === handle.corner.y ? 'nwse-resize' : 'nesw-resize';
-      else event.currentTarget.style.cursor = '';
+      else if (editPanel === 'background' && pendingBackgroundAsset) event.currentTarget.style.cursor = 'crosshair';
+      else event.currentTarget.style.cursor = backgroundSectionUnderPointer(p) ? 'grab' : '';
       return;
     }
     if (drag.pin !== event.pointerId) return;
     if (!drag.item) {
-      if (drag.backgroundTap && Math.hypot(drag.x - event.clientX, drag.backgroundTap.y - event.clientY) < 4) return;
-      drag.backgroundTap = undefined;
       setPan(Math.min(maxPan(scene, zoom), Math.max(0, drag.y + (drag.x - event.clientX) * VIEW_WIDTH / event.currentTarget.clientWidth / zoom)));
       return;
     }
@@ -795,8 +918,28 @@ export function StageEditor(props: StageEditorProps) {
     const dy = delta.y * (drag.item.anchor?.startsWith('bottom') ? -1 : 1);
     editItem({ x: adjust(drag.item.x + dx), y: adjust(drag.item.y + dy) }, drag.item.id);
   }
+  function dragBackgroundSection(drag: NonNullable<typeof sectionDrag.current>, event: PointerEvent<HTMLCanvasElement>) {
+    if (!drag.moved && Math.abs(event.clientX - drag.clientX) < 4) return;
+    drag.moved = true;
+    const snap = 8 * VIEW_WIDTH / event.currentTarget.clientWidth / zoom;
+    moveBackgroundSection(drag.id, point(event).x - drag.offset, snap, drag.original);
+  }
+  function updateBackgroundDrag(drag: NonNullable<typeof frameDrag.current>, p: Point) {
+    const delta = { x: p.x - drag.origin.x, y: p.y - drag.origin.y };
+    const image = drag.corner ? resizeBackgroundImage(drag.image, drag.corner, delta)
+      : { ...drag.image, x: drag.image.x + delta.x, y: drag.image.y + delta.y };
+    setBackgroundDraft(draft => draft && { ...draft, image });
+  }
   function endDrag(event: PointerEvent<HTMLCanvasElement>) {
-    if (frameDrag.current?.pointerId === event.pointerId) {
+    const section = sectionDrag.current;
+    if (section?.pointerId === event.pointerId) {
+      if (event.type === 'pointerup') dragBackgroundSection(section, event);
+      sectionDrag.current = undefined;
+      event.currentTarget.style.cursor = 'grab';
+    }
+    const frame = frameDrag.current;
+    if (frame?.pointerId === event.pointerId) {
+      if (event.type === 'pointerup') updateBackgroundDrag(frame, point(event));
       frameDrag.current = undefined;
       event.currentTarget.style.cursor = 'grab';
     }
@@ -804,10 +947,6 @@ export function StageEditor(props: StageEditorProps) {
     if (drag?.pin === event.pointerId) {
       drags.current = undefined;
       event.currentTarget.style.cursor = '';
-      if (event.type === 'pointerup' && drag.backgroundTap &&
-        Math.hypot(drag.x - event.clientX, drag.backgroundTap.y - event.clientY) < 4) {
-        chooseBackgroundSegment(drag.backgroundTap.id);
-      }
     }
   }
 
@@ -818,31 +957,71 @@ export function StageEditor(props: StageEditorProps) {
       if (Number.isFinite(next)) onChange(min === undefined ? next : Math.max(min, next));
     }} /></label>
   );
-  const simulatedEvents = mode === 'play' ? extractSimulatedEventsFromEdges(props.nodes, props.edges, new Set(props.nodes.map(node => node.id)), props.lang) : [];
-  function renderOverlay(scene: Scene, nodeId: string | null | undefined, interactive: boolean) {
-    const overlay = props.nodes.find(node => node.id === nodeId);
-    const narrative = overlay?.kind === 'narration' || overlay?.kind === 'dialogue' ? overlay : undefined;
-    const dialogue = narrative?.kind === 'dialogue' ? resolveDialogueContent(narrative) : undefined;
-    const text = dialogue?.body || narrative?.note.trim() || narrative?.title.trim();
-    const subtitle = (interactive ? run.current?.entities ?? scene.placements : scene.placements).find(item => item.kind === 'subtitle');
-    const position = subtitle && anchoredPosition(subtitle);
-    const finished = interactive ? run.current?.finished : undefined;
-    if (!finished && (!text || subtitle?.isHidden)) return null;
-    return (
-      <div className={'stage-overlay' + (!interactive ? ' pointer-events-none' : '')} style={subtitle && position && !finished ? {
-        left: subtitle.anchor?.endsWith('right') ? undefined : position.x / VIEW_WIDTH * 100 + '%',
-        right: subtitle.anchor?.endsWith('right') ? subtitle.x / VIEW_WIDTH * 100 + '%' : undefined,
-        top: subtitle.anchor?.startsWith('top') ? position.y / VIEW_HEIGHT * 100 + '%' : undefined,
-        bottom: subtitle.anchor?.startsWith('bottom') ? subtitle.y / VIEW_HEIGHT * 100 + '%' : 'auto',
-        width: Math.min(100, subtitle.width / VIEW_WIDTH * 100) + '%',
-        transform: `rotate(${subtitle.rotation}deg)`,
-        transformOrigin: `${subtitle.anchor?.endsWith('right') ? 'right' : 'left'} ${subtitle.anchor?.startsWith('bottom') ? 'bottom' : 'top'}`,
-      } : !finished && narrative && resolveSubtitlePosition(narrative) === 'top' ? { top: 0, bottom: 'auto' } : undefined}>
-        <p>{finished ? (finished === 'victory' ? l('Victory', '胜利') : l('Defeat', '失败')) : dialogue?.speaker ? dialogue.speaker + ': ' + text : text}</p>
-        {interactive && narrative && mode === 'play' && resolvePlaybackSettings(narrative).mode === 'click' &&
-          <button type="button" onClick={() => { if (run.current) advanceOverlay(run.current, graph); playViewport.current?.focus(); }}>{l('Continue', '继续')}</button>}
-      </div>
-    );
+  const boardSelection = playableNodes.find(node => node.id === props.selectedNodeId);
+  const groupChildren = boardSelection?.kind === 'group' ? new Set(getDescendantNodeIds(boardSelection.id, props.nodes)) : undefined;
+  const scopedPreview = groupChildren?.size ? playableNodes.filter(node => groupChildren.has(node.id)) : playableNodes;
+  const previewPool = scopedPreview.length ? scopedPreview : playableNodes;
+  const reversePreview = [...previewPool].reverse();
+  const previewNarration = boardSelection?.kind === 'narration' ? boardSelection : reversePreview.find(node => node.kind === 'narration');
+  const previewDialogue = boardSelection?.kind === 'dialogue' ? boardSelection : reversePreview.find(node => node.kind === 'dialogue');
+  const narrationAtBottom = previewNarration && resolveSubtitlePosition(previewNarration) === 'bottom';
+  const simulatedEvents = useMemo(() => extractSimulatedEventsFromEdges(
+    props.nodes, props.edges, new Set(playableNodes.map(node => node.id)), props.lang,
+  ), [playableNodes, props.nodes, props.edges, props.lang]);
+  const customFlags = useMemo(() => extractCustomFlagConditions(props.nodes, props.edges, props.variables), [props.nodes, props.edges, props.variables]);
+  const stats = useMemo(() => detectUsedStats(
+    props.nodes.filter(node => !node.promptInput?.outcomeMode || node.fields.stageScoreFormula), props.edges,
+  ), [props.nodes, props.edges]);
+  const activeRun = run.current;
+  const stageNodeMap = useMemo(() => new Map(playableNodes.map(node => [node.id, node])), [playableNodes]);
+  const availableMechanisms = new Set(activeRun?.entities.filter(item => item.kind === 'challenge' && !item.collected && !item.open &&
+    isActive(item, activeRun) && item.nodeId && getAncestorGroupIds(item.nodeId, stageNodeMap).every(id => activeRun.unlockedGroups.includes(id)))
+    .map(item => item.nodeId));
+  const mechanisms = activeRun ? playableNodes.filter(node => (availableMechanisms.has(node.id) || node.id === activeRun.overlayId) &&
+    (!activeRun.groupId || isDescendantOf(node.id, activeRun.groupId, stageNodeMap))) : [];
+  const showStats = activeRun && (stats.usesHp || stats.usesScore);
+  const waitingForChapter = activeRun && activeRun.waitingGroups.length > 0 && !activeRun.overlayId && !activeRun.finished
+    && !activeRun.groupId && !activeRun.entities.some(item => item.kind === 'challenge' && item.nodeId
+      && playableNodes.some(node => node.id === item.nodeId && !node.parentId));
+  const togglePlayFlag = (key: string) => {
+    if (mode === 'paused') return;
+    const enabled = !playFlags.includes(key);
+    setPlayFlags(flags => enabled ? [...flags, key] : flags.filter(flag => flag !== key));
+    if (!activeRun) return;
+    if (enabled) activateStageEvent(activeRun, key, graph);
+    else activeRun.flags = activeRun.flags.filter(flag => flag !== key);
+  };
+  const chooseChapter = (groupId: string) => {
+    if (!activeRun) return;
+    const prior = activeRun.sceneId;
+    focusStageChapter(activeRun, groupId, graph);
+    if (prior !== activeRun.sceneId) {
+      trial.current.clear();
+      setInspectedId(undefined);
+    }
+    redraw(value => value + 1);
+    playViewport.current?.focus({ preventScroll: true });
+  };
+  const chooseMechanism = (nodeId: string) => {
+    if (!activeRun) return;
+    const entity = activeRun.entities.find(item => item.nodeId === nodeId && !item.collected && !item.open && isActive(item, activeRun));
+    if (!entity) return;
+    activeRun.focusedObjectId = entity.id;
+    redraw(value => value + 1);
+    playViewport.current?.focus({ preventScroll: true });
+  };
+
+  function renderOverlay(stageScene: Scene, active: StageRun | undefined, interactive: boolean) {
+    const overlay = active && props.nodes.find(node => node.id === active.overlayId);
+    const narration = active ? overlay?.kind === 'narration' ? overlay : undefined
+      : narrationAtBottom && previewDialogue && boardSelection?.kind !== 'narration' ? undefined : previewNarration;
+    const dialogue = active ? overlay?.kind === 'dialogue' ? overlay : undefined
+      : narrationAtBottom && boardSelection?.kind === 'narration' ? undefined : previewDialogue;
+    const subtitle = (active && interactive ? active.entities : stageScene.placements).find(item => item.kind === 'subtitle');
+    const portrait = dialogue && [...getNodeAssetIds(dialogue), stageScene.placements.find(item => item.id === stageScene.entrySpawnId)?.assetId]
+      .map(id => props.assets.find(asset => asset.id === id && asset.categoryId === 'characters')).find(Boolean);
+    return <StageCutscene lang={props.lang} narration={narration} dialogue={dialogue} portrait={portrait}
+      subtitle={subtitle} run={active} hint={Boolean(active && interactive && mode === 'play')} />;
   }
   function renderInspector(trialMode: boolean) {
     const mode = trialMode ? 'paused' : 'edit';
@@ -854,8 +1033,16 @@ export function StageEditor(props: StageEditorProps) {
     const parameters = selected ? exposedParameters(props.nodes, selected) : [];
     const rewardCards = props.nodes.filter(node => node.kind === 'outcome' && node.fields.stageScoreFormula &&
       props.edges.some(edge => edge.fromId === selectedNode?.id && edge.toId === node.id));
-    const verdict = trialMode && run.current && selected && Object.values(run.current.verdicts).reverse().find(entry => entry.objectId === selected.id);
-    const recentEdge = verdict && props.edges.find(edge => edge.id === verdict.edgeId);
+    const verdicts = trialMode && run.current && selected ? Object.values(run.current.verdicts)
+      .filter(entry => entry.objectId === selected.id) : [];
+    const byEdge = new Map(verdicts.map(entry => [entry.edgeId, entry]));
+    const conditions = trialMode && selected ? props.edges.filter(edge =>
+      (edge.condition?.trim() || edge.conditionGroup?.clauses.length)
+      && (byEdge.has(edge.id) || selected.nodeId && (edge.fromId === selected.nodeId || edge.toId === selected.nodeId))) : [];
+    const recent = [...verdicts].reverse().sort((a, b) => b.at - a.at || Number(b.passed) - Number(a.passed))[0];
+    const recentEdge = conditions.find(edge => edge.id === inspectedEdgeId) ??
+      conditions.find(edge => edge.id === recent?.edgeId) ?? conditions[0];
+    const verdict = recentEdge && byEdge.get(recentEdge.id);
     return (
       <aside className="stage-inspector" aria-label={trialMode ? l('Play inspection', '试玩检查') : l('Edit selection', '编辑对象')}>
         <div className="stage-inspector-heading">
@@ -922,8 +1109,19 @@ export function StageEditor(props: StageEditorProps) {
           </fieldset>}
           {mode === 'paused' && <fieldset><legend>{l('This run', '本局状态')}</legend>
             <p>{selected.collected ? l('Collected', '已收集') : selected.open ? l('Open', '已打开') : l('Active', '运行实例')}</p>
+            {conditions.length > 1 && recentEdge && <label>{l('Related condition', '相关条件')}
+              <select aria-label={l('Related condition', '相关条件')} value={recentEdge.id} onChange={event => setInspectedEdgeId(event.target.value)}>
+                {conditions.map(edge => {
+                  const target = props.nodes.find(node => node.id === edge.toId);
+                  const result = byEdge.get(edge.id);
+                  const label = target?.title || target?.note || l('Condition', '条件');
+                  const state = result ? result.passed ? l('Passed', '通过') : l('Not passed', '未通过') : l('No evaluation yet', '尚未求值');
+                  return <option key={edge.id} value={edge.id}>{label} · {state}</option>;
+                })}
+              </select>
+            </label>}
+            {recentEdge && <button type="button" onClick={() => void locate({ edgeId: recentEdge.id })}>{l('Locate related condition', '查看相关条件')}</button>}
             {verdict && recentEdge ? <>
-              <button type="button" onClick={() => void locate({ edgeId: verdict.edgeId })}>{l('Locate related condition', '查看相关条件')}</button>
               <p>{verdict.passed ? l('Passed', '通过') : l('Not passed', '未通过')} · {l('Score', '分数')} {verdict.scoreBefore} → {verdict.scoreAfter}</p>
               {verdict.clauses.map(result => {
                 const clause = recentEdge.conditionGroup?.clauses.find(item => item.id === result.id);
@@ -939,7 +1137,8 @@ export function StageEditor(props: StageEditorProps) {
   }
 
   return (
-    <aside ref={panel} className={'stage-editor' + (full ? ' stage-full' : '')} style={{ width: full ? undefined : props.isOpen ? props.width : 44 }}
+    <aside ref={panel} className={'stage-editor' + (full ? ' stage-full' : '') + (props.spotlightStage === 'focus-play' ? ' stage-spotlight' : '')}
+      style={{ width: full ? undefined : props.isOpen ? props.width : 44 }}
       aria-label={l('Canvas stage', 'Canvas 舞台')}
       onKeyDown={event => {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'd' && event.target === viewport.current && selected) {
@@ -948,46 +1147,99 @@ export function StageEditor(props: StageEditorProps) {
       }}>
       {!props.isOpen && !full ? <button type="button" className="stage-icon" aria-label={l('Expand Play panel', '展开试玩栏')} onClick={props.onToggle}><PanelRightOpen size={16} /></button> : <>
         <header className="stage-header">
-          <h2>{l('Play', '试玩')} <small>· {mode === 'play' ? l('Running', '运行中') : mode === 'paused' ? l('Paused', '已暂停') : l('Stage Preview', '实时舞台预览')}</small></h2>
+          <div className="flex items-center gap-2 min-w-0"><h2>{t.title}</h2>
+            <small>· {mode === 'play' ? t.liveLabel : mode === 'paused' ? l('Paused', '已暂停') : t.previewLabel}</small>
+          </div>
           <div className="stage-row">
-            {mode === 'edit' && <button className="stage-primary" type="button" onClick={() => start(scene)}>{l('Play', '试玩')}</button>}
+            {mode === 'edit' && <button className="stage-primary stage-team-play" type="button" disabled={emptyPreview}
+              onClick={() => start(scene)}><Play size={12} fill="currentColor" aria-hidden="true" />{t.playBtn}</button>}
             {mode === 'play' && <button type="button" onClick={() => setMode('paused')}>{l('Pause', '暂停')}</button>}
             {mode === 'paused' && <button className="stage-primary" type="button" onClick={resume}>{l('Resume', '继续')}</button>}
-            {mode !== 'edit' && <button type="button" onClick={stop}>{l('Stop', '停止')}</button>}
+            {mode !== 'edit' && <>
+              <button type="button" className="stage-team-stop" onClick={stop}><Square size={12} fill="currentColor" aria-hidden="true" />{t.stopBtn}</button>
+              <button type="button" className="stage-icon" aria-label={t.restart} title={t.restart} onClick={restart}><RotateCcw size={14} /></button>
+            </>}
             <button ref={fullButton} type="button" className="stage-icon" onClick={() => void toggleFull()} aria-label={full ? l('Exit fullscreen', '退出全屏') : l('Fullscreen', '全屏')} title={full ? l('Exit fullscreen', '退出全屏') : l('Fullscreen', '全屏')}>{full ? <Minimize size={16} /> : <Maximize size={16} />}</button>
-            {!full && <button type="button" className="stage-icon" aria-label={l('Collapse Play panel', '收起试玩栏')} onClick={props.onToggle}><PanelRightClose size={16} /></button>}
+            {!full && <button type="button" className="stage-icon" aria-label={t.collapse} onClick={props.onToggle}><PanelRightClose size={16} /></button>}
           </div>
         </header>
         <div className="stage-body">
           <section className="stage-main stage-play" aria-label={l('Play stage', '试玩舞台')}>
-            <div className="stage-toolbar">
-              <span className="stage-scene-name">{playScene.name}</span>
-              {run.current && <span className="stage-stats">{l('Score', '分数')} {run.current.score} · HP {run.current.hp}</span>}
-            </div>
-            <div className="stage-view">
+            <StagePlayProperties lang={props.lang} scopedVariables={props.variables} onUpdatePlayValue={props.onUpdatePlayValue} />
+            {(scenes.length > 1 || showStats) && <div className="stage-toolbar">
+              {scenes.length > 1 && <span className="stage-scene-name">{playScene.name}</span>}
+              {showStats && <span className="stage-stats">
+                {stats.usesScore && l('Score ', '分数 ') + activeRun.score}{stats.usesHp && (stats.usesScore ? ' · ' : '') + 'HP ' + activeRun.hp}
+              </span>}
+            </div>}
+            <div className={'stage-view stage-team-view' + (emptyPreview ? ' stage-team-empty' : '')}>
               <canvas ref={playViewport} tabIndex={0} aria-label={l('Play viewport', '试玩画面')}
-                onPointerDown={playPointerDown} onContextMenu={event => { if (mode === 'play') event.preventDefault(); }} />
-              {renderOverlay(playScene, run.current ? run.current.overlayId : props.selectedNodeId, Boolean(run.current))}
+                onPointerDown={playPointerDown}
+                onPointerUp={event => {
+                  const key = event.button === 2 ? 'right button' : 'left button';
+                  if (keys.current.delete(key)) released.current.add(key);
+                }}
+                onPointerMove={event => {
+                  if (mode === 'play' && event.buttons) {
+                    pressed.current.add('drag:mouse position');
+                    if (event.buttons & 1) pressed.current.add('drag:left button');
+                    if (event.buttons & 2) pressed.current.add('drag:right button');
+                  }
+                }}
+                onDoubleClick={event => {
+                  if (mode === 'play') pressed.current.add('double-click:' + (event.button === 2 ? 'right button' : 'left button'));
+                }}
+                onContextMenu={event => { if (mode === 'play') event.preventDefault(); }} />
+              {renderHud(playScene, run.current)}
+              {renderOverlay(playScene, activeRun, true)}
+              {emptyPreview && <div className="absolute pointer-events-none inset-0 flex flex-col items-center justify-center p-5 text-center">
+                <div className="font-display text-sm font-bold text-[#14244B]">{t.stageEmptyTitle}</div>
+                <p className="mt-1 text-[11.5px] text-[#64748B] leading-relaxed max-w-[230px]">{t.stageEmpty}</p>
+              </div>}
+              {waitingForChapter && <div className="absolute pointer-events-none inset-0 bg-[#0B132B]/72 backdrop-blur-[1px] flex flex-col items-center justify-center p-4 text-center gap-1.5">
+                <Lock className="w-5 h-5 text-[#FBC53D]" aria-hidden="true" />
+                <div className="text-xs font-bold text-white">{t.chapterLockedHint}</div>
+                <div className="text-[11px] text-[#CBD5E1] max-w-[240px]">{activeRun.waitingGroups.map(id => {
+                  const group = props.nodes.find(node => node.id === id);
+                  const name = group?.title || group?.note;
+                  return name && (group?.availableWhen ? name + ' (' + group.availableWhen + ')' : name);
+                }).filter(Boolean).join(' · ')}</div>
+              </div>}
+              {activeRun?.finished && <div className="stage-team-ending absolute inset-0 bg-[#0B132B]/78 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-center gap-2.5">
+                <div className={'text-xs font-bold uppercase tracking-wider ' +
+                  (activeRun.finished === 'victory' ? 'text-[#FBC53D]' : activeRun.finished === 'defeat' ? 'text-[#FDA4AF]' : 'text-[#7DD3FC]')}>
+                  {activeRun.finished === 'victory' ? l('Victory', '通关成功') : activeRun.finished === 'defeat' ? l('Challenge Over', '挑战结束') : l('Scene Complete', '片段结束')}
+                </div>
+                {activeRun.endText && <p className="text-sm font-semibold text-white leading-snug max-w-[260px]">{activeRun.endText}</p>}
+                <div className="mt-1 flex items-center gap-2">
+                  <button type="button" onClick={restart} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#FBC53D] hover:bg-[#F59E0B] text-[#14244B] text-xs font-bold">
+                    <RotateCcw size={14} aria-hidden="true" />{t.playAgain}
+                  </button>
+                  <button type="button" onClick={stop} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold">
+                    <Square size={12} fill="currentColor" aria-hidden="true" />{t.stopBtn}
+                  </button>
+                </div>
+              </div>}
+              {run.current?.message && run.current.time - run.current.message.at < 2.5 &&
+                <div role="status" className="absolute pointer-events-none top-2.5 left-1/2 -translate-x-1/2 max-w-[92%] rounded-lg bg-slate-950/85 px-3 py-1 text-center text-[11px] font-semibold text-white">
+                  {run.current.message.key === 'formula' ? l('Complete the property formula before running.', '请补充明确的属性公式')
+                    : l('Choose a target and change for this outcome.', '请先设置这张 Outcome 的目标和变化')}
+                </div>}
             </div>
+            {mode === 'play' && activeRun && <StagePlayChapters lang={props.lang} nodes={playableNodes} run={activeRun}
+              mechanisms={mechanisms} onChapter={chooseChapter} onMechanism={chooseMechanism} />}
+            <StagePlaySwitches lang={props.lang} events={simulatedEvents} conditions={customFlags}
+              active={playFlags} disabled={mode === 'paused'} onToggle={togglePlayFlag} />
+            <StageActionControls lang={props.lang} graph={graph} run={activeRun} mode={mode}
+              previewNodeIds={groupChildren && scopedPreview.length ? groupChildren : undefined} onChoose={chooseAction} />
             {mode === 'paused' && <div className="stage-row">
               <button type="button" disabled={!checkpoint.current} onClick={restore}>{l('Retry checkpoint', '从检查点复测')}</button>
               <button type="button" onClick={() => start(playScene)}>{l('Restart scene', '从入口重试')}</button>
               {trial.current.size > 0 && <button type="button" onClick={commitTrial}>{l('Keep trial edits', '保留本局修改')}</button>}
             </div>}
-            {simulatedEvents.length > 0 && <fieldset><legend>{l('Custom event toggles', '自定义事件开关')}</legend>
-              <div className="stage-row">
-                {simulatedEvents.map(event => <button type="button" key={event.key} aria-pressed={Boolean(run.current?.flags.includes(event.key))} onClick={() => {
-                  const active = run.current;
-                  if (!active) return;
-                  if (active.flags.includes(event.key)) active.flags = active.flags.filter(flag => flag !== event.key);
-                  else activateStageEvent(active, event.key, graph);
-                  redraw(value => value + 1);
-                  playViewport.current?.focus();
-                }}>{event.label}</button>)}
-              </div>
-            </fieldset>}
             {notice && <p role="status" className="stage-notice">{notice}</p>}
             {mode === 'paused' && renderInspector(true)}
+            {mode !== 'paused' && <p className="text-[11px] text-[#64748B] leading-relaxed">{mode === 'play' ? t.liveHint : t.previewHint}</p>}
           </section>
           <section className="stage-main stage-edit" aria-label={l('Edit stage', '编辑舞台')}>
             <h2 className="stage-section-title">{l('Edit stage', '编辑舞台')}</h2>
@@ -1037,7 +1289,7 @@ export function StageEditor(props: StageEditorProps) {
               segments={segments} segment={selectedSegment} boundary={selectedBoundary} tool={backgroundTool}
               pendingAsset={pendingBackgroundAsset} notice={backgroundNotice}
               onChange={changeBackground} onTool={beginBackgroundTool} onAsset={chooseBackgroundAsset}
-              onPlaceInView={() => placeBackgroundAt(pan + visibleMapWidth / 2)}
+              onPlaceInView={() => placeBackgroundAt()}
               onRemoveSegment={() => {
                 if (!selectedSegment) return;
                 updateBackgroundSections(items => items.filter(item => item.id !== selectedSegment.id));
@@ -1049,6 +1301,8 @@ export function StageEditor(props: StageEditorProps) {
                 if (image) setBackgroundDraft({ ...backgroundDraft, image });
               }}
               onSaveFrame={() => finishBackgroundImageEdit(true)} onCancelFrame={() => finishBackgroundImageEdit(false)}
+              onSaveFrameAndAdd={() => { finishBackgroundImageEdit(true); beginBackgroundTool('add'); }}
+              onMoveSection={moveBackgroundSection}
               onMoveBoundary={moveBackgroundBoundary}
               onTransition={(id, transition) => editBackgroundSegment(id, { transition, transitionFrom: selectedBoundary?.leftId })} />}
             {editPanel === 'settings' && <section id="stage-scene-settings" className="stage-inline-panel" aria-label={l('Scene settings', '场景设置')}>
@@ -1089,18 +1343,21 @@ export function StageEditor(props: StageEditorProps) {
                   const asset = props.assets.find(item => item.id === event.dataTransfer.getData('text/plain'));
                   if (asset) addAsset(asset, point(event));
                 }} />
-              {renderOverlay(scene, props.selectedNodeId, false)}
+              {renderHud(scene, run.current?.sceneId === scene.id ? run.current : undefined, true)}
+              {renderOverlay(scene, run.current?.sceneId === scene.id ? run.current : undefined, false)}
             </div>
             {(scene.width > VIEW_WIDTH || editPanel === 'background' && hasBackgroundSections) && <div className="stage-map-nav">
               <div className="stage-map-track">
-                <span>{l('Map overview', '关卡总览')}</span>
+                <span className="stage-map-label">{l('Map overview', '关卡总览')}
+                  <small>X {Math.round(pan)}–{Math.round(pan + visibleMapWidth)} / {scene.width}</small>
+                </span>
                 <span className="stage-map-rail" data-pannable={!wholeMapVisible}
                   onPointerDown={startMapDrag} onPointerMove={moveMapDrag} onPointerUp={endMapDrag}
                   onPointerCancel={endMapDrag} onLostPointerCapture={endMapDrag}
                   style={{ backgroundColor: background.mode === 'inherit' ? undefined : background.color }}>
                   <span className="stage-map-window" aria-hidden="true"
-                    style={{ left: Math.min(pan, maxPan(scene, zoom)) / scene.width * 100 + '%', width: visibleMapWidth / scene.width * 100 + '%' }} />
-                  <input type="range" min="0" max={maxPan(scene, zoom)} value={Math.min(pan, maxPan(scene, zoom))}
+                    style={{ left: pan / scene.width * 100 + '%', width: visibleMapWidth / scene.width * 100 + '%' }} />
+                  <input type="range" min="0" max={maxPan(scene, zoom)} step="any" value={pan}
                     aria-label={l('Map overview', '关卡总览')} disabled={wholeMapVisible}
                     onChange={event => setPan(Number(event.target.value))} />
                 </span>
@@ -1108,7 +1365,7 @@ export function StageEditor(props: StageEditorProps) {
                   lang={props.lang} width={scene.width} preferredWidth={VIEW_WIDTH} color={background.color}
                   segments={segments} assets={props.assets} segmentId={segmentId} boundaryId={selectedBoundary?.id}
                   pendingAsset={pendingBackgroundAsset} editingImage={editingBackgroundImage} onSelect={chooseBackgroundSegment} onBoundary={chooseBackgroundBoundary}
-                  onMove={moveBackgroundBoundary} onPlace={placeBackgroundAt} />}
+                  onMove={moveBackgroundBoundary} onMoveSection={moveBackgroundSection} onPlace={placeBackgroundAt} />}
               </div>
               {scene.width > VIEW_WIDTH && <button type="button" onClick={() => {
                 if (wholeMapVisible) {
@@ -1143,23 +1400,32 @@ type PaintView = {
   selectedId?: string;
   zh: boolean;
   backgroundDraft?: BackgroundImageDraft;
+  backgroundSelection?: BackgroundSegment;
+  emptyPreview?: boolean;
 };
 type SpriteCache = WeakMap<HTMLImageElement, Map<string, ReturnType<typeof bakeStaticEffectsToCanvas>>>;
 
 function paint(ctx: CanvasRenderingContext2D, width: number, height: number, scene: Scene, view: PaintView,
   images: Map<string, HTMLImageElement>, bakedSprites: SpriteCache) {
+  if (view.mode === 'preview' && view.emptyPreview) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    return;
+  }
   const { run, pan, zoom, time } = view;
   ctx.setTransform(width / VIEW_WIDTH, 0, 0, height / VIEW_HEIGHT, 0, 0);
   ctx.save();
   ctx.scale(zoom, zoom);
   drawStageBackdrop(ctx, scene.theme ?? 'neutral', VIEW_WIDTH / zoom, VIEW_HEIGHT / zoom, scene.height - 28, time, 0, null);
   ctx.translate(-pan, 0);
-  drawSceneBackground(ctx, scene, pan, zoom, view.props.assets, images, view.backgroundDraft);
+  drawSceneBackground(ctx, scene, pan, zoom, view.props.assets, images, view.backgroundDraft, run?.visualOutcomes, time);
 
   const drawAsset = (item: Placement, x: number, y: number, behavior?: ReturnType<typeof cardPreviewBehavior>, spin: -1 | 0 | 1 = 0, age = time) => {
     const asset = view.props.assets.find(candidate => candidate.id === item.assetId);
     const slot = asset?.states.find(state => state.id === asset.activeStateId) ?? asset?.states[0];
-    if (isHiddenByEffect(slot?.visualEffects)) return;
+    const visual = asset && run?.visualOutcomes[asset.id];
+    const sceneVisual = visual ? { run: visual, time } : undefined;
+    if (isHiddenByEffect(getOutcomeVisualEffects(slot?.visualEffects, visual, time))) return;
     const url = slot?.mediaKind === 'video' ? undefined : slot?.mediaUrl;
     const sprite = loadStageImage(url, images);
     let baked = null;
@@ -1176,7 +1442,7 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
     const rotation = item.rotation * Math.PI / 180;
     if (behavior) {
       drawChallengeEntity(ctx, x, y, 13, behavior.visual, age, sprite, spin, baked, slot?.visualEffects,
-        { width: item.width, height: item.height, rotation });
+        { width: item.width, height: item.height, rotation }, sceneVisual);
     } else if (asset?.interfaceMode === 'text' && asset.typography) {
       ctx.save();
       ctx.translate(x, y);
@@ -1186,7 +1452,7 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
       ctx.fillText(asset.typography.text, -item.width / 2, 4, item.width);
       ctx.restore();
     } else if (sprite) {
-      drawSpriteWithEffects(ctx, sprite, baked, x, y, item.width, item.height, slot?.visualEffects, time, rotation);
+      drawSpriteWithEffects(ctx, sprite, baked, x, y, item.width, item.height, slot?.visualEffects, time, rotation, 1, sceneVisual);
     } else {
       ctx.save();
       ctx.translate(x, y);
@@ -1233,7 +1499,7 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
     if (behavior && (view.mode === 'preview' || selected && editing)) {
       drawBehaviorGuide(ctx, editing ? item : motion, item, behavior, zoom, editing ? 0 : time);
     }
-    if (spriteVisible && (!run || isActive(item, run)) && !motion.collected && !motion.open) {
+    if (spriteVisible && (editing || !run || isActive(item, run)) && !motion.collected && !motion.open) {
       drawAsset(item, motion.x, motion.y, behavior, motion.spin, age);
     }
     if (!selected) continue;
@@ -1248,8 +1514,25 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
 
   const spawn = run && scene.placements.find(item => item.id === scene.entrySpawnId);
   if (run && spawn && spawn.assetId && !spawn.isHidden) {
-    const hero = { ...run.player, id: '', kind: 'decoration' as const, name: '', rotation: 0, layer: 0, assetId: spawn.assetId };
+    const hero = { ...spawn, x: run.player.x, y: run.player.y + (run.player.height - spawn.height) / 2 };
     drawAsset(hero, hero.x, hero.y);
+  }
+  if (run) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.shadowColor = '#7dd3fc';
+    ctx.shadowBlur = 6;
+    for (const wave of run.waves) {
+      ctx.beginPath();
+      ctx.ellipse(wave.x, wave.y, 9, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (run.guardUntil && run.guardUntil > run.time) {
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(run.player.x, run.player.y, 17, 22, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
   ctx.restore();
 
@@ -1278,7 +1561,9 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
   for (const item of placements.filter(item => screenObject(item.kind) && !item.isHidden)) {
     const position = anchoredPosition(item);
     if (item.kind === 'hud') {
-      if (item.assetId) drawAsset(item, position.x, position.y);
+      const binding = view.props.assets.find(asset => asset.id === item.assetId && asset.categoryId === 'interface')?.displayBinding;
+      const hasBoundReadout = binding && (run?.variables ?? view.props.variables).some(entry => entry.variable.id === binding.variableId);
+      if (item.assetId && !hasBoundReadout) drawAsset(item, position.x, position.y);
       if (item.hud) {
         ctx.font = 'bold 14px sans-serif';
         ctx.fillStyle = '#f8fafc';
@@ -1323,6 +1608,16 @@ function paint(ctx: CanvasRenderingContext2D, width: number, height: number, sce
   if (draft && scene.background) {
     const segment = backgroundSegments(scene.background, scene.width).find(item => item.id === draft.segmentId);
     if (segment) drawBackgroundImageEditor(ctx, draft.image, segment, scene.height - 28, pan, zoom);
+  } else if (editing && view.backgroundSelection) {
+    const segment = view.backgroundSelection;
+    ctx.save();
+    ctx.scale(zoom, zoom);
+    ctx.translate(-pan, 0);
+    ctx.strokeStyle = '#fbbf24';
+    ctx.lineWidth = 2 / zoom;
+    ctx.setLineDash([5 / zoom, 4 / zoom]);
+    ctx.strokeRect(segment.start, 0, segment.end - segment.start, scene.height - 28);
+    ctx.restore();
   }
 }
 

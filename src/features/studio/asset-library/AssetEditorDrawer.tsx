@@ -1,3 +1,4 @@
+import type {ScopedStateVariable} from '../properties/stateModel';
 import {
   useEffect,
   useRef,
@@ -60,6 +61,7 @@ import {
 import type { VisualEffectType } from './effects/visualEffectsModel';
 
 interface AssetEditorDrawerProps {
+  scopedVariables:ScopedStateVariable[];
   lang: Language;
   asset: AssetItem;
   audioUnlocked: boolean;
@@ -97,6 +99,7 @@ const STATE_TAB_THEMES: readonly StateTabTheme[] = [
 ];
 
 export function AssetEditorDrawer({
+  scopedVariables,
   lang,
   asset,
   audioUnlocked,
@@ -285,10 +288,11 @@ export function AssetEditorDrawer({
   };
 
   // Real Local Uploads
-  const handleVisualUpload = (event: ChangeEvent<HTMLInputElement>) => {
+  const handleVisualUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const objectUrl = URL.createObjectURL(file);
+    const input=event.target;
+    const objectUrl = await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject(reader.error);reader.readAsDataURL(file);});
     const kind = file.type.startsWith('video/') ? 'video' : 'image';
     updateActiveState((slot) => ({
       ...slot,
@@ -301,10 +305,11 @@ export function AssetEditorDrawer({
     event.target.value = '';
   };
 
-  const handleAudioUpload = (event: ChangeEvent<HTMLInputElement>) => {
+  const handleAudioUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const objectUrl = URL.createObjectURL(file);
+    const input=event.target;
+    const objectUrl = await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject(reader.error);reader.readAsDataURL(file);});
     updateActiveState((slot) => ({
       ...slot,
       audioUrl: objectUrl,
@@ -1210,16 +1215,16 @@ export function AssetEditorDrawer({
             </div>
           )}
 
-          {/* Figma-style Additive Visual Effects (available for both Image/Video and Interface Text) */}
-          <VisualEffectsEditor
-            lang={lang}
-            effects={activeState.visualEffects ?? []}
-            unlockedEffects={unlockedVisualEffects}
-            onChange={(next) =>
-              updateActiveState((slot) => ({ ...slot, visualEffects: next }))
-            }
-            onTriggerDynamicPreview={() => setDynamicReplayNonce((n) => n + 1)}
-          />
+          {asset.categoryId==='interface' && <section className="p-4 rounded-xl bg-sky-50 border border-sky-200 space-y-3">
+            <h3 className="font-bold">{lang==='zh'?'显示数据 · 随游戏更新':'Display data · Live during play'}</h3>
+            <p className="text-xs text-slate-600">{lang==='zh'?'预览使用开局值，运行时显示当前值。这里不修改属性。':'Preview uses the starting value; Play shows the current value. This display does not change the property.'}</p>
+            <label className="block text-sm">{lang==='zh'?'读取哪个属性':'Read property'}<select className="w-full bg-white border rounded p-2" value={asset.displayBinding?.variableId??''} onChange={e=>onUpdateAsset(asset.id,a=>({...a,displayBinding:{style:'bar',max:100,x:5,y:5,color:'#22c55e',...a.displayBinding,variableId:e.target.value}}))}><option value="">{lang==='zh'?'不绑定':'Not bound'}</option>{scopedVariables.map(v=><option key={v.variable.id} value={v.variable.id}>{v.fullKey}</option>)}</select></label>
+            {asset.displayBinding && <>
+            <label className="block text-sm">{lang==='zh'?'显示方式':'Display style'}<select className="w-full bg-white border rounded p-2" value={asset.displayBinding.style} onChange={e=>onUpdateAsset(asset.id,a=>({...a,displayBinding:{...a.displayBinding!,style:e.target.value as 'bar'|'text'}}))}><option value="bar">{lang==='zh'?'血条 / 进度条':'Bar'}</option><option value="text">{lang==='zh'?'数字 / 文字':'Text'}</option></select></label>
+            {(['max','x','y'] as const).map(key=><label key={key} className="block text-sm">{key==='max'?(lang==='zh'?'满格值':'Full bar value'):key==='x'?(lang==='zh'?'水平位置（%）':'Horizontal position (%)'):(lang==='zh'?'垂直位置（%）':'Vertical position (%)')}<input type="number" min={key==='max'?1:0} max={key==='max'?undefined:80} value={asset.displayBinding![key]} className="w-full border rounded p-2" onChange={e=>onUpdateAsset(asset.id,a=>({...a,displayBinding:{...a.displayBinding!,[key]:key==='max'?Math.max(1,Number(e.target.value)||1):Math.max(0,Math.min(80,Number(e.target.value)||0))}}))}/></label>)}
+            </>}
+          </section>}
+          <p className="text-xs text-slate-500">{lang==='zh'?'这里编辑默认外观。运行中的特效请添加「视觉变化」Outcome。':'Edit the default appearance here. Add a Visual outcome for effects during play.'}</p>
         </section>
 
         {/* ============================================================

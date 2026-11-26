@@ -1,3 +1,4 @@
+import {starterOptions,starterImage} from './starterAssets';
 import {
   useEffect,
   useRef,
@@ -43,6 +44,7 @@ export interface AiPlacedNotice {
 }
 
 interface AssetsPanelProps {
+  onAddStarter:(key:string)=>void;
   lang: Language;
   isOpen: boolean;
   width: number;
@@ -75,6 +77,7 @@ const CATEGORY_ICONS: Record<AssetCategoryId, typeof Users> = {
 };
 
 export function AssetsPanel({
+  onAddStarter,
   lang,
   isOpen,
   width,
@@ -98,6 +101,7 @@ export function AssetsPanel({
   useEffect(() => {
     if (pickingForStage && isOpen) stagePickHint.current?.focus();
   }, [isOpen, pickingForStage]);
+  const [starterOpen,setStarterOpen]=useState(false);
 
   const [expandedCategories, setExpandedCategories] = useState<
     Record<AssetCategoryId, boolean>
@@ -395,11 +399,15 @@ export function AssetsPanel({
   };
 
   return (
+    <>
+    {starterOpen && <div className="fixed inset-0 z-[100] bg-slate-900/30 flex items-center justify-center p-6"><section className="bg-white rounded-2xl p-6 max-w-2xl w-full shadow-xl"><div className="flex justify-between mb-5"><h2 className="text-xl font-bold">{lang==='zh'?'内置素材 · 添加到我的素材':'Built-in assets · Add to my assets'}</h2><button onClick={()=>setStarterOpen(false)} aria-label="Close asset catalog">×</button></div><div className="grid grid-cols-4 gap-3">{starterOptions.map(o=><button key={o[0]} className="border rounded-xl p-3 hover:border-sky-400" onClick={()=>{onAddStarter(o[0]);setStarterOpen(false);}}><img src={starterImage(o[0])} alt="" className="w-20 h-20 mx-auto"/><span className="text-sm">{o[lang==='zh'?2:1]}</span></button>)}</div></section></div>}
+
     <aside
       aria-label={t.title}
       style={{ width: `${width}px` }}
       className="shrink-0 bg-white border-r border-[#E2E8F0] flex flex-col min-h-0 select-none"
     >
+    <button onClick={()=>setStarterOpen(true)} className="m-3 bg-sky-100 border border-sky-200 rounded-lg px-3 py-2 text-xs font-semibold">{lang==='zh'?'＋ 内置素材':'+ Built-in assets'}</button>
       {/* Top Header */}
       <div className="h-11 px-3.5 border-b border-[#F1F5F9] flex items-center justify-between gap-2 shrink-0">
         <span className="font-display font-bold text-[15px] text-[#14244B] truncate">
@@ -611,6 +619,7 @@ export function AssetsPanel({
                       resolvedTargetFolderId === subFolder.id;
 
                     return (
+
                       <div key={subFolder.id} className="space-y-0.5">
                         <div
                           onDragOver={(e) => handleFolderDragOver(e, subDropKey, true)}
@@ -730,5 +739,6 @@ export function AssetsPanel({
         })}
       </div>
     </aside>
+    </>
   );
 }

@@ -76,6 +76,104 @@ export function backgroundRangeAt(segments: BackgroundSegment[], width: number, 
   return { start, end: Math.min(high, start + desiredWidth) };
 }
 
+function emptyBackgroundRanges(segments: BackgroundSegment[], width: number) {
+  const gaps: { start: number; end: number }[] = [];
+  let start = 0;
+  for (const segment of segments) {
+    if (segment.start > start) gaps.push({ start, end: segment.start });
+    start = Math.max(start, segment.end);
+  }
+  if (start < width) gaps.push({ start, end: width });
+  return gaps;
+}
+
+export function backgroundRangeInView(segments: BackgroundSegment[], width: number, pan: number, visibleWidth: number, preferredWidth: number) {
+  const gaps = emptyBackgroundRanges(segments, width);
+  for (const gap of gaps) {
+    const start = Math.max(gap.start, Math.round(pan));
+    if (start < pan + visibleWidth && gap.end - start >= MIN_SEGMENT_WIDTH) {
+      return { start, end: Math.min(gap.end, start + preferredWidth) };
+    }
+  }
+  const next = gaps.find(gap => gap.start >= pan && gap.end - gap.start >= MIN_SEGMENT_WIDTH)
+    ?? gaps.find(gap => gap.end - gap.start >= MIN_SEGMENT_WIDTH);
+  if (next) return { start: next.start, end: Math.min(next.end, next.start + preferredWidth) };
+  return backgroundRangeForDrop(segments, width, pan + visibleWidth / 2, preferredWidth);
+}
+
+export function backgroundRangeForDrop(segments: BackgroundSegment[], width: number, x: number, preferredWidth: number) {
+  const at = clamp(x, 0, width - 1);
+  const empty = backgroundRangeAt(segments, width, at, preferredWidth);
+  if (empty) return empty;
+  const item = segments.find(segment => at >= segment.start && at < segment.end);
+  if (!item || item.end - item.start < 2 * MIN_SEGMENT_WIDTH) return null;
+  const size = Math.min(preferredWidth, item.end - item.start - MIN_SEGMENT_WIDTH);
+  const start = at - item.start < MIN_SEGMENT_WIDTH
+    ? item.start : clamp(Math.round(at), item.start + MIN_SEGMENT_WIDTH, item.end - MIN_SEGMENT_WIDTH);
+  const end = item.end - (start + size) < MIN_SEGMENT_WIDTH ? item.end : start + size;
+  return { start, end };
+}
+
+export function insertBackgroundSegment(segments: BackgroundSegment[], added: BackgroundSegment, newFragmentId: string) {
+  let splitId: string | undefined;
+  const kept = segments.flatMap(item => {
+    if (item.end <= added.start || item.start >= added.end) return [item];
+    const left = item.start < added.start ? { ...item, end: added.start } : undefined;
+    const right = item.end > added.end ? {
+      ...item, id: left ? newFragmentId : item.id, start: added.end, transition: 0, transitionFrom: undefined,
+    } : undefined;
+    if (left && right) splitId = item.id;
+    return [left, right].filter((segment): segment is BackgroundSegment => Boolean(segment));
+  });
+  const ordered = [...kept, added].sort((a, b) => a.start - b.start);
+  return splitId ? ordered.map((item, index) => item.transitionFrom === splitId && ordered[index - 1]?.id === newFragmentId
+    ? { ...item, transitionFrom: newFragmentId } : item) : ordered;
+}
+
+function translateBackgroundSegment(segment: BackgroundSegment, start: number): BackgroundSegment {
+  const delta = start - segment.start;
+  return {
+    ...segment, start, end: segment.end + delta,
+    imagePlacement: segment.imagePlacement && { ...segment.imagePlacement, x: segment.imagePlacement.x + delta },
+  };
+}
+
+export function moveBackgroundSegment(segments: BackgroundSegment[], id: string, width: number, requestedStart: number, snap = 0): BackgroundSegment[] {
+  const originalIndex = segments.findIndex(item => item.id === id);
+  const original = segments[originalIndex];
+  if (!original || !Number.isFinite(requestedStart)) return segments;
+  const size = original.end - original.start;
+  const start = clamp(Math.round(requestedStart), 0, width - size);
+  const rest = segments.filter(item => item.id !== id);
+  const gap = emptyBackgroundRanges(rest, width).find(item =>
+    item.end - item.start >= size && start >= item.start - snap && start + size <= item.end + snap);
+  if (gap) {
+    const end = gap.end - size;
+    const position = start - gap.start <= snap ? gap.start : end - start <= snap ? end : start;
+    return [...rest, translateBackgroundSegment(original, position)].sort((a, b) => a.start - b.start);
+  }
+
+  const center = start + size / 2;
+  const nextIndex = rest.findIndex(item => center < (item.start + item.end) / 2);
+  const target = nextIndex < 0 ? rest.length : nextIndex;
+  if (target === originalIndex) {
+    const position = clamp(start, rest[target - 1]?.end ?? 0, (rest[target]?.start ?? width) - size);
+    return segments.map(item => item.id === id ? translateBackgroundSegment(item, position) : item);
+  }
+  const first = Math.min(originalIndex, target);
+  const last = Math.max(originalIndex, target);
+  const affected = segments.slice(first, last + 1);
+  const ordered = affected.filter(item => item.id !== id);
+  ordered.splice(target - first, 0, original);
+  let cursor = affected[0].start;
+  const moved = ordered.map((item, index) => {
+    const translated = translateBackgroundSegment(item, cursor);
+    cursor = translated.end + (affected[index + 1] ? affected[index + 1].start - affected[index].end : 0);
+    return translated;
+  });
+  return [...segments.slice(0, first), ...moved, ...segments.slice(last + 1)];
+}
+
 export function dragBackgroundBoundary(segments: BackgroundSegment[], boundary: BackgroundBoundary, width: number, x: number, snap: number) {
   const left = segments.findIndex(segment => segment.id === boundary.leftId);
   const right = segments.findIndex(segment => segment.id === boundary.rightId);

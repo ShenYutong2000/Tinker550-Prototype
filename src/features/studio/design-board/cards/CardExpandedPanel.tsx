@@ -1,3 +1,4 @@
+import {VisualOutcomeEditor} from './VisualOutcomeEditor';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronUp, Plus, RotateCcw, Search, Trash2 } from 'lucide-react';
 import type { AssetCategoryId, AssetItem } from '../../asset-library/assetLibraryModel';
@@ -191,7 +192,7 @@ export function CardExpandedPanel({
       className="border-t border-black/10 bg-white/75 px-3.5 py-3 space-y-3.5 text-[#14244B]"
     >
       {/* 1. Asset Binding (All 5 playable cards) */}
-      <section className="space-y-1.5">
+      {node.kind!=='outcome' && <section className="space-y-1.5">
         <div className="flex items-center justify-between gap-2">
           <h4 className="text-[11px] font-semibold text-[#334155]">
             1. {b.secAssetBinding}
@@ -239,7 +240,7 @@ export function CardExpandedPanel({
             onUpdateNode(node.id, { assetIds: nextIds });
           }}
         />
-      </section>
+      </section>}
 
       {/* 2. Narration & Dialogue: Playback Settings */}
       {(node.kind === 'narration' || node.kind === 'dialogue') && (
@@ -563,8 +564,9 @@ export function CardExpandedPanel({
         </>
       )}
 
+      {node.kind==='outcome' && node.promptInput?.outcomeMode==='visual' && <section className="pt-3 border-t"><VisualOutcomeEditor node={node} assetItems={assetItems} lang={lang} onChange={value=>onUpdateNodeField(node.id,'visualOutcome',value)}/></section>}
       {/* 2 & 3. Outcome: Related Properties + Optional Related Parameters */}
-      {node.kind === 'outcome' && (
+      {node.kind === 'outcome' && node.promptInput?.outcomeMode !== 'visual' && (
         <>
           <section className="grid gap-2 text-xs">
             <label className="grid gap-1">
@@ -594,7 +596,7 @@ export function CardExpandedPanel({
               rules={propertyRules}
               scopedVariables={scopedVariables}
               numericParameters={numericParameters}
-              onChange={(next) => onUpdateNodeField(node.id, 'relatedProperties', next)}
+              onChange={(next) => onUpdateNodeField(node.id, 'relatedProperties', next.slice(0,1))}
               onEnableChoiceOrdering={onEnableChoiceOrdering}
             />
           </section>

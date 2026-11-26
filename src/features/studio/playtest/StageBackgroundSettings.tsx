@@ -24,14 +24,16 @@ interface StageBackgroundSettingsProps {
   onRemoveSegment: () => void;
   onResetFrame: () => void;
   onSaveFrame: () => void;
+  onSaveFrameAndAdd: () => void;
   onCancelFrame: () => void;
+  onMoveSection: (id: string, x: number) => void;
   onMoveBoundary: (boundary: BackgroundBoundary, x: number) => void;
   onTransition: (id: string, width: number) => void;
 }
 
 export function StageBackgroundSettings({
   lang, background, assets, segments, segment, boundary, tool, pendingAsset, notice, onChange, onTool, onAsset, onPlaceInView,
-  onRemoveSegment, onResetFrame, onSaveFrame, onCancelFrame, onMoveBoundary, onTransition,
+  onRemoveSegment, onResetFrame, onSaveFrame, onSaveFrameAndAdd, onCancelFrame, onMoveSection, onMoveBoundary, onTransition,
 }: StageBackgroundSettingsProps) {
   const l = (en: string, zh: string) => lang === 'zh' ? zh : en;
   const modeLabels = [l('Follow Board', '跟随设计板'), l('Solid color', '纯色'), l('Background sections', '分段背景')];
@@ -88,14 +90,21 @@ export function StageBackgroundSettings({
           <button type="button" onClick={onRemoveSegment}>{l('Remove section', '移除此段')}</button>
         </>}
       </div>}
+      {segment && !framing && tool === null && <div className="stage-row stage-background-boundary-controls">
+        <label>{l('Section start', '分段起点')} <input type="number" min="0" aria-label={l('Section start', '分段起点')} value={segment.start}
+          onChange={event => { if (event.target.value !== '') onMoveSection(segment.id, Number(event.target.value)); }} /></label>
+        <small>{l('Drag the whole section on the stage or map to move it. Drag its edges to adjust the seam.',
+          '在舞台或总览拖动整段可移动位置，拖动总览上的分段边缘可调整接缝。')}</small>
+      </div>}
       {framing && segment && <div className="stage-object-details">
         <div className="stage-row">
           <strong>{assetName(segment.assetId)}</strong>
           <button type="button" className="stage-primary" onClick={onSaveFrame}>{l('Save and lock', '保存并锁定')}</button>
+          <button type="button" onClick={onSaveFrameAndAdd}>{l('Save and add section', '保存并添加下一段')}</button>
           <button type="button" onClick={onCancelFrame}>{l('Cancel', '取消')}</button>
           <button type="button" onClick={onResetFrame}>{l('Fit to section', '适配分段')}</button>
         </div>
-        <small>{l('Drag to move the image. Drag a square corner to scale it.', '拖动图片可移动取景，拖动方形角点可等比例缩放。')}</small>
+        <small>{l('Drag to adjust the image within this section. Drag a square corner to scale it.', '拖动可调整此段内的取景，拖动方形角点可等比例缩放。')}</small>
       </div>}
       {boundary && <div className="stage-row stage-background-boundary-controls">
         <strong>{left && right ? l('Join', '接缝') : l('Section edge', '分段边界')} · {boundary.x}</strong>
@@ -112,7 +121,8 @@ export function StageBackgroundSettings({
       {notice && <p className="stage-panel-hint" role="status">{notice}</p>}
       {chooseAsset && <>
         {pendingAsset ? <div className="stage-row">
-          <small>{l('Click an empty part of the map overview to place', '点击关卡总览的空白处放置')} {assetName(pendingAsset)}</small>
+          <small>{l('Click the stage or map to place', '点击舞台或关卡总览放置')} {assetName(pendingAsset)}
+            {l('. Placing it on another section splits that section.', '。放在已有背景上可分割原段。')}</small>
           <button type="button" onClick={onPlaceInView}>{l('Place in current view', '在当前视野放置')}</button>
           <button type="button" onClick={() => onTool(null)}>{l('Cancel', '取消')}</button>
         </div> : <small>{tool === 'replace' ? l('Choose a replacement image.', '选择替换素材。') : l('Choose an image for the new section.', '选择新背景段的素材。')}</small>}

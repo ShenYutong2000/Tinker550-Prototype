@@ -482,6 +482,18 @@ export function bakeStaticEffectsToCanvas(
 /**
  * Draws a sprite onto the 2D Play canvas with full static + dynamic Visual Effects support.
  */
+export type RunningVisual = {effect:VisualEffectItem; start:number; duration:number; restore:boolean};
+const runtimeBakes = new WeakMap<HTMLImageElement, {
+  run: RunningVisual;
+  effects: VisualEffectItem[] | undefined;
+  baked: ReturnType<typeof bakeStaticEffectsToCanvas>;
+}>();
+
+export function getOutcomeVisualEffects(effects: VisualEffectItem[] | undefined, run: RunningVisual | undefined, time: number) {
+  if (!run || (run.restore && time - run.start >= run.duration)) return effects;
+  return [...(effects ?? []).filter(effect => effect.type !== run.effect.type), run.effect];
+}
+
 export function drawSpriteWithEffects(
   ctx: CanvasRenderingContext2D,
   img: HTMLImageElement,
@@ -494,17 +506,35 @@ export function drawSpriteWithEffects(
   timeSec: number,
   rotateRad = 0,
   baseAlpha = 1,
+  sceneVisual?: { run: RunningVisual; time: number },
 ) {
+  let outcomeFrame = NEUTRAL_DYNAMIC_FRAME;
+  if (sceneVisual) {
+    const { run, time } = sceneVisual;
+    const effectiveEffects = getOutcomeVisualEffects(effects, run, time);
+    if (effectiveEffects !== effects) {
+      if (isHiddenByEffect(effectiveEffects)) return;
+      const cached = runtimeBakes.get(img);
+      if (cached?.run === run && cached.effects === effects) baked = cached.baked;
+      else {
+        baked = bakeStaticEffectsToCanvas(img, effectiveEffects);
+        runtimeBakes.set(img, { run, effects, baked });
+      }
+      outcomeFrame = evaluateDynamicEffects([run.effect], Math.max(0, Math.min(time - run.start, run.duration)), false);
+      effects = effectiveEffects?.filter(effect => !['flash', 'fade', 'pulse', 'shake'].includes(effect.type));
+    }
+  }
   if (isHiddenByEffect(effects)) return;
 
   const staticOpacity = getStaticOpacity(effects);
   const dyn = evaluateDynamicEffects(effects, timeSec, true);
-  const finalAlpha = Math.max(0, Math.min(1, baseAlpha * staticOpacity * dyn.opacityMul));
+  const finalAlpha = Math.max(0, Math.min(1, baseAlpha * staticOpacity * dyn.opacityMul * outcomeFrame.opacityMul));
   if (finalAlpha <= 0.005) return;
 
   ctx.save();
   ctx.globalAlpha *= finalAlpha;
-  ctx.translate(centerX + dyn.offsetX, centerY + dyn.offsetY);
+  ctx.translate(centerX + dyn.offsetX + outcomeFrame.offsetX, centerY + dyn.offsetY + outcomeFrame.offsetY);
+  if (outcomeFrame.scale !== 1) ctx.scale(outcomeFrame.scale, outcomeFrame.scale);
   if (rotateRad !== 0) ctx.rotate(rotateRad);
   if (dyn.scale !== 1) ctx.scale(dyn.scale, dyn.scale);
 

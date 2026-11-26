@@ -14,6 +14,7 @@ import {
   getNodeAssetIds,
   inferCardFieldsFromText,
   parseOutcomeDeltasFromText,
+  resolveEdgeType,
   type ActionControlConfig,
   type ActionMechanic,
   type BoardEdge,
@@ -61,9 +62,9 @@ export interface PlaySpatialSnapshot {
 }
 
 export interface RuntimeEventRecord {
-  eventId: string;
   subjectInstanceId?: string;
   targetInstanceId?: string;
+  eventId: string;
   subjectAssetId?: string;
   subjectRole?: 'hero' | 'hazard' | 'projectile' | 'timer';
   targetAssetId?: string;
@@ -655,6 +656,7 @@ export function hasCardContent(node: BoardNode): boolean {
         node.availableWhenGroup?.clauses.length,
     );
   }
+  if (node.fields.visualOutcome?.assetId) return true;
   if (node.note.trim().length > 0) return true;
   if (node.title.trim().length > 0) return true;
   if (node.manualFields.length > 0) return true;
@@ -742,18 +744,42 @@ export function evaluateGroupAvailability(
   );
 }
 
+/** Only authored edges enable execution; enclosing groups expose connected children. */
+export function getConnectedPlayableNodeIds(nodes: BoardNode[], edges: BoardEdge[]): Set<string> {
+  const map = new Map(getPlayableNodes(nodes).map((node) => [node.id, node]));
+  const connected = new Set<string>();
+  for (const edge of edges) {
+    if (!map.has(edge.toId) || (edge.fromId !== null && !map.has(edge.fromId))) continue;
+    connected.add(edge.toId);
+    if (edge.fromId !== null) connected.add(edge.fromId);
+  }
+  for (const id of [...connected]) {
+    let parentId = map.get(id)?.parentId;
+    const seen = new Set<string>();
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      if (map.has(parentId)) connected.add(parentId);
+      parentId = map.get(parentId)?.parentId;
+    }
+  }
+  return connected;
+}
+
 export function getGroupLocalRoots(
   groupId: string,
   nodes: BoardNode[],
   edges: BoardEdge[],
 ): BoardNode[] {
   const playable = getPlayableNodes(nodes);
-  const directChildren = playable.filter((n) => n.parentId === groupId);
+  const connected = getConnectedPlayableNodeIds(nodes, edges);
+  const directChildren = playable.filter((n) => n.parentId === groupId && connected.has(n.id));
   if (directChildren.length === 0) return [];
 
+  const allNodeMap = new Map(nodes.map((n) => [n.id, n]));
   const childIds = new Set(directChildren.map((n) => n.id));
   const incomingCounts = new Map<string, number>();
   const guardedByEntryTrigger = new Set<string>();
+  const associatedActionIds = new Set<string>();
   directChildren.forEach((n) => incomingCounts.set(n.id, 0));
 
   for (const edge of edges) {
@@ -761,24 +787,46 @@ export function getGroupLocalRoots(
       guardedByEntryTrigger.add(edge.toId);
       continue;
     }
-    if (edge.fromId && childIds.has(edge.fromId) && childIds.has(edge.toId) && edge.fromId !== edge.toId) {
+    if (
+      edge.fromId &&
+      childIds.has(edge.fromId) &&
+      childIds.has(edge.toId) &&
+      edge.fromId !== edge.toId
+    ) {
       const from = directChildren.find((n) => n.id === edge.fromId);
       const to = directChildren.find((n) => n.id === edge.toId);
+      if (!from || !to) continue;
+      if (resolveEdgeType(edge, allNodeMap) === 'association') {
+        if (from.kind === 'challenge' && to.kind === 'action') {
+          associatedActionIds.add(to.id);
+        } else if (from.kind === 'action' && to.kind === 'challenge') {
+          associatedActionIds.add(from.id);
+        }
+        continue;
+      }
       // Ignore backward loop edges when identifying entry roots
-      if (from && to && to.x + 120 < from.x) continue;
+      if (to.x + 120 < from.x) continue;
       incomingCounts.set(edge.toId, (incomingCounts.get(edge.toId) ?? 0) + 1);
     }
   }
 
   const roots = directChildren.filter(
+    (n) =>
+      (incomingCounts.get(n.id) ?? 0) === 0 &&
+      !guardedByEntryTrigger.has(n.id) &&
+      !associatedActionIds.has(n.id),
+  );
+  const fallbackRoots = directChildren.filter(
     (n) => (incomingCounts.get(n.id) ?? 0) === 0 && !guardedByEntryTrigger.has(n.id),
   );
   const candidates =
     roots.length > 0
       ? roots
-      : guardedByEntryTrigger.size > 0
-        ? []
-        : [directChildren[0]];
+      : fallbackRoots.length > 0
+        ? fallbackRoots
+        : guardedByEntryTrigger.size > 0
+          ? []
+          : [directChildren[0]];
 
   return [...candidates].sort((a, b) => {
     if (Math.abs(a.y - b.y) > 40) return a.y - b.y;
@@ -1009,9 +1057,12 @@ export function resolveChallengeTimeLimitSec(
     return timeParam.value;
   }
 
-  // Also activate a default countdown if an outgoing edge from this Challenge (or its connected Actions) waits on time_up
+  // Also activate a default countdown if an outgoing edge from this Challenge (or its associated Actions) waits on time_up
   const connectedActionIds = new Set(
-    edges.filter((e) => e.fromId === node.id).map((e) => e.toId),
+    edges
+      .filter((e) => e.fromId === node.id || e.toId === node.id)
+      .map((e) => (e.fromId === node.id ? e.toId : e.fromId))
+      .filter((id): id is string => Boolean(id)),
   );
   const checksTimeUp = edges.some((e) => {
     const isRelevant =
@@ -1076,13 +1127,17 @@ export function findStartNodeId(
   const playable = getPlayableNodes(nodes);
   if (playable.length === 0) return null;
 
+  const allNodeMap = new Map(nodes.map((n) => [n.id, n]));
   const playableIds = new Set(playable.map((n) => n.id));
-  const topLevel = playable.filter((n) => !n.parentId || !playableIds.has(n.parentId));
-  const scopeNodes = topLevel.length > 0 ? topLevel : playable;
+  const connected = getConnectedPlayableNodeIds(nodes, edges);
+  const eligible = playable.filter((n) => connected.has(n.id));
+  const topLevel = eligible.filter((n) => !n.parentId || !playableIds.has(n.parentId));
+  const scopeNodes = topLevel.length > 0 ? topLevel : eligible;
 
   const nodeMap = new Map(scopeNodes.map((n) => [n.id, n]));
   const forwardIncoming = new Map<string, number>();
   const guardedByEntryTrigger = new Set<string>();
+  const associatedActionIds = new Set<string>();
   scopeNodes.forEach((n) => forwardIncoming.set(n.id, 0));
 
   for (const edge of edges) {
@@ -1093,17 +1148,32 @@ export function findStartNodeId(
     const from = nodeMap.get(edge.fromId);
     const to = nodeMap.get(edge.toId);
     if (!from || !to) continue;
+    if (resolveEdgeType(edge, allNodeMap) === 'association') {
+      if (from.kind === 'challenge' && to.kind === 'action') {
+        associatedActionIds.add(to.id);
+      } else if (from.kind === 'action' && to.kind === 'challenge') {
+        associatedActionIds.add(from.id);
+      }
+      continue;
+    }
     if (to.x + 120 < from.x) continue;
     forwardIncoming.set(to.id, (forwardIncoming.get(to.id) ?? 0) + 1);
   }
 
   const roots = scopeNodes.filter(
+    (n) =>
+      (forwardIncoming.get(n.id) ?? 0) === 0 &&
+      !guardedByEntryTrigger.has(n.id) &&
+      !associatedActionIds.has(n.id),
+  );
+  const fallbackRoots = scopeNodes.filter(
     (n) => (forwardIncoming.get(n.id) ?? 0) === 0 && !guardedByEntryTrigger.has(n.id),
   );
-  if (roots.length === 0 && guardedByEntryTrigger.size > 0) {
+  if (roots.length === 0 && fallbackRoots.length === 0 && guardedByEntryTrigger.size > 0) {
     return null;
   }
-  const candidates = roots.length > 0 ? roots : scopeNodes;
+  const candidates =
+    roots.length > 0 ? roots : fallbackRoots.length > 0 ? fallbackRoots : scopeNodes;
 
   const kindPriority: Record<string, number> = {
     group: 0,
@@ -1129,11 +1199,15 @@ export function computeLoopEdgeIds(
   nodes: BoardNode[],
   edges: BoardEdge[],
 ): Set<string> {
+  const allNodeMap = new Map(nodes.map((n) => [n.id, n]));
   const playable = nodes.filter((n) => NODE_CATALOG[n.kind].isPlayable);
   const nodeMap = new Map(playable.map((n) => [n.id, n]));
   const playableEdges = edges.filter(
     (e): e is BoardEdge & { fromId: string } =>
-      e.fromId !== null && nodeMap.has(e.fromId) && nodeMap.has(e.toId),
+      e.fromId !== null &&
+      nodeMap.has(e.fromId) &&
+      nodeMap.has(e.toId) &&
+      resolveEdgeType(e, allNodeMap) === 'flow',
   );
 
   const loopIds = new Set<string>();
@@ -1201,12 +1275,14 @@ export function getEvaluatedOutgoing(
   scopedVariables: ScopedStateVariable[] = [],
   runtimeCtx?: PlayRuntimeContext,
 ): EvaluatedEdge[] {
+  const allNodeMap = new Map(nodes.map((n) => [n.id, n]));
   const playableMap = new Map(getPlayableNodes(nodes).map((n) => [n.id, n]));
   const activeSet = new Set(activeNodeIds);
   const result: EvaluatedEdge[] = [];
 
   for (const edge of edges) {
     if (!edge.fromId || !activeSet.has(edge.fromId)) continue;
+    if (resolveEdgeType(edge, allNodeMap) !== 'flow') continue;
     const target = playableMap.get(edge.toId);
     if (!target) continue;
     result.push({
@@ -1221,6 +1297,61 @@ export function getEvaluatedOutgoing(
         runtimeCtx,
       ),
       isLoop: loopEdgeIds.has(edge.id),
+    });
+  }
+
+  result.sort((a, b) => a.target.y - b.target.y || a.target.x - b.target.x);
+  return result;
+}
+
+/**
+ * Resolves all playable Action cards associated with a given Challenge
+ * (either via undirected 'association' links in any direction, or explicit flow edges Challenge -> Action).
+ */
+export function getAssociatedActionsForChallenge(
+  challengeId: string,
+  nodes: BoardNode[],
+  edges: BoardEdge[],
+  stats: PlayStats,
+  customFlags: Record<string, boolean>,
+  scopedVariables: ScopedStateVariable[] = [],
+  runtimeCtx?: PlayRuntimeContext,
+): { edge: BoardEdge; target: BoardNode; evaluation: ConditionEvaluation }[] {
+  const allNodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const playableMap = new Map(getPlayableNodes(nodes).map((n) => [n.id, n]));
+  const result: { edge: BoardEdge; target: BoardNode; evaluation: ConditionEvaluation }[] = [];
+  const seenActionIds = new Set<string>();
+
+  for (const edge of edges) {
+    if (edge.fromId === null) continue;
+    const kind = resolveEdgeType(edge, allNodeMap);
+    let candidateAction: BoardNode | undefined;
+
+    if (kind === 'association') {
+      if (edge.fromId === challengeId) {
+        candidateAction = playableMap.get(edge.toId);
+      } else if (edge.toId === challengeId) {
+        candidateAction = playableMap.get(edge.fromId);
+      }
+    } else if (edge.fromId === challengeId) {
+      candidateAction = playableMap.get(edge.toId);
+    }
+
+    if (!candidateAction || candidateAction.kind !== 'action') continue;
+    if (seenActionIds.has(candidateAction.id)) continue;
+    seenActionIds.add(candidateAction.id);
+
+    result.push({
+      edge,
+      target: candidateAction,
+      evaluation: evaluateEdgeCondition(
+        edge.condition,
+        stats,
+        customFlags,
+        scopedVariables,
+        edge.conditionGroup,
+        runtimeCtx,
+      ),
     });
   }
 

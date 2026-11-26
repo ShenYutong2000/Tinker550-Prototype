@@ -1,3 +1,5 @@
+import {createDefaultVisualEffect,type VisualEffectType} from '../../asset-library/effects/visualEffectsModel';
+import {VisualOutcomeEditor} from './VisualOutcomeEditor';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Search, X } from 'lucide-react';
 import {
@@ -334,6 +336,7 @@ export function CardPromptFront({
   scopedVariables,
   autoFocus,
   onUpdateNode,
+  onUpdateNodeField,
 }: CardPromptFrontProps) {
   const b = COPY[lang].studio.board;
   const s = COPY[lang].studio.states;
@@ -898,6 +901,11 @@ export function CardPromptFront({
   }
 
   // 5. OUTCOME — guiding question + searchable Asset/Property target picker + change input OR custom text
+  if (node.kind === 'outcome' && node.promptInput?.outcomeMode==='visual') {
+    const cfg=node.fields.visualOutcome;
+    const update=(patch:Partial<NonNullable<CardFieldConfig['visualOutcome']>>)=>onUpdateNodeField(node.id,'visualOutcome',{assetId:'',effect:{type:'visibility',enabled:true,visible:false},duration:0,restore:false,...cfg,...patch});
+    return <div className="p-3 space-y-2 text-xs" onPointerDown={e=>e.stopPropagation()}><p className="text-emerald-700">{lang==='zh'?'让哪个对象发生什么视觉变化？':'What visual change happens to which object?'}</p><select aria-label="Visual target" value={cfg?.assetId??''} className="w-full border rounded-lg p-2 bg-white" onChange={e=>update({assetId:e.target.value})}><option value="">{lang==='zh'?'选择目标素材':'Choose target asset'}</option>{assetItems.filter(a=>['characters','objects','backgrounds'].includes(a.categoryId)).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select><select aria-label="Visual change" className="w-full border rounded-lg p-2 bg-white" value={cfg?.effect.type??'visibility'} onChange={e=>{const type=e.target.value as VisualEffectType;const effect=createDefaultVisualEffect(type);if(effect.type==='visibility')effect.visible=false;update({effect,duration:'duration' in effect?effect.duration:0,restore:['flash','shake','pulse'].includes(type)});}}>{[['visibility','隐藏 / 显示','Hide / Show'],['fade','淡入 / 淡出','Fade'],['flash','闪烁','Flash'],['shake','抖动','Shake'],['pulse','缩放脉冲','Pulse'],['opacity','透明度','Opacity'],['glow','发光','Glow'],['brightness','亮度','Brightness']].map(([key,zh,en])=><option key={key} value={key}>{lang==='zh'?zh:en}</option>)}</select><p className="text-slate-500">{cfg?`${cfg.duration}s · ${cfg.restore?(lang==='zh'?'恢复原样':'Restore'):(lang==='zh'?'保持变化':'Keep change')}`:(lang==='zh'?'展开设置效果参数和时间':'Expand Details for effect and timing')}</p></div>;
+  }
   if (node.kind === 'outcome') {
     const isCustom = prompt.mode === 'custom';
     const prevTargetAssetId =
@@ -1100,7 +1108,7 @@ export function CardPromptFront({
                     )}
 
                     {/* Group 2: Characters & Objects */}
-                    {outcomeGroups.assetGroups.length > 0 && (
+                    {false && outcomeGroups.assetGroups.length > 0 && (
                       <div className="mb-1 last:mb-0">
                         <div className="px-2.5 pt-1 pb-1 text-[10px] font-semibold tracking-wide text-[#334155] bg-[#F8FAFC] border-y border-[#F1F5F9] first:border-t-0">
                           {lang === 'zh' ? '角色与物品' : 'Characters & Objects'}

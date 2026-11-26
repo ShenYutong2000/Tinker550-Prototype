@@ -1,6 +1,8 @@
-import { type BoardEdge, type BoardNode } from '../design-board/studioModel';
+import type { RunningVisual } from '../asset-library/effects/visualEffectsModel';
+import { areActionsInSameComboFrame, getAncestorGroupIds, getComboFramesForAction, isDescendantOf, resolveEdgeType, type BoardComboFrame, type BoardEdge, type BoardNode } from '../design-board/studioModel';
+import { getSimulatedEventKey } from '../design-board/arrowConditionModel';
 import { applyOutcomePropertyRule, clampNumberValue, evaluateNumberFormula, type ScopedStateVariable } from '../properties/stateModel';
-import { evaluateEdgeCondition, evaluateGroupAvailability, findStartNodeId, getGroupLocalRoots, getPlayableNodes, INITIAL_PLAY_STATS, resolveActionConfig, resolveActionControl, resolveOutcomeConfig, resolvePlaybackSettings, type RuntimeEventRecord } from './boardPlayEngine';
+import { computeLoopEdgeIds, evaluateEdgeCondition, evaluateGroupAvailability, findStartNodeId, getGroupLocalRoots, getPlayableNodes, INITIAL_PLAY_STATS, resolveActionConfig, resolveOutcomeConfig, resolvePlaybackSettings, type RuntimeEventRecord } from './boardPlayEngine';
 import { cardPreviewBehavior, cardPreviewTimeLimit, challengeMotion, challengeSpeed } from './cardPreviewMotion';
 import { cameraX, overlaps, type Placement, type Scene } from './stageProject';
 
@@ -9,6 +11,7 @@ export interface StageVerdict {
   nodeId?: string;
   objectId?: string;
   passed: boolean;
+  at: number;
   clauses: { id: string; passed: boolean; actual?: string | number | boolean }[];
   scoreBefore: number;
   scoreAfter: number;
@@ -30,29 +33,52 @@ export interface StageRun {
   entryTime: number;
   verdicts: Record<string, StageVerdict>;
   activationTimes: Record<string, number>;
+  guardedChallenges: Set<string>;
   edgeId?: string;
   edgeTime?: number;
+  firedEdges: Record<string, number>;
+  actionChoices: Record<string, string>;
+  activeActions: Record<string, { ownerId?: string; at: number; resolved?: boolean }>;
+  visualOutcomes: Record<string, RunningVisual>;
+  pendingOutcomes: { nodeId: string; sceneId: string; objectId?: string; until: number }[];
+  message?: { key: 'formula' | 'outcome'; at: number };
   checkpointId?: string;
   checkpointVisits?: number;
   overlayId?: string;
+  overlayQueue: string[];
   overlayTime: number;
+  groupId?: string;
+  unlockedGroups: string[];
+  waitingGroups: string[];
   actionId?: string;
   actionOwnerId?: string;
   actionTime: number;
   guardUntil?: number;
+  dodge?: { until: number; velocity: number };
+  waves: { x: number; y: number; direction: number; actionId: string; ownerId?: string }[];
   lockedCameraX?: number;
+  focusedObjectId?: string;
   sound?: { id: string; assetId: string };
-  finished?: 'victory' | 'defeat';
+  finished?: 'victory' | 'defeat' | 'neutral';
+  endText?: string;
 }
 
-export type StageInput = { left: boolean; right: boolean; keys: Set<string> };
-type Graph = { nodes: BoardNode[]; edges: BoardEdge[]; scenes: Scene[] };
+export type StageInput = {
+  left: boolean;
+  right: boolean;
+  keys: Set<string>;
+  held?: Set<string>;
+  released?: Set<string>;
+  actionId?: string;
+};
+type Graph = { nodes: BoardNode[]; edges: BoardEdge[]; scenes: Scene[]; comboFrames?: BoardComboFrame[] };
 
 export function setStageEntityHidden(run: StageRun, item: StageEntity, hidden: boolean | undefined) {
   item.isHidden = hidden;
   if (hidden) {
     item.hiddenSince ??= run.time;
     run.contacts = run.contacts.filter(id => id !== item.id);
+    run.flags = run.flags.filter(flag => flag !== 'appeared:' + item.id);
   } else if (item.hiddenSince !== undefined) {
     const activated = run.activationTimes[item.id] ?? run.entryTime;
     run.activationTimes[item.id] = activated + Math.max(0, run.time - Math.max(activated, item.hiddenSince));
@@ -78,7 +104,14 @@ export function startScene(scene: Scene, variables: ScopedStateVariable[], previ
     variables: structuredClone(previous?.variables ?? variables),
     score: previous?.score ?? INITIAL_PLAY_STATS.score, hp: previous?.hp ?? INITIAL_PLAY_STATS.hp,
     time: previous?.time ?? 0, entryTime: previous?.time ?? 0, verdicts: previous?.verdicts ?? {}, activationTimes: previous?.activationTimes ?? {},
-    edgeId: previous?.edgeId, overlayTime: 0, actionTime: -1,
+    guardedChallenges: previous?.guardedChallenges ?? new Set(),
+    edgeId: previous?.edgeId, edgeTime: previous?.edgeTime, firedEdges: previous?.firedEdges ?? {}, groupId: scene.entryGroupId,
+    actionChoices: {}, activeActions: {}, visualOutcomes: previous?.visualOutcomes ?? {}, waves: [],
+    unlockedGroups: previous?.unlockedGroups ?? [], waitingGroups: previous?.waitingGroups ?? [],
+    pendingOutcomes: previous?.pendingOutcomes ?? [], overlayQueue: [], overlayTime: 0, actionTime: -1,
+    overlayId: undefined, actionId: undefined, actionOwnerId: undefined, checkpointId: undefined, checkpointVisits: undefined,
+    lockedCameraX: undefined, focusedObjectId: undefined, guardUntil: undefined, dodge: undefined,
+    message: undefined, sound: undefined, finished: undefined, endText: undefined,
   };
   for (const item of run.entities) {
     if (item.isHidden) setStageEntityHidden(run, item, true);
@@ -104,6 +137,7 @@ export function restoreSceneCheckpoint(snapshot: StageRun, scenes: Scene[], node
   });
   restored.verdicts = {};
   restored.edgeId = undefined;
+  restored.firedEdges = {};
   restored.sound = undefined;
   return restored;
 }
@@ -139,6 +173,10 @@ export function syncRunScenes(run: StageRun, previous: Scene[], next: Scene[]) {
 }
 
 function setOverlay(run: StageRun, node: BoardNode) {
+  if (run.overlayId) {
+    if (run.overlayId !== node.id && !run.overlayQueue.includes(node.id)) run.overlayQueue.push(node.id);
+    return;
+  }
   run.overlayId = node.id;
   run.overlayTime = run.time;
 }
@@ -164,7 +202,7 @@ export function calculateStageReward(node: BoardNode, nodes: BoardNode[], variab
   return { formula, value: result?.ok ? result.value : resolveOutcomeConfig(node).scoreDelta, valid: !result || result.ok };
 }
 
-function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity | undefined, events: RuntimeEventRecord[]) {
+function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity | undefined, events: RuntimeEventRecord[], record = true) {
   const scene = graph.scenes.find(item => item.id === run.sceneId);
   const hero = scene?.placements.find(item => item.id === scene.entrySpawnId);
   const customFlags = Object.fromEntries(run.flags.map(flag => [flag, true]));
@@ -175,7 +213,7 @@ function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity |
   const stats = { score: run.score, hp: run.hp };
   const passed = evaluateEdgeCondition(edge.condition, stats, customFlags, run.variables, edge.conditionGroup, context).passed;
   const verdict: StageVerdict = {
-    edgeId: edge.id, nodeId: edge.fromId ?? undefined, objectId: object?.id, passed,
+    edgeId: edge.id, nodeId: edge.fromId ?? undefined, objectId: object?.id, passed, at: run.time,
     clauses: edge.conditionGroup?.clauses.map(clause => ({
       id: clause.id,
       actual: clause.kind === 'property' ? run.variables.find(entry => entry.variable.id === clause.propertyId)?.playValue : undefined,
@@ -183,37 +221,112 @@ function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity |
     })) ?? [],
     scoreBefore: run.score, scoreAfter: run.score,
   };
-  run.verdicts[(object?.id ?? '') + ':' + edge.id] = verdict;
+  if (record) run.verdicts[(object?.id ?? '') + ':' + edge.id] = verdict;
   return verdict;
 }
 
-function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Entity | undefined, events: RuntimeEventRecord[], visited = new Set<string>()): boolean {
+function canEnterGroup(run: StageRun, graph: Graph, group: BoardNode, events: RuntimeEventRecord[] = []) {
+  const flags = Object.fromEntries(run.flags.map(flag => [flag, true]));
+  return evaluateGroupAvailability(group, graph.nodes, { score: run.score, hp: run.hp }, flags, run.variables, {
+    eventRecords: events, runtimeEvents: new Set(events.map(event => event.eventId)),
+    simulatedEvents: flags, numericParameters: symbols(graph),
+  }).passed;
+}
+
+function markEdge(run: StageRun, id: string) {
+  run.edgeId = id;
+  run.edgeTime = run.time;
+  run.firedEdges[id] = run.time;
+}
+
+type FollowOptions = {
+  allPassing?: boolean;
+  acceptEdge?: (edge: BoardEdge) => boolean;
+  onMatch?: (edge: BoardEdge) => void;
+};
+
+const hasCondition = (edge: BoardEdge) => Boolean(edge.condition?.trim() || edge.conditionGroup?.clauses.length);
+const reactiveKey = (id: string, item: Entity) => 'reactive:' + item.id + ':' + id;
+
+function isInUnlockedChapter(run: StageRun, nodeId: string, nodeMap: Map<string, BoardNode>) {
+  return getAncestorGroupIds(nodeId, nodeMap).every(id => run.unlockedGroups.includes(id));
+}
+
+function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Entity | undefined, events: RuntimeEventRecord[], visited = new Set<string>(), options: FollowOptions = {}): boolean {
   if (object?.isHidden) return false;
   if (nodeId && visited.has(nodeId)) return false;
   if (nodeId) visited.add(nodeId);
-  const candidates = graph.edges.filter(edge => edge.fromId === nodeId && !visited.has(edge.toId));
-  for (const edge of candidates) {
-    const node = graph.nodes.find(card => card.id === edge.toId);
-    if (!node || node.kind === 'draft' || node.kind === 'action' || node.stageTemplate) continue;
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+  if (nodeId && !isInUnlockedChapter(run, nodeId, nodeMap)) return false;
+  const sceneId = run.sceneId;
+  const passing = graph.edges.flatMap(edge => {
+    if (edge.fromId !== nodeId || options.acceptEdge?.(edge) === false || visited.has(edge.toId) || resolveEdgeType(edge, nodeMap) !== 'flow') return [];
+    if (object && run.flags.includes(reactiveKey(edge.id, object))) return [];
+    const node = nodeMap.get(edge.toId);
+    if (!node || node.kind === 'draft' || node.stageTemplate) return [];
+    if (nodeId === null) {
+      if (run.flags.includes('entry:' + edge.id) || node.kind === 'group' && run.unlockedGroups.includes(node.id)) return [];
+      if (!hasCondition(edge) && edge.edgeType !== 'flow') return [];
+      if (!isInUnlockedChapter(run, node.id, nodeMap)) return [];
+    }
     if (node.kind === 'challenge') {
       const targets = run.entities.filter(item => item.nodeId === node.id && (!item.activationId || item.activationId === object?.id));
-      if (targets.length > 0 && targets.every(item => item.isHidden)) continue;
+      if (targets.length > 0 && targets.every(item => item.isHidden)) return [];
     }
-    if (nodeId === null && !edge.condition && !edge.conditionGroup?.clauses.length) continue;
-    if (nodeId === null && run.flags.includes('entry:' + edge.id)) continue;
     const verdict = evaluate(run, edge, graph, object, events);
-    if (!verdict.passed) continue;
-    if (node.kind === 'group' && !evaluateGroupAvailability(node, graph.nodes, { score: run.score, hp: run.hp }, {}, run.variables).passed) continue;
+    return verdict.passed ? [{ edge, node, verdict }] : [];
+  });
+  if (!passing.length) return false;
+  const outcomes = nodeId !== null && nodeMap.get(nodeId)?.kind !== 'group'
+    ? passing.filter(({ node }) => node.kind === 'outcome' && node.promptInput?.outcomeMode) : [];
+  const selected = options.allPassing || nodeId === null ? passing : outcomes.length > 1 ? outcomes
+    : passing.filter(item => item === passing[0] || !!item.edge.sharedConditionId && item.edge.sharedConditionId === passing[0].edge.sharedConditionId);
+  const executed = new Set<string>();
+  for (const { edge, node, verdict } of selected) {
     if (nodeId === null) run.flags.push('entry:' + edge.id);
-    run.edgeId = edge.id;
-    run.edgeTime = run.time;
+    if (node.kind === 'group' && !canEnterGroup(run, graph, node, events)) {
+      if (!run.waitingGroups.includes(node.id)) run.waitingGroups.push(node.id);
+      options.onMatch?.(edge);
+      continue;
+    }
+    options.onMatch?.(edge);
+    markEdge(run, edge.id);
+    if (executed.has(node.id)) continue;
+    executed.add(node.id);
     if (node.kind === 'outcome') {
+      const mode = node.promptInput?.outcomeMode;
+      if (mode === 'visual') {
+        const visual = node.fields.visualOutcome;
+        if (!visual?.assetId) {
+          run.message = { key: 'outcome', at: run.time };
+          continue;
+        }
+        if (!run.pendingOutcomes.some(item => item.nodeId === node.id && item.objectId === object?.id)) {
+          const duration = Math.max(0.016, visual.duration);
+          run.visualOutcomes[visual.assetId] = { effect: visual.effect, start: run.time, duration, restore: visual.restore };
+          run.pendingOutcomes.push({ nodeId: node.id, sceneId: run.sceneId, objectId: object?.id, until: run.time + duration });
+        }
+        continue;
+      }
       const outcome = resolveOutcomeConfig(node);
+      const allRules = node.fields.relatedProperties ?? [];
+      const rules = mode === 'property' ? allRules.slice(0, 1) : allRules;
+      const rule = rules[0];
+      if (mode === 'property' && !rule && !node.fields.stageScoreFormula && !node.fields.stageTargetEffect) {
+        run.message = { key: 'outcome', at: run.time };
+        continue;
+      }
+      if (mode === 'property' && rule && (!run.variables.some(entry => entry.variable.id === rule.variableId)
+        || rule.op === 'formula' && !rule.formula?.trim())) {
+        run.message = { key: 'formula', at: run.time };
+        continue;
+      }
       const params = symbols(graph, object);
       const reward = calculateStageReward(node, graph.nodes, run.variables, object);
-      run.score = Math.max(0, run.score + reward.value);
-      run.hp = Math.max(0, run.hp + outcome.hpDelta);
-      const rules = node.fields.relatedProperties ?? [];
+      const scoreDelta = mode === 'property' && !reward.formula ? 0 : reward.value;
+      const hpDelta = mode === 'property' ? 0 : outcome.hpDelta;
+      run.score = Math.max(0, run.score + scoreDelta);
+      run.hp = Math.max(0, run.hp + hpDelta);
       for (const rule of rules) {
         const entry = run.variables.find(variable => variable.variable.id === rule.variableId);
         if (entry) entry.playValue = applyOutcomePropertyRule(rule, entry, run.variables, params);
@@ -221,8 +334,8 @@ function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Enti
       for (const entry of run.variables) {
         if (entry.variable.type !== 'number' || rules.some(rule => rule.variableId === entry.variable.id)) continue;
         const name = entry.variable.name;
-        const delta = /血量|血|生命|体力|\bhp\b|health|life/i.test(name) ? outcome.hpDelta
-          : /分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(name) ? reward.value : 0;
+        const delta = /血量|血|生命|体力|\bhp\b|health|life/i.test(name) ? hpDelta
+          : /分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(name) ? scoreDelta : 0;
         if (delta) entry.playValue = clampNumberValue(Number(entry.playValue) + delta, entry.variable);
       }
       if (node.fields.stageTargetEffect === 'open' && object?.targetId) {
@@ -236,49 +349,103 @@ function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Enti
       }
       if (node.fields.stageTargetEffect === 'follow-camera') run.lockedCameraX = undefined;
       verdict.scoreAfter = run.score;
-      if (outcome.visual === 'victory' || outcome.visual === 'defeat') run.finished = outcome.visual;
-      if (!run.finished) follow(run, node.id, graph, object, [], visited);
+      if (!mode && (outcome.visual === 'victory' || outcome.visual === 'defeat')) run.finished = outcome.visual;
+      if (!run.finished) follow(run, node.id, graph, object, [], new Set(visited), { allPassing: mode === 'property' });
     } else if (node.kind === 'narration' || node.kind === 'dialogue') {
       setOverlay(run, node);
+    } else if (node.kind === 'action') {
+      const flag = 'action:' + node.id;
+      if (!run.flags.includes(flag)) run.flags.push(flag);
     } else if (node.kind === 'group') {
-      const destination = graph.scenes.find(scene => scene.id !== run.sceneId && scene.entryGroupId === node.id);
-      if (destination) {
-        enterScene(run, destination, graph);
-        if (node.stageResetOnEntry) {
-          run.score = INITIAL_PLAY_STATS.score;
-          run.hp = INITIAL_PLAY_STATS.hp;
-          run.variables = run.variables.map(entry => ({ ...entry, playValue: entry.variable.initialValue }));
-        }
-      }
-      else enterGroup(run, node.id, graph);
+      focusStageChapter(run, node.id, graph, true);
     } else {
       for (const target of run.entities.filter(item => !item.isHidden && item.nodeId === node.id && (!item.activationId || item.activationId === object?.id))) {
         if (run.flags.includes('active:' + target.id)) continue;
         run.flags.push('active:' + target.id);
         run.activationTimes[target.id] = run.time;
       }
-      follow(run, node.id, graph, object, [], visited);
+      follow(run, node.id, graph, object, [], new Set(visited));
     }
-    return true;
+    if (run.sceneId !== sceneId || run.finished) break;
   }
-  return false;
+  return true;
 }
 
 export function enterGroup(run: StageRun, groupId: string, graph: Graph) {
-  const opening = getGroupLocalRoots(groupId, graph.nodes, graph.edges).find(node => node.kind === 'dialogue' || node.kind === 'narration');
-  if (opening) setOverlay(run, opening);
+  run.groupId = groupId;
+  const visited = new Set<string>();
+  const unlock = (id: string) => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    if (!run.unlockedGroups.includes(id)) run.unlockedGroups.push(id);
+    const flag = 'chapter-opening:' + id;
+    if (!run.flags.includes(flag)) {
+      run.flags.push(flag);
+      for (const root of getGroupLocalRoots(id, graph.nodes, graph.edges)) {
+        if (root.kind === 'dialogue' || root.kind === 'narration') setOverlay(run, root);
+        else if (root.kind === 'action' && !run.flags.includes('action:' + root.id)) run.flags.push('action:' + root.id);
+        else if (root.kind === 'group') {
+          if (canEnterGroup(run, graph, root)) unlock(root.id);
+          else if (!run.waitingGroups.includes(root.id)) run.waitingGroups.push(root.id);
+        }
+      }
+    }
+  };
+  unlock(groupId);
+}
+
+export function focusStageChapter(run: StageRun, groupId: string, graph: Graph, entering = false) {
+  if (!entering && !run.unlockedGroups.includes(groupId)) return;
+  const destination = graph.scenes.find(scene => scene.id !== run.sceneId && scene.entryGroupId === groupId);
+  if (destination) {
+    enterScene(run, destination, graph);
+    if (entering && graph.nodes.find(node => node.id === groupId)?.stageResetOnEntry) {
+      run.score = INITIAL_PLAY_STATS.score;
+      run.hp = INITIAL_PLAY_STATS.hp;
+      run.variables = run.variables.map(entry => ({ ...entry, playValue: entry.variable.initialValue }));
+    }
+  } else {
+    run.overlayId = undefined;
+    run.focusedObjectId = undefined;
+    enterGroup(run, groupId, graph);
+  }
 }
 
 export function beginSceneRules(run: StageRun, scene: Scene, graph: Graph) {
+  syncStageRules(run, graph);
   if (scene.entryGroupId) {
     enterGroup(run, scene.entryGroupId, graph);
     return;
   }
   if (scene.id !== graph.scenes[0]?.id) return;
-  const start = findStartNodeId(graph.nodes.filter(node => !node.stageTemplate), graph.edges);
-  const opening = graph.nodes.find(node => node.id === start);
-  if (opening?.kind === 'group') enterGroup(run, opening.id, graph);
+  const nodes = graph.nodes.filter(node => !node.stageTemplate);
+  const nodeMap = new Map(nodes.map(node => [node.id, node]));
+  const roots = getPlayableNodes(nodes).filter(node => node.kind === 'group' && !node.parentId &&
+    graph.edges.some(edge => edge.fromId === node.id || edge.toId === node.id ||
+      Boolean(edge.fromId && isDescendantOf(edge.fromId, node.id, nodeMap)) || isDescendantOf(edge.toId, node.id, nodeMap)) &&
+    !graph.edges.some(edge => edge.toId === node.id && edge.fromId !== node.id && resolveEdgeType(edge, nodeMap) === 'flow'))
+    .sort((a, b) => Math.abs(a.y - b.y) > 40 ? a.y - b.y : a.x - b.x);
+  for (const root of roots) {
+    if (canEnterGroup(run, graph, root)) run.unlockedGroups.push(root.id);
+    else run.waitingGroups.push(root.id);
+  }
+  if (run.unlockedGroups.length) {
+    enterGroup(run, run.unlockedGroups[0], graph);
+    return;
+  }
+  const start = findStartNodeId(nodes, graph.edges);
+  const opening = graph.nodes.find(node => node.id === start)
+    ?? (!graph.edges.length ? getPlayableNodes(nodes).find(node => node.kind === 'narration' || node.kind === 'dialogue') : undefined);
+  if (opening?.kind === 'group' && canEnterGroup(run, graph, opening)) enterGroup(run, opening.id, graph);
+  if (opening?.kind === 'action') run.flags.push('action:' + opening.id);
   if (opening?.kind === 'dialogue' || opening?.kind === 'narration') setOverlay(run, opening);
+}
+
+export function syncStageRules(run: StageRun, graph: Graph) {
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+  const loops = computeLoopEdgeIds(graph.nodes, graph.edges);
+  run.guardedChallenges = new Set(graph.edges.filter(edge => edge.edgeType === 'flow'
+    && nodeMap.get(edge.toId)?.kind === 'challenge' && !loops.has(edge.id)).map(edge => edge.toId));
 }
 
 function enterScene(run: StageRun, destination: Scene, graph: Graph) {
@@ -295,18 +462,32 @@ export function advanceOverlay(run: StageRun, graph: Graph, key?: string) {
   if (playback.mode === 'auto' && key !== undefined) return;
   if (playback.mode === 'click' && key !== undefined && key !== 'space' && key !== 'enter') return;
   run.overlayId = undefined;
-  if (!follow(run, node.id, graph, undefined, []) && graph.edges.length === 0) {
+  const advanced = follow(run, node.id, graph, undefined, []);
+  if (!advanced && graph.edges.length === 0) {
     const playable = getPlayableNodes(graph.nodes);
     const next = playable[playable.findIndex(item => item.id === node.id) + 1];
     if (next?.kind === 'narration' || next?.kind === 'dialogue') setOverlay(run, next);
+  }
+  while (!run.overlayId && run.overlayQueue.length) {
+    const id = run.overlayQueue.shift();
+    const queued = graph.nodes.find(card => card.id === id);
+    if (queued) setOverlay(run, queued);
+  }
+  if (!advanced && !run.overlayId && !run.pendingOutcomes.length && !run.waitingGroups.length && !run.finished
+    && !run.entities.some(item => item.kind === 'challenge' && !item.collected && !item.open && isActive(item, run))
+    && !graph.edges.some(edge => edge.fromId === null && !run.flags.includes('entry:' + edge.id))) {
+    run.finished = 'neutral';
+    run.endText = node.note;
   }
 }
 
 export function clickStageObject(run: StageRun, graph: Graph, x: number, y: number) {
   if (run.overlayId || run.finished) return;
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
   const object = [...run.entities].reverse().find(item => item.kind === 'challenge' &&
     !item.open && !item.collected && isActive(item, run) &&
-    !graph.nodes.some(node => node.id === item.nodeId && cardPreviewBehavior(node).isSceneOnly) &&
+    (!item.nodeId || isInUnlockedChapter(run, item.nodeId, nodeMap)) &&
+    !graph.nodes.some(node => node.id === item.nodeId && node.kind === 'challenge' && cardPreviewBehavior(node).isSceneOnly) &&
     overlaps({ x, y, width: 0, height: 0 }, item));
   if (!object) return;
   const events: RuntimeEventRecord[] = [{
@@ -318,70 +499,191 @@ export function clickStageObject(run: StageRun, graph: Graph, x: number, y: numb
 export function activateStageEvent(run: StageRun, flag: string, graph: Graph) {
   if (run.flags.includes(flag)) return;
   run.flags.push(flag);
+  if (run.overlayId || run.finished) return;
   follow(run, null, graph, undefined, []);
   const scene = graph.scenes.find(item => item.id === run.sceneId);
   if (scene) checkSceneExit(run, scene, graph);
 }
 
 export function checkSceneExit(run: StageRun, scene: Scene, graph: Graph, object?: Entity, events: RuntimeEventRecord[] = []) {
-  if (!scene.entryGroupId || run.overlayId || run.finished) return false;
-  const challenges = run.entities.filter(item => item.kind === 'challenge' && !item.isHidden);
-  const completed = challenges.length > 0 && challenges.every(item => item.collected || item.open);
-  const eligible = graph.edges.filter(edge => edge.fromId !== scene.entryGroupId ||
-    (edge.condition || edge.conditionGroup?.clauses.length || completed) && !run.flags.includes('exit:' + scene.id + ':' + edge.id));
-  if (!follow(run, scene.entryGroupId, { ...graph, edges: eligible }, object, events)) return false;
-  if (run.edgeId) run.flags.push('exit:' + scene.id + ':' + run.edgeId);
-  return true;
+  const groupId = run.groupId ?? scene.entryGroupId;
+  if (!groupId || run.overlayId || run.finished) return false;
+  const groups = [groupId, ...run.unlockedGroups.filter(id => id !== groupId &&
+    !graph.scenes.some(other => other.id !== scene.id && other.entryGroupId === id))];
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+  for (const id of groups) {
+    const progressionFlag = 'exit:' + scene.id + ':' + id;
+    if (run.flags.includes(progressionFlag)) continue;
+    const challenges = run.entities.filter(item => item.kind === 'challenge' && !item.isHidden
+      && (id === scene.entryGroupId || item.nodeId && isDescendantOf(item.nodeId, id, nodeMap)));
+    const completed = challenges.length > 0 && challenges.every(item => item.collected || item.open);
+    if (follow(run, id, graph, object, events, new Set(), {
+      acceptEdge: edge => hasCondition(edge) || completed,
+      onMatch: () => run.flags.push(progressionFlag),
+    })) return true;
+  }
+  return false;
+}
+
+export function getStageActionControls(run: StageRun, graph: Graph) {
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+  const frames = graph.comboFrames ?? [];
+  const result = graph.nodes.flatMap(action => {
+    if (action.kind !== 'action' || action.stageTemplate || !isInUnlockedChapter(run, action.id, nodeMap)) return [];
+    const entries = graph.edges.flatMap<{ edge?: BoardEdge; owner?: StageEntity; ownerKey: string; passed: boolean }>(edge => {
+      const forward = edge.toId === action.id;
+      const reverse = edge.fromId === action.id && resolveEdgeType(edge, nodeMap) === 'association';
+      if (!forward && !reverse) return [];
+      const source = forward ? edge.fromId : edge.toId;
+      const owners = source && isInUnlockedChapter(run, source, nodeMap)
+        ? run.entities.filter(item => item.nodeId === source && !item.open && !item.collected && isActive(item, run)) : [];
+      const groupAction = forward && source !== null && run.groupId === source;
+      return owners.length ? owners.map(owner => ({ edge, owner, ownerKey: owner.id, passed: evaluate(run, edge, graph, owner, [], false).passed }))
+        : groupAction ? [{ edge, owner: undefined, ownerKey: source, passed: evaluate(run, edge, graph, undefined, [], false).passed }] : [];
+    });
+    const frame = getComboFramesForAction(action.id, graph.nodes, frames)[0];
+    const standalone = run.flags.includes('action:' + action.id) || frame && graph.nodes.some(node =>
+      run.flags.includes('action:' + node.id) && areActionsInSameComboFrame(action.id, node.id, graph.nodes, frames));
+    if (!entries.length && standalone) entries.push({ ownerKey: frame?.id ?? action.parentId ?? action.id, passed: true });
+    return entries.map(entry => {
+      const chosen = run.actionChoices[entry.ownerKey];
+      return {
+        ...entry, action, config: resolveActionConfig(action), frame,
+        id: action.id + ':' + entry.ownerKey,
+        locked: Boolean(chosen && !areActionsInSameComboFrame(action.id, chosen, graph.nodes, frames)),
+      };
+    });
+  });
+  return result.map(control => ({
+    ...control,
+    exclusive: result.some(other => other.ownerKey === control.ownerKey
+      && !areActionsInSameComboFrame(other.action.id, control.action.id, graph.nodes, frames)),
+  }));
+}
+
+function applyStageActions(run: StageRun, graph: Graph, scene: Scene, input: StageInput, hero: Placement | undefined) {
+  if (!input.keys.size && !input.released?.size && !input.actionId) return;
+  const controls = getStageActionControls(run, graph);
+  const candidates = controls.filter((candidate, index) => {
+    if (!candidate.passed || candidate.locked) return false;
+    if (input.actionId) return candidate.id === input.actionId;
+    if (index < 4 && input.keys.has(String(index + 1))) return true;
+    const { control } = candidate.config;
+    const key = (control.input === 'custom' ? control.customKey : control.input)?.toLowerCase();
+    if (!key) return false;
+    if (control.interactionType === 'release') return input.released?.has(key);
+    if (control.interactionType === 'double-click' || control.interactionType === 'drag') {
+      return input.keys.has(control.interactionType + ':' + key);
+    }
+    return input.keys.has(key) || control.interactionType === 'hold' && input.keys.has('repeat:' + key);
+  });
+  const used = new Set<string>();
+  for (const candidate of candidates) {
+    const { action, owner, ownerKey, edge, config } = candidate;
+    const chosen = run.actionChoices[ownerKey];
+    if (used.has(action.id) || chosen && !areActionsInSameComboFrame(action.id, chosen, graph.nodes, graph.comboFrames ?? [])) continue;
+    used.add(action.id);
+    run.actionChoices[ownerKey] = action.id;
+    if (edge) {
+      evaluate(run, edge, graph, owner, []);
+      markEdge(run, edge.id);
+    }
+    const actionEvents: RuntimeEventRecord[] = [];
+    if (config.mechanic === 'jump' && run.player.grounded) {
+      const height = action.fields.relatedParameters?.find(parameter => /jump|height|跳|高/i.test(parameter.name))?.value;
+      run.player.vy = -335 * (height && height > 0 ? Math.max(.65, Math.min(1.5, height / 120)) : 1);
+      run.player.grounded = false;
+      actionEvents.push({ eventId: 'jumps', subjectAssetId: hero?.assetId, subjectRole: 'hero' });
+    } else if (config.mechanic === 'dodge') {
+      const direction = input.left || (owner && owner.x < run.player.x) ? -1 : 1;
+      run.dodge = { until: run.time + .52, velocity: direction * 190 };
+    } else if (config.mechanic === 'ability') {
+      const direction = owner && owner.x < run.player.x ? -1 : 1;
+      run.waves.push({ x: run.player.x + 20 * direction, y: run.player.y, direction, actionId: action.id, ownerId: owner?.id });
+      actionEvents.push({
+        eventId: 'fires', subjectAssetId: hero?.assetId, subjectRole: 'hero', targetAssetId: owner?.assetId,
+        targetInstanceId: owner?.id, targetRole: owner ? 'hazard' : undefined,
+      });
+    }
+    else if (config.mechanic === 'shield') run.guardUntil = run.time + .72;
+    run.actionId = action.id;
+    run.actionOwnerId = owner?.id;
+    run.actionTime = run.time;
+    const activation: StageRun['activeActions'][string] = { ownerId: owner?.id, at: run.time };
+    run.activeActions[action.id] = activation;
+    activation.resolved = follow(run, action.id, graph, owner, actionEvents);
+    if (run.sceneId !== scene.id || run.finished) return;
+  }
 }
 
 export function stepScene(run: StageRun, graph: Graph, input: StageInput, dt: number) {
   const scene = graph.scenes.find(item => item.id === run.sceneId);
   if (!scene || run.finished) return;
   run.time += dt;
+  const completing = run.pendingOutcomes.filter(item => item.until <= run.time);
+  for (const outcome of completing) {
+    run.pendingOutcomes = run.pendingOutcomes.filter(item => item !== outcome);
+    const entities = outcome.sceneId === run.sceneId ? run.entities : run.saved[outcome.sceneId];
+    const object = entities?.find(item => item.id === outcome.objectId);
+    follow(run, outcome.nodeId, graph, object, [], new Set(), { allPassing: true });
+    if (run.sceneId !== scene.id || run.finished) return;
+  }
   const overlay = graph.nodes.find(node => node.id === run.overlayId);
   if (overlay) {
     const playback = resolvePlaybackSettings(overlay);
     if (playback.mode === 'auto' && run.time - run.overlayTime >= (playback.durationSec ?? 3)) advanceOverlay(run, graph);
     return;
   }
+  const entryResult = follow(run, null, graph, undefined, []);
+  if (entryResult && (run.sceneId !== scene.id || run.overlayId || run.finished)) return;
+  for (const groupId of [...run.waitingGroups]) {
+    const group = graph.nodes.find(node => node.id === groupId);
+    if (!group || !canEnterGroup(run, graph, group)) continue;
+    run.waitingGroups = run.waitingGroups.filter(id => id !== groupId);
+    focusStageChapter(run, groupId, graph, true);
+    if (run.sceneId !== scene.id || run.overlayId) return;
+  }
+  const reactive = graph.edges.filter(edge => edge.fromId !== null && hasCondition(edge)
+    && (!edge.conditionGroup?.clauses.length || edge.conditionGroup.clauses.some(clause =>
+      clause.kind === 'property' || run.flags.includes(getSimulatedEventKey(clause)))));
+  if (reactive.length) {
+    const candidateIds = new Set(reactive.map(edge => edge.id));
+    const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+    for (const item of run.entities) {
+      if (item.kind !== 'challenge' || !item.nodeId || item.open || item.collected || !isActive(item, run)
+        || !isInUnlockedChapter(run, item.nodeId, nodeMap)) continue;
+      follow(run, item.nodeId, graph, item, [], new Set(), {
+        acceptEdge: edge => candidateIds.has(edge.id) && nodeMap.get(edge.toId)?.kind !== 'action',
+        onMatch: edge => run.flags.push(reactiveKey(edge.id, item)),
+      });
+      if (run.sceneId !== scene.id || run.overlayId || run.finished) return;
+    }
+    for (const [id, action] of Object.entries(run.activeActions)) {
+      if (action.resolved) continue;
+      const owner = run.entities.find(item => item.id === action.ownerId);
+      if (action.ownerId && (!owner || !isActive(owner, run))) continue;
+      action.resolved = follow(run, id, graph, owner, [], new Set(), { acceptEdge: edge => candidateIds.has(edge.id) });
+      if (run.sceneId !== scene.id || run.overlayId || run.finished) return;
+    }
+  }
   const player = run.player;
+  if (input.left || input.right) run.focusedObjectId = undefined;
+  const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
   const hero = scene.placements.find(item => item.id === scene.entrySpawnId);
   const events: RuntimeEventRecord[] = [];
-  const actions = graph.nodes.filter(node => node.kind === 'action' && graph.edges.some(edge =>
-    edge.toId === node.id && (edge.fromId === scene.entryGroupId || run.entities.some(item => item.nodeId === edge.fromId))));
-  for (const action of actions) {
-    const control = resolveActionControl(action);
-    const key = control.input === 'custom' ? control.customKey : control.input;
-    if (!key || !input.keys.has(key.toLowerCase())) continue;
-    const incoming = graph.edges.find(edge => {
-      if (edge.toId !== action.id) return false;
-      const owner = run.entities.find(item => !item.collected && item.nodeId === edge.fromId && isActive(item, run));
-      return (edge.fromId === scene.entryGroupId || Boolean(owner)) && evaluate(run, edge, graph, owner, []).passed;
-    });
-    if (!incoming) continue;
-    const behavior = resolveActionConfig(action).mechanic;
-    if (behavior === 'jump' && player.grounded) {
-      player.vy = -260;
-      player.grounded = false;
-      events.push({ eventId: 'jumps', subjectAssetId: hero?.assetId, subjectRole: 'hero' });
-    } else if (behavior === 'jump') continue;
-    else if (behavior === 'dodge') player.x += input.left ? -36 : 36;
-    else if (behavior === 'ability') events.push({ eventId: 'fires', subjectAssetId: hero?.assetId, subjectRole: 'hero' });
-    else if (behavior === 'shield') run.guardUntil = run.time + .65;
-    run.actionId = action.id;
-    run.actionOwnerId = run.entities.find(item => item.nodeId === incoming.fromId && !item.collected && isActive(item, run))?.id;
-    run.actionTime = run.time;
-    run.edgeId = incoming.id;
-    run.edgeTime = run.time;
-    follow(run, action.id, graph, undefined, events);
-    break;
+  if (hero?.assetId && !hero.isHidden && !run.flags.includes('appeared:' + hero.id)) {
+    run.flags.push('appeared:' + hero.id);
+    follow(run, null, graph, undefined, [{ eventId: 'appears', subjectRole: 'hero', subjectAssetId: hero.assetId }]);
+    if (run.sceneId !== scene.id || run.overlayId || run.finished) return;
   }
-  if (run.sceneId !== scene.id) return;
-  const activeActionId = run.time - run.actionTime < 2 &&
-    (!run.actionOwnerId || run.entities.some(item => item.id === run.actionOwnerId && isActive(item, run))) ? run.actionId : undefined;
+  applyStageActions(run, graph, scene, input, hero);
+  if (run.sceneId !== scene.id || run.finished) return;
+  const activeActions = Object.entries(run.activeActions).filter(([, action]) => run.time - action.at < 2
+    && (!action.ownerId || run.entities.some(item => item.id === action.ownerId && isActive(item, run))));
   const oldX = player.x;
   const bottom = player.y + player.height / 2;
-  player.x = Math.max(player.width / 2, Math.min(scene.width - player.width / 2, player.x + (Number(input.right) - Number(input.left)) * 145 * dt));
+  const velocity = run.dodge && run.dodge.until > run.time ? run.dodge.velocity : (Number(input.right) - Number(input.left)) * 145;
+  player.x = Math.max(player.width / 2, Math.min(scene.width - player.width / 2, player.x + velocity * dt));
   for (const platform of run.entities) {
     if (platform.kind !== 'platform' || platform.open || platform.isHidden || !overlaps(player, platform)) continue;
     if (bottom <= platform.y - platform.height / 2 + 1) continue;
@@ -405,12 +707,38 @@ export function stepScene(run: StageRun, graph: Graph, input: StageInput, dt: nu
     if (!wasGrounded) events.push({ eventId: 'lands', subjectAssetId: hero?.assetId, subjectRole: 'hero' });
   }
   const contacts: string[] = [];
+  for (const wave of [...run.waves]) {
+    wave.x += wave.direction * 270 * dt;
+    const target = run.entities.find(item => item.kind === 'challenge' && isActive(item, run)
+      && (!item.nodeId || isInUnlockedChapter(run, item.nodeId, nodeMap))
+      && !item.collected && !item.open && (!wave.ownerId || wave.ownerId === item.id)
+      && overlaps({ x: wave.x, y: wave.y, width: 14, height: 10 }, item));
+    if (target || wave.x < 0 || wave.x > scene.width) run.waves = run.waves.filter(item => item !== wave);
+    if (!target) continue;
+    follow(run, wave.actionId, graph, target, [{
+      eventId: 'hits', subjectAssetId: hero?.assetId, subjectRole: 'hero',
+      targetAssetId: target.assetId, targetInstanceId: target.id, targetRole: 'hazard',
+    }], new Set(), { acceptEdge: hasCondition });
+    if (run.sceneId !== scene.id || run.finished) return;
+  }
   for (const item of run.entities) {
     if (item.open || item.collected || !isActive(item, run) || !['zone', 'challenge', 'checkpoint'].includes(item.kind)) continue;
-    const card = graph.nodes.find(node => node.id === item.nodeId && node.kind === 'challenge');
+    const source = item.nodeId ? nodeMap.get(item.nodeId) : undefined;
+    const card = source?.kind === 'challenge' ? source : undefined;
+    const enabled = !card || isInUnlockedChapter(run, card.id, nodeMap);
     const behavior = card && cardPreviewBehavior(card);
+    if (card && enabled && !behavior?.isSceneOnly && !run.flags.includes('appeared:' + item.id)) {
+      run.flags.push('appeared:' + item.id);
+      const appearance: RuntimeEventRecord[] = [{
+        eventId: 'appears', subjectRole: 'hazard', subjectAssetId: item.assetId, subjectInstanceId: item.id,
+      }];
+      follow(run, card.id, graph, item, appearance, new Set(), { acceptEdge: hasCondition });
+      if (run.sceneId !== scene.id || run.overlayId || run.finished) return;
+      follow(run, null, graph, item, appearance);
+      if (run.sceneId !== scene.id || run.overlayId || run.finished) return;
+    }
     const activated = run.activationTimes[item.id] ?? run.entryTime;
-    if (card) {
+    if (card && enabled) {
       const limit = cardPreviewTimeLimit(card, graph.edges);
       const expired = 'expired:' + item.id;
       if (limit !== null && run.time - activated >= limit && !run.flags.includes(expired)) {
@@ -426,12 +754,15 @@ export function stepScene(run: StageRun, graph: Graph, input: StageInput, dt: nu
       const age = Math.max(0, run.time - activated);
       Object.assign(item, challengeMotion(anchor, behavior, challengeSpeed(item, card, behavior), scene, age));
     }
+    if (!enabled) continue;
     if (!overlaps(player, item)) {
       if (item.kind === 'challenge' && oldX !== player.x && (oldX < item.x && player.x >= item.x || oldX > item.x && player.x <= item.x)) {
         const crossing: RuntimeEventRecord[] = ['passes', 'avoids'].map(eventId => ({
           eventId, subjectAssetId: hero?.assetId, subjectRole: 'hero', targetAssetId: item.assetId, targetInstanceId: item.id, targetRole: 'hazard',
         }));
-        if (activeActionId) follow(run, activeActionId, graph, item, crossing);
+        for (const [actionId, action] of activeActions) {
+          if (!action.ownerId || action.ownerId === item.id) follow(run, actionId, graph, item, crossing, new Set(), { acceptEdge: hasCondition });
+        }
         if (run.sceneId !== scene.id || run.finished) return;
         if (item.nodeId) follow(run, item.nodeId, graph, item, crossing);
         if (run.sceneId !== scene.id || run.finished) return;
@@ -455,6 +786,12 @@ export function stepScene(run: StageRun, graph: Graph, input: StageInput, dt: nu
     if (behavior?.pattern === 'collectible') {
       contact.push({ eventId: 'is_collected', subjectAssetId: item.assetId, subjectInstanceId: item.id, subjectRole: 'hazard', targetAssetId: hero?.assetId, targetRole: 'hero' });
     }
+    if (contact.some(event => event.eventId === 'blocks')) {
+      for (const [actionId, action] of activeActions) {
+        if (!action.ownerId || action.ownerId === item.id) follow(run, actionId, graph, item, contact, new Set(), { acceptEdge: hasCondition });
+      }
+      if (run.sceneId !== scene.id || run.finished) return;
+    }
     const handled = item.nodeId ? follow(run, item.nodeId, graph, item, contact) : false;
     if (handled && contact.some(event => event.eventId === 'is_collected')) {
       item.collected = true;
@@ -467,15 +804,19 @@ export function stepScene(run: StageRun, graph: Graph, input: StageInput, dt: nu
     if (run.sceneId !== scene.id) return;
   }
   run.contacts = contacts;
-  if (activeActionId && events.length) follow(run, activeActionId, graph, undefined, events);
+  if (activeActions.length && events.length) for (const [actionId, action] of activeActions) {
+    follow(run, actionId, graph, run.entities.find(item => item.id === action.ownerId), events, new Set(), { acceptEdge: hasCondition });
+  }
   checkSceneExit(run, scene, graph);
   if (run.hp <= 0) run.finished = 'defeat';
 }
 
 export function sceneCamera(scene: Scene, run: StageRun) {
-  return run.lockedCameraX ?? cameraX(scene.width, run.player.x);
+  const focused = run.entities.find(item => item.id === run.focusedObjectId && !item.collected && isActive(item, run));
+  return run.lockedCameraX ?? cameraX(scene.width, focused?.x ?? run.player.x);
 }
 
 export function isActive(item: Placement, run: StageRun): boolean {
-  return !item.isHidden && (!item.activationId || run.flags.includes('active:' + item.id));
+  const waits = item.activationId || item.nodeId && run.guardedChallenges.has(item.nodeId);
+  return !item.isHidden && (!waits || run.flags.includes('active:' + item.id));
 }

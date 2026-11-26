@@ -70,7 +70,10 @@ export interface AssetSubFolder {
   isAiCreated?: boolean;
 }
 
+export interface DisplayBinding { variableId:string; style:'bar'|'text'; max:number; x:number; y:number; color:string; }
+
 export interface AssetItem {
+  displayBinding?: DisplayBinding;
   id: string;
   categoryId: AssetCategoryId;
   folderId: string | null; // null = directly under fixed category root
@@ -589,15 +592,15 @@ export function createAssetStateSlot(
   categoryId: AssetCategoryId,
   seedOffset = 0,
 ): AssetStateSlot {
-  const candidates = generateAssetCandidates(prompt, categoryId, 3, seedOffset);
+  const candidates: AssetCandidate[] = [];
   return {
     id: `state-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
     name,
     prompt,
-    mediaKind: 'generated',
-    mediaUrl: candidates[0].previewUrl,
+    mediaKind: 'image',
+    mediaUrl: '',
     candidates,
-    selectedCandidateId: candidates[0].id,
+    selectedCandidateId: null,
     audioPrompt: '',
     audioCandidates: [],
     selectedAudioCandidateId: null,

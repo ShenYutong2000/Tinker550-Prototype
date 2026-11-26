@@ -1,3 +1,5 @@
+import {saveProject,exportProject,type ProjectData} from './projectStore';
+import {createStarterAsset} from './asset-library/starterAssets';
 import {
   useCallback,
   useEffect,
@@ -24,6 +26,10 @@ import {
   type StateVariableValue,
 } from './properties/stateModel';
 import {
+  COMBO_FRAME_DEFAULT_HEIGHT,
+  COMBO_FRAME_DEFAULT_WIDTH,
+  COMBO_FRAME_MIN_HEIGHT,
+  COMBO_FRAME_MIN_WIDTH,
   GROUP_DEFAULT_HEIGHT,
   GROUP_DEFAULT_WIDTH,
   GROUP_MIN_HEIGHT,
@@ -31,25 +37,33 @@ import {
   INITIAL_EDGES,
   INITIAL_NODES,
   NODE_CATALOG,
+  cloneGroupSubtree,
   composeNoteFromPromptInput,
   createDefaultPromptInput,
+  detachGroupInstance,
+  findOwningSharedGroupId,
   formatBehaviorSummary,
   formatOutcomeRuleSummary,
   getAncestorGroupIds,
   getDefaultKeyForMechanic,
   getDescendantNodeIds,
+  getGroupDefId,
   getNextGroupCode,
   getNodeAssetIds,
   getNodeDepth,
   getNodeDimensions,
   inferCardFieldsFromText,
+  inferDefaultEdgeType,
   isDescendantOf,
   mergeAutoFields,
+  propagateGroupDefinitionFrom,
   type ActionMechanic,
+  type BoardComboFrame,
   type BoardEdge,
   type BoardNode,
   type CardFieldConfig,
   type ChallengeBehaviorConfig,
+  type EdgeType,
   type NodeKind,
   type OnboardingChecklist,
   type OutcomePropertyRule,
@@ -65,8 +79,10 @@ import { AssetsPanel, type AiPlacedNotice } from './asset-library/AssetsPanel';
 import { DesignBoard } from './design-board/DesignBoard';
 import { FloatingGuidance } from './guidance/FloatingGuidance';
 import { StageEditor } from './playtest/StageEditor';
+import { createScene, type Scene } from './playtest/stageProject';
 
 interface StudioWorkspaceProps {
+  initialProject: ProjectData;
   lang: Language;
   onChangeLang: (lang: Language) => void;
   onGoHome: () => void;
@@ -80,7 +96,14 @@ const MAX_LEFT_WIDTH = 380;
 const DEFAULT_RIGHT_WIDTH = 360;
 const MIN_RIGHT_WIDTH = 276;
 
+function sharedGroupForEdge(edge: BoardEdge, nodes: BoardNode[]) {
+  const owner = findOwningSharedGroupId(edge.toId, nodes);
+  if (!owner || owner === edge.toId) return null;
+  return edge.fromId === null || edge.fromId !== owner && findOwningSharedGroupId(edge.fromId, nodes) === owner ? owner : null;
+}
+
 export function StudioWorkspace({
+  initialProject,
   lang,
   onChangeLang,
   onGoHome,
@@ -90,8 +113,8 @@ export function StudioWorkspace({
   const workspaceRef = useRef<HTMLDivElement | null>(null);
 
   const [logoError, setLogoError] = useState(false);
-  const [projectName, setProjectName] = useState<string>(t.defaultProject);
-  const [hasRenamedProject, setHasRenamedProject] = useState(false);
+  const [projectName, setProjectName] = useState<string>(initialProject.name);
+  const [hasRenamedProject, setHasRenamedProject] = useState(true);
 
   useEffect(() => {
     if (!hasRenamedProject) {
@@ -100,6 +123,9 @@ export function StudioWorkspace({
   }, [lang, hasRenamedProject]);
 
   // Collapsible & drag-resizable Left (Assets) and Right (Play) columns
+  const [placementCounts, setPlacementCounts] = useState<Record<string, number>>({});
+  const [stageFocus, setStageFocus] = useState<{ nodeId: string; nonce: number } | null>(null);
+  const [stageAssetPick, setStageAssetPick] = useState<'picking' | { assetId: string } | null>(null);
   const [leftOpen, setLeftOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1024 : true,
   );
@@ -109,8 +135,6 @@ export function StudioWorkspace({
     typeof window !== 'undefined' ? window.innerWidth >= 768 : true,
   );
   const [rightWidth, setRightWidth] = useState(DEFAULT_RIGHT_WIDTH);
-  const [placementCounts, setPlacementCounts] = useState<Record<string, number>>({});
-  const [stageFocus, setStageFocus] = useState<{ nodeId: string; nonce: number } | null>(null);
   const [activeSplitter, setActiveSplitter] = useState<'left' | 'right' | null>(null);
 
   // Asset Library State
@@ -121,16 +145,15 @@ export function StudioWorkspace({
     initialLibraryRef.current = createInitialAssetLibrary(lang);
   }
   const [assetFolders, setAssetFolders] = useState<AssetSubFolder[]>(
-    () => initialLibraryRef.current!.folders,
+    () => initialProject.folders,
   );
   const [assetItems, setAssetItems] = useState<AssetItem[]>(
-    () => initialLibraryRef.current!.items,
+    () => initialProject.assets,
   );
   const [unlockedCategories] = useState<Record<AssetCategoryId, boolean>>(
     () => initialLibraryRef.current!.unlockedCategories,
   );
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
-  const [stageAssetPick, setStageAssetPick] = useState<'picking' | { assetId: string } | null>(null);
   const [assetEditorTab, setAssetEditorTab] = useState<'looks' | 'properties'>('looks');
   const [highlightPropertyId, setHighlightPropertyId] = useState<string | null>(null);
   const [aiNotice, setAiNotice] = useState<AiPlacedNotice | null>(null);
@@ -159,8 +182,9 @@ export function StudioWorkspace({
   );
 
   // Unified Global State Variables & Live Play Mode Sandbox Override Map
-  const [globalVariables, setGlobalVariables] = useState<StateVariable[]>([]);
+  const [globalVariables, setGlobalVariables] = useState<StateVariable[]>(initialProject.variables);
   const [playValues, setPlayValues] = useState<Record<string, StateVariableValue>>({});
+  const [playValueEdit, setPlayValueEdit] = useState<{ variableId?: string; value?: StateVariableValue }>();
   const [stateManagerOpen, setStateManagerOpen] = useState(false);
   const [boardFocusTarget, setBoardFocusTarget] = useState<{
     nodeId?: string;
@@ -174,8 +198,71 @@ export function StudioWorkspace({
   );
 
   // Design Board State — starts completely blank (from 0)
-  const [nodes, setNodes] = useState<BoardNode[]>(() => [...INITIAL_NODES]);
-  const [edges, setEdges] = useState<BoardEdge[]>(() => [...INITIAL_EDGES]);
+  const [nodes, setNodes] = useState<BoardNode[]>(() => initialProject.nodes);
+  const [edges, setEdges] = useState<BoardEdge[]>(() => initialProject.edges);
+  const [comboFrames, setComboFrames] = useState<BoardComboFrame[]>(initialProject.comboFrames);
+  const [sceneDrafts, setSceneDrafts] = useState<Scene[]>(() => initialProject.scenes?.length ? initialProject.scenes : [createScene(lang === 'zh' ? '第一关' : 'Level 1', lang === 'zh' ? '玩家出生点' : 'Player spawn')]);
+  const [saveStatus, setSaveStatus] = useState('');
+  const [undoBoard, setUndoBoard] = useState<{nodes:BoardNode[];edges:BoardEdge[]} | null>(null);
+  const projectSnapshot = useMemo<ProjectData>(() => ({version:1,id:initialProject.id,name:projectName,updatedAt:Date.now(),nodes,edges,comboFrames,scenes:sceneDrafts,assets:assetItems,folders:assetFolders,variables:globalVariables}),[initialProject.id,projectName,nodes,edges,comboFrames,sceneDrafts,assetItems,assetFolders,globalVariables]);
+  const latestSnapshot = useRef(projectSnapshot); latestSnapshot.current = projectSnapshot;
+  const saveRevision = useRef(0);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const persistProject = useCallback(async () => {
+    const revision = ++saveRevision.current;
+    setSaveStatus(lang === 'zh' ? '保存中…' : 'Saving…');
+    const write = saveQueue.current.then(() => saveProject(latestSnapshot.current));
+    saveQueue.current = write.catch(() => {});
+    try {
+      await write;
+      if (revision === saveRevision.current) setSaveStatus(lang === 'zh' ? '已保存到此浏览器' : 'Saved in this browser');
+      return true;
+    } catch {
+      if (revision === saveRevision.current) setSaveStatus(lang === 'zh' ? '保存失败，请导出备份' : 'Save failed — export a backup');
+      return false;
+    }
+  },[lang]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void persistProject(), 200);
+    return () => window.clearTimeout(timer);
+  }, [projectSnapshot, persistProject]);
+  const saveBeforeLeaving = async (leave: () => void) => {
+    if (await persistProject()) leave();
+  };
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
+
+  const commitBoardState = useCallback(
+    (
+      nextNodes: BoardNode[],
+      nextEdges: BoardEdge[],
+      syncSourceNodeId?: string | null,
+    ) => {
+      setUndoBoard(null);
+      let finalNodes = nextNodes;
+      let finalEdges = nextEdges;
+      if (syncSourceNodeId) {
+        const ownerGroupId = findOwningSharedGroupId(syncSourceNodeId, finalNodes);
+        if (ownerGroupId) {
+          const synced = propagateGroupDefinitionFrom(
+            ownerGroupId,
+            finalNodes,
+            finalEdges,
+          );
+          finalNodes = synced.nodes;
+          finalEdges = synced.edges;
+        }
+      }
+      nodesRef.current = finalNodes;
+      edgesRef.current = finalEdges;
+      setNodes(finalNodes);
+      setEdges(finalEdges);
+    },
+    [],
+  );
+
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [autoFocusNodeId, setAutoFocusNodeId] = useState<string | null>(null);
 
@@ -198,21 +285,25 @@ export function StudioWorkspace({
   }, [nodes, edges]);
 
   // Two-stage Spotlight Onboarding + Built-in Floating Guidance Checklist
-  const [spotlightStage, setSpotlightStage] = useState<SpotlightStage>('focus-build');
+  const [spotlightStage, setSpotlightStage] = useState<SpotlightStage>(initialProject.nodes.length?'free':'focus-build');
   const [checklist, setChecklist] = useState<OnboardingChecklist>({
-    addedFirstCard: false,
-    connectedCards: false,
+    addedFirstCard: initialProject.nodes.length>0,
+    connectedCards: initialProject.edges.length>0,
     testedInPlay: false,
   });
 
   // Live Play -> Design Board synchronized highlighting
   const [activePlayNodeIds, setActivePlayNodeIds] = useState<string[]>([]);
   const [activePlayEdgeId, setActivePlayEdgeId] = useState<string | null>(null);
+  const [activePlayEdgeIds, setActivePlayEdgeIds] = useState<string[]>([]);
 
   const handleActivePlayChange = useCallback(
-    (nodeIds: string[], edgeId: string | null) => {
-      setActivePlayNodeIds(previous => previous.length === nodeIds.length && previous.every((id, index) => id === nodeIds[index]) ? previous : nodeIds);
+    (nodeIds: string[], edgeId: string | null, edgeIds?: string[]) => {
+      setActivePlayNodeIds(nodeIds);
       setActivePlayEdgeId(edgeId);
+      setActivePlayEdgeIds(
+        edgeIds && edgeIds.length > 0 ? edgeIds : edgeId ? [edgeId] : [],
+      );
     },
     [],
   );
@@ -495,6 +586,7 @@ export function StudioWorkspace({
   const handleUpdatePlayValue = useCallback(
     (variableId: string, value: StateVariableValue) => {
       setPlayValues((prev) => ({ ...prev, [variableId]: value }));
+      setPlayValueEdit({ variableId, value });
     },
     [],
   );
@@ -516,6 +608,7 @@ export function StudioWorkspace({
   );
 
   const handleResetPlayValue = useCallback((variableId: string) => {
+    setPlayValueEdit({ variableId });
     setPlayValues((prev) => {
       if (!(variableId in prev)) return prev;
       const next = { ...prev };
@@ -525,6 +618,7 @@ export function StudioWorkspace({
   }, []);
 
   const handleResetAllPlayValues = useCallback(() => {
+    setPlayValueEdit({});
     setPlayValues({});
   }, []);
 
@@ -596,106 +690,163 @@ export function StudioWorkspace({
 
   // Design Board Handlers — every newly added card starts truly blank & ready to type
   const addNodeAt = useCallback(
-    (kind: NodeKind, x: number, y: number, explicitParentId?: string | null) => {
+    (kind: NodeKind, x: number, y: number, explicitParentId?: string | null, outcomeMode: 'property'|'visual' = 'property') => {
       const meta = NODE_CATALOG[kind];
       const id = `n-${kind}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
-      setNodes((prev) => {
-        const nodeMap = new Map(prev.map((n) => [n.id, n]));
-        const tempNode: BoardNode = {
-          id,
-          kind,
-          parentId: null,
-          title: '',
-          note: '',
-          assetIds: [],
-          promptInput: createDefaultPromptInput(kind),
-          fields: {},
-          manualFields: [],
-          x,
-          y,
-          ...(kind === 'group'
-            ? {
-                width: GROUP_DEFAULT_WIDTH,
-                height: GROUP_DEFAULT_HEIGHT,
-                collapsed: false,
-              }
-            : {}),
-        };
-        const dim = getNodeDimensions(tempNode);
-        const cx = x + dim.width / 2;
-        const cy = y + dim.height / 2;
+      const prev = nodesRef.current;
+      const nodeMap = new Map(prev.map((n) => [n.id, n]));
+      const tempNode: BoardNode = {
+        id,
+        kind,
+        parentId: null,
+        title: '',
+        note: '',
+        assetId: undefined,
+        assetIds: [],
+        promptInput: kind === 'outcome' ? {...createDefaultPromptInput(kind)!,outcomeMode} : createDefaultPromptInput(kind),
+        fields: {},
+        manualFields: [],
+        x,
+        y,
+        ...(kind === 'group'
+          ? {
+              width: GROUP_DEFAULT_WIDTH,
+              height: GROUP_DEFAULT_HEIGHT,
+              collapsed: false,
+            }
+          : {}),
+      };
+      const dim = getNodeDimensions(tempNode);
+      const cx = x + dim.width / 2;
+      const cy = y + dim.height / 2;
 
-        let resolvedParentId: string | null = explicitParentId ?? null;
-        if (explicitParentId === undefined) {
-          let bestDepth = -1;
-          let bestArea = Infinity;
-          for (const g of prev) {
-            if (g.kind !== 'group' || g.collapsed) continue;
-            const gDim = getNodeDimensions(g);
-            if (
-              cx >= g.x &&
-              cx <= g.x + gDim.width &&
-              cy >= g.y &&
-              cy <= g.y + gDim.height
-            ) {
-              const depth = getNodeDepth(g.id, nodeMap);
-              const area = gDim.width * gDim.height;
-              if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
-                bestDepth = depth;
-                bestArea = area;
-                resolvedParentId = g.id;
-              }
+      let resolvedParentId: string | null = explicitParentId ?? null;
+      if (explicitParentId === undefined) {
+        let bestDepth = -1;
+        let bestArea = Infinity;
+        for (const g of prev) {
+          if (g.kind !== 'group' || g.collapsed) continue;
+          const gDim = getNodeDimensions(g);
+          if (
+            cx >= g.x &&
+            cx <= g.x + gDim.width &&
+            cy >= g.y &&
+            cy <= g.y + gDim.height
+          ) {
+            const depth = getNodeDepth(g.id, nodeMap);
+            const area = gDim.width * gDim.height;
+            if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
+              bestDepth = depth;
+              bestArea = area;
+              resolvedParentId = g.id;
             }
           }
         }
+      }
 
-        const nextGroupCode = kind === 'group' ? getNextGroupCode(prev) : undefined;
-        const groupNumSuffix = nextGroupCode ? nextGroupCode.slice(1) : '';
-        const defaultGroupTitle =
-          kind === 'group'
-            ? lang === 'zh'
-              ? `机制组 ${groupNumSuffix}`
-              : `Group ${groupNumSuffix}`
-            : '';
+      const nextGroupCode = kind === 'group' ? getNextGroupCode(prev) : undefined;
+      const groupNumSuffix = nextGroupCode ? nextGroupCode.slice(1) : '';
+      const defaultGroupTitle =
+        kind === 'group'
+          ? lang === 'zh'
+            ? `机制组 ${groupNumSuffix}`
+            : `Group ${groupNumSuffix}`
+          : '';
 
-        const newNode: BoardNode = {
-          ...tempNode,
-          parentId: resolvedParentId,
-          title: defaultGroupTitle,
-          ...(nextGroupCode ? { groupCode: nextGroupCode } : {}),
-        };
-        return [...prev, newNode];
-      });
+      const newNode: BoardNode = {
+        ...tempNode,
+        parentId: resolvedParentId,
+        title: defaultGroupTitle,
+        ...(nextGroupCode ? { groupCode: nextGroupCode, groupDefId: id } : {}),
+      };
+      commitBoardState([...prev, newNode], edgesRef.current, resolvedParentId);
       setSelectedNodeId(id);
       setAutoFocusNodeId(id);
       if (meta.isPlayable) {
         markCardAdded();
       }
-      return id;
     },
-    [lang, markCardAdded],
+    [commitBoardState, lang, markCardAdded],
   );
 
-  const handleDragNode = useCallback((id: string, dx: number, dy: number) => {
-    setNodes((prev) => {
-      const target = prev.find((n) => n.id === id);
-      if (!target) return prev;
-      const moveIds = new Set<string>([id]);
-      if (target.kind === 'group') {
-        for (const descId of getDescendantNodeIds(id, prev)) {
-          moveIds.add(descId);
-        }
-      }
-      return prev.map((n) =>
-        moveIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n,
+  const handleAddComboFrame = useCallback(
+    (x: number, y: number, width = COMBO_FRAME_DEFAULT_WIDTH, height = COMBO_FRAME_DEFAULT_HEIGHT) => {
+      const id = `combo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+      setComboFrames((prev) => [
+        ...prev,
+        {
+          id,
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.max(COMBO_FRAME_MIN_WIDTH, Math.round(width)),
+          height: Math.max(COMBO_FRAME_MIN_HEIGHT, Math.round(height)),
+        },
+      ]);
+      return id;
+    },
+    [],
+  );
+
+  const handleUpdateComboFrame = useCallback(
+    (id: string, patch: Partial<BoardComboFrame>) => {
+      setComboFrames((prev) =>
+        prev.map((frame) => {
+          if (frame.id !== id) return frame;
+          return {
+            ...frame,
+            ...patch,
+            width: Math.max(COMBO_FRAME_MIN_WIDTH, Math.round(patch.width ?? frame.width)),
+            height: Math.max(COMBO_FRAME_MIN_HEIGHT, Math.round(patch.height ?? frame.height)),
+          };
+        }),
       );
-    });
+    },
+    [],
+  );
+
+  const handleDeleteComboFrame = useCallback((id: string) => {
+    setComboFrames((prev) => prev.filter((frame) => frame.id !== id));
   }, []);
 
-  const handleCommitNodeDrop = useCallback((id: string) => {
-    setNodes((prev) => {
+  const handleDragNode = useCallback((id: string, dx: number, dy: number) => {
+    const prevNodes = nodesRef.current;
+    const target = prevNodes.find((n) => n.id === id);
+    if (!target) return;
+    const moveIds = new Set<string>([id]);
+    if (target.kind === 'group') {
+      for (const descId of getDescendantNodeIds(id, prevNodes)) {
+        moveIds.add(descId);
+      }
+      const gDim = getNodeDimensions(target);
+      setComboFrames((prevFrames) =>
+        prevFrames.map((frame) => {
+          const fcx = frame.x + frame.width / 2;
+          const fcy = frame.y + frame.height / 2;
+          if (
+            fcx >= target.x &&
+            fcx <= target.x + gDim.width &&
+            fcy >= target.y &&
+            fcy <= target.y + gDim.height
+          ) {
+            return { ...frame, x: frame.x + dx, y: frame.y + dy };
+          }
+          return frame;
+        }),
+      );
+    }
+    setNodes((prev) =>
+      prev.map((n) =>
+        moveIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n,
+      ),
+    );
+  }, []);
+
+  const handleCommitNodeDrop = useCallback(
+    (id: string) => {
+      const prev = nodesRef.current;
       const dragged = prev.find((n) => n.id === id);
-      if (!dragged) return prev;
+      if (!dragged) return;
+      const prevOwnerGroupId = findOwningSharedGroupId(id, prev);
       const nodeMap = new Map(prev.map((n) => [n.id, n]));
       const dim = getNodeDimensions(dragged);
       const cx = dragged.x + dim.width / 2;
@@ -731,30 +882,65 @@ export function StudioWorkspace({
         }
       }
 
+      let nextNodes = prev;
       if (bestGroupId) {
         const targetGroup = prev.find((n) => n.id === bestGroupId);
         if (targetGroup) {
           const gDim = getNodeDimensions(targetGroup);
-          const neededW = Math.max(gDim.width, Math.round(dragged.x + dim.width + 20 - targetGroup.x));
-          const neededH = Math.max(gDim.height, Math.round(dragged.y + dim.height + 20 - targetGroup.y));
+          const neededW = Math.max(
+            gDim.width,
+            Math.round(dragged.x + dim.width + 20 - targetGroup.x),
+          );
+          const neededH = Math.max(
+            gDim.height,
+            Math.round(dragged.y + dim.height + 20 - targetGroup.y),
+          );
           const groupNeedsExpand = neededW > gDim.width || neededH > gDim.height;
-          if (dragged.parentId === bestGroupId && !groupNeedsExpand) return prev;
-          return prev.map((n) => {
-            if (n.id === dragged.id) return { ...n, parentId: bestGroupId };
-            if (n.id === bestGroupId && groupNeedsExpand) {
-              return { ...n, width: neededW, height: neededH };
-            }
-            return n;
-          });
+          if (dragged.parentId !== bestGroupId || groupNeedsExpand) {
+            nextNodes = prev.map((n) => {
+              if (n.id === dragged.id) return { ...n, parentId: bestGroupId };
+              if (n.id === bestGroupId && groupNeedsExpand) {
+                return { ...n, width: neededW, height: neededH };
+              }
+              return n;
+            });
+          }
         }
+      } else if (dragged.parentId !== null) {
+        nextNodes = prev.map((n) =>
+          n.id === dragged.id ? { ...n, parentId: null } : n,
+        );
       }
 
-      if (dragged.parentId === bestGroupId) return prev;
-      return prev.map((n) =>
-        n.id === dragged.id ? { ...n, parentId: bestGroupId } : n,
-      );
-    });
-  }, []);
+      const nextOwnerGroupId = findOwningSharedGroupId(id, nextNodes);
+      let workingNodes = nextNodes;
+      let workingEdges = edgesRef.current;
+
+      if (prevOwnerGroupId && prevOwnerGroupId !== id && prevOwnerGroupId !== nextOwnerGroupId) {
+        const syncedPrev = propagateGroupDefinitionFrom(
+          prevOwnerGroupId,
+          workingNodes,
+          workingEdges,
+        );
+        workingNodes = syncedPrev.nodes;
+        workingEdges = syncedPrev.edges;
+      }
+      if (nextOwnerGroupId && nextOwnerGroupId !== id) {
+        const syncedNext = propagateGroupDefinitionFrom(
+          nextOwnerGroupId,
+          workingNodes,
+          workingEdges,
+        );
+        workingNodes = syncedNext.nodes;
+        workingEdges = syncedNext.edges;
+      }
+
+      if (workingNodes !== prev || workingEdges !== edgesRef.current) {
+        commitBoardState(workingNodes, workingEdges);
+      }
+    },
+    [commitBoardState],
+  );
 
   const handleResizeGroup = useCallback(
     (
@@ -780,12 +966,13 @@ export function StudioWorkspace({
     [],
   );
 
-  const handleCommitGroupResize = useCallback((groupId: string) => {
-    setNodes((prev) => {
+  const handleCommitGroupResize = useCallback(
+    (groupId: string) => {
+      const prev = nodesRef.current;
       const grp = prev.find(
         (n) => n.id === groupId && n.kind === 'group' && !n.collapsed,
       );
-      if (!grp) return prev;
+      if (!grp) return;
       const nodeMap = new Map(prev.map((n) => [n.id, n]));
       const gDim = getNodeDimensions(grp);
       const gx1 = grp.x;
@@ -813,9 +1000,12 @@ export function StudioWorkspace({
         }
         return n;
       });
-      return changed ? next : prev;
-    });
-  }, []);
+      if (changed) {
+        commitBoardState(next, edgesRef.current, groupId);
+      }
+    },
+    [commitBoardState],
+  );
 
   const handleToggleGroupCollapse = useCallback((id: string) => {
     setNodes((prev) =>
@@ -826,137 +1016,113 @@ export function StudioWorkspace({
   }, []);
 
   const handleDuplicateNode = useCallback(
+    (id: string, mode: 'duplicate' | 'reuse' = 'duplicate') => {
+      const res = cloneGroupSubtree(id, mode, nodesRef.current, edgesRef.current, lang);
+      commitBoardState(res.nodes, res.edges);
+      if (res.createdRootId) {
+        setSelectedNodeId(res.createdRootId);
+      }
+    },
+    [commitBoardState, lang],
+  );
+
+  const handleDetachGroupInstance = useCallback(
     (id: string) => {
-      const root = nodes.find((n) => n.id === id);
-      if (!root) return null;
+      const nextNodes = detachGroupInstance(id, nodesRef.current);
+      commitBoardState(nextNodes, edgesRef.current);
+      setSelectedNodeId(id);
+    },
+    [commitBoardState],
+  );
 
-      const subtreeIds =
-        root.kind === 'group'
-          ? [root.id, ...getDescendantNodeIds(root.id, nodes)]
-          : [root.id];
-      const subtreeSet = new Set(subtreeIds);
-      const idMap = new Map<string, string>();
-      const ts = Date.now().toString(36);
+  const handleRemoveReusedPlacement = useCallback(
+    (id: string) => {
+      const prevNodes = nodesRef.current;
+      const target = prevNodes.find((n) => n.id === id && n.kind === 'group');
+      if (!target) return;
+      const removeSet = new Set<string>([id, ...getDescendantNodeIds(id, prevNodes)]);
+      const nextNodes = prevNodes.filter((n) => !removeSet.has(n.id));
+      const nextEdges = edgesRef.current.filter(
+        (e) =>
+          !removeSet.has(e.toId) &&
+          (e.fromId === null || !removeSet.has(e.fromId)),
+      );
+      commitBoardState(nextNodes, nextEdges);
+      setSelectedNodeId((prev) => (prev && removeSet.has(prev) ? null : prev));
+    },
+    [commitBoardState],
+  );
 
-      for (const origId of subtreeIds) {
-        const orig = nodes.find((n) => n.id === origId);
-        if (!orig) continue;
-        const rand = Math.random().toString(36).slice(2, 6);
-        idMap.set(origId, `n-${orig.kind}-${ts}-${rand}`);
-      }
+  const handleUngroupDefinition = useCallback(
+    (defId: string) => {
+      const prevNodes = nodesRef.current;
+      const matchingGroups = prevNodes.filter(
+        (n) => n.kind === 'group' && getGroupDefId(n) === defId,
+      );
+      if (matchingGroups.length === 0) return;
 
-      const clonedRootId = idMap.get(root.id) ?? null;
-      const clones: BoardNode[] = [];
-      for (const origId of subtreeIds) {
-        const orig = nodes.find((n) => n.id === origId);
-        const nextId = idMap.get(origId);
-        if (!orig || !nextId) continue;
-        const nextParentId =
-          origId === root.id
-            ? orig.parentId
-            : orig.parentId && idMap.has(orig.parentId)
-              ? idMap.get(orig.parentId)!
-              : orig.parentId;
-        const clonedGroupCode =
-          orig.kind === 'group' ? getNextGroupCode([...nodes, ...clones]) : orig.groupCode;
-        clones.push({
-          ...orig,
-          id: nextId,
-          parentId: nextParentId,
-          ...(orig.kind === 'group' ? { groupCode: clonedGroupCode } : {}),
-          title:
-            origId === root.id && orig.kind === 'group' && orig.title.trim()
-              ? `${orig.title.trim()} (${lang === 'zh' ? '副本' : 'Copy'})`
-              : orig.title,
-          assetIds: orig.assetIds ? [...orig.assetIds] : undefined,
-          promptInput: orig.promptInput ? { ...orig.promptInput } : undefined,
-          fields: {
-            ...orig.fields,
-            relatedParameters: orig.fields.relatedParameters
-              ? orig.fields.relatedParameters.map((p) => ({ ...p }))
-              : undefined,
-            relatedProperties: orig.fields.relatedProperties
-              ? orig.fields.relatedProperties.map((r) => ({ ...r }))
-              : undefined,
-          },
-          manualFields: [...orig.manualFields],
-          availableWhenGroup: orig.availableWhenGroup
-            ? {
-                combinator: orig.availableWhenGroup.combinator,
-                clauses: orig.availableWhenGroup.clauses.map((c) => ({ ...c })),
-              }
-            : undefined,
-          x: orig.x + 48,
-          y: orig.y + 48,
+      const groupById = new Map(matchingGroups.map((g) => [g.id, g]));
+      const removedGroupIds = new Set(matchingGroups.map((g) => g.id));
+
+      const nextNodes = prevNodes
+        .filter((n) => !removedGroupIds.has(n.id))
+        .map((n) => {
+          const parentGrp = n.parentId ? groupById.get(n.parentId) : undefined;
+          if (!parentGrp) return { ...n, syncKey: undefined };
+          return {
+            ...n,
+            parentId: parentGrp.parentId ?? null,
+            syncKey: undefined,
+          };
         });
-      }
 
-      const internalClonedEdges: BoardEdge[] = [];
-      for (const e of edges) {
-        if (e.fromId === null && subtreeSet.has(e.toId)) {
-          const rand = Math.random().toString(36).slice(2, 6);
-          internalClonedEdges.push({
-            ...e,
-            id: `e-${ts}-${rand}`,
-            fromId: null,
-            toId: idMap.get(e.toId)!,
-            entryOffset: e.entryOffset ? { ...e.entryOffset } : undefined,
-            conditionGroup: e.conditionGroup
-              ? {
-                  combinator: e.conditionGroup.combinator,
-                  clauses: e.conditionGroup.clauses.map((c) => ({ ...c })),
-                }
-              : undefined,
-          });
-        } else if (e.fromId && subtreeSet.has(e.fromId) && subtreeSet.has(e.toId)) {
-          const rand = Math.random().toString(36).slice(2, 6);
-          internalClonedEdges.push({
-            ...e,
-            id: `e-${ts}-${rand}`,
-            fromId: idMap.get(e.fromId)!,
-            toId: idMap.get(e.toId)!,
-            conditionGroup: e.conditionGroup
-              ? {
-                  combinator: e.conditionGroup.combinator,
-                  clauses: e.conditionGroup.clauses.map((c) => ({ ...c })),
-                }
-              : undefined,
-          });
+      const nextEdges = edgesRef.current.filter(
+        (e) =>
+          !removedGroupIds.has(e.toId) &&
+          (e.fromId === null || !removedGroupIds.has(e.fromId)),
+      );
+      commitBoardState(nextNodes, nextEdges);
+      setSelectedNodeId((prev) => (prev && removedGroupIds.has(prev) ? null : prev));
+    },
+    [commitBoardState],
+  );
+
+  const handleDeleteGroupDefinition = useCallback(
+    (defId: string) => {
+      const prevNodes = nodesRef.current;
+      const matchingGroups = prevNodes.filter(
+        (n) => n.kind === 'group' && getGroupDefId(n) === defId,
+      );
+      if (matchingGroups.length === 0) return;
+
+      const removeSet = new Set<string>();
+      for (const grp of matchingGroups) {
+        removeSet.add(grp.id);
+        for (const descId of getDescendantNodeIds(grp.id, prevNodes)) {
+          removeSet.add(descId);
         }
       }
 
-      setNodes((prev) => [...prev, ...clones]);
-      if (internalClonedEdges.length > 0) {
-        setEdges((prev) => [...prev, ...internalClonedEdges]);
-      }
-      if (clonedRootId) {
-        setSelectedNodeId(clonedRootId);
-      }
-      return clonedRootId;
+      const nextNodes = prevNodes.filter((n) => !removeSet.has(n.id));
+      const nextEdges = edgesRef.current.filter(
+        (e) =>
+          !removeSet.has(e.toId) &&
+          (e.fromId === null || !removeSet.has(e.fromId)),
+      );
+      commitBoardState(nextNodes, nextEdges);
+      setSelectedNodeId((prev) => (prev && removeSet.has(prev) ? null : prev));
     },
-    [edges, lang, nodes],
+    [commitBoardState],
   );
-
-  const handleUngroup = useCallback((id: string) => {
-    setNodes((prev) => {
-      const target = prev.find((n) => n.id === id);
-      if (!target || target.kind !== 'group') return prev;
-      const fallbackParent = target.parentId ?? null;
-      return prev
-        .filter((n) => n.id !== id)
-        .map((n) => (n.parentId === id ? { ...n, parentId: fallbackParent } : n));
-    });
-    setEdges((prev) => prev.filter((e) => e.fromId !== id && e.toId !== id));
-    setSelectedNodeId((prev) => (prev === id ? null : prev));
-  }, []);
 
   const handleUpdateNode = useCallback(
     (
       id: string,
-      patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
+      patch: Partial<
+        Pick<BoardNode, 'groupCode' | 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>
+      >,
     ) => {
-      setNodes((prev) =>
-        prev.map((n) => {
+      const nextNodes = nodesRef.current.map((n) => {
           if (n.id !== id) return n;
 
           let nextTitle = patch.title !== undefined ? patch.title : n.title;
@@ -1015,7 +1181,9 @@ export function StudioWorkspace({
               .filter((a): a is AssetItem => Boolean(a));
 
             if (n.kind === 'dialogue') {
-              const firstChar = boundAssets.find((a) => a.categoryId === 'characters');
+              const firstChar = [...boundAssets]
+                .reverse()
+                .find((a) => a.categoryId === 'characters');
               if (!nextTitle.trim() && firstChar) {
                 nextTitle = firstChar.name;
               }
@@ -1033,14 +1201,16 @@ export function StudioWorkspace({
                   changed = true;
                 }
                 if (updatedPrompt.challengeTemplate === 'scene-limit') {
-                  const firstScene = boundAssets.find((a) => a.categoryId === 'backgrounds');
+                  const firstScene = [...boundAssets]
+                    .reverse()
+                    .find((a) => a.categoryId === 'backgrounds');
                   if (!updatedPrompt.sceneName?.trim() && firstScene) {
                     updatedPrompt.sceneName = firstScene.name;
                     updatedPrompt.sceneAssetId = firstScene.id;
                     changed = true;
                   }
                 } else {
-                  const firstObs = boundAssets.find(
+                  const firstObs = [...boundAssets].reverse().find(
                     (a) =>
                       a.categoryId === 'objects' ||
                       a.categoryId === 'characters' ||
@@ -1064,10 +1234,13 @@ export function StudioWorkspace({
                 let changed = false;
                 if (updatedPrompt.actorAssetId && !boundSet.has(updatedPrompt.actorAssetId)) {
                   updatedPrompt.actorAssetId = undefined;
+                  updatedPrompt.actorName = '';
                   changed = true;
                 }
-                const firstChar = boundAssets.find((a) => a.categoryId === 'characters');
-                if (!updatedPrompt.actorName?.trim() && firstChar) {
+                const firstChar = [...boundAssets]
+                  .reverse()
+                  .find((a) => a.categoryId === 'characters');
+                if (firstChar && updatedPrompt.actorAssetId !== firstChar.id) {
                   updatedPrompt.actorName = firstChar.name;
                   updatedPrompt.actorAssetId = firstChar.id;
                   changed = true;
@@ -1167,10 +1340,10 @@ export function StudioWorkspace({
             fields: nextFields,
             manualFields: effectiveManualFields,
           };
-        }),
-      );
+        });
+      commitBoardState(nextNodes, edgesRef.current, id);
     },
-    [assetItems, lang, scopedVariables],
+    [assetItems, commitBoardState, lang, scopedVariables],
   );
 
   const handleUpdateNodeField = useCallback(
@@ -1179,8 +1352,7 @@ export function StudioWorkspace({
       key: K,
       value: CardFieldConfig[K],
     ) => {
-      setNodes((prev) =>
-        prev.map((n) => {
+      const nextNodes = nodesRef.current.map((n) => {
           if (n.id !== id) return n;
           const manualFields = n.manualFields.includes(key)
             ? n.manualFields
@@ -1201,6 +1373,13 @@ export function StudioWorkspace({
           let nextNote = n.note;
           let nextAssetIds = getNodeAssetIds(n);
 
+          if(n.kind==='outcome' && key==='visualOutcome') {
+            const cfg=value as CardFieldConfig['visualOutcome'];
+            const target=assetItems.find(a=>a.id===cfg?.assetId);
+            nextAssetIds=cfg?.assetId?[cfg.assetId]:[];
+            nextPrompt={...(n.promptInput??createDefaultPromptInput('outcome')!),outcomeMode:'visual',outcomeTargetKind:'asset',outcomeTargetRef:cfg?.assetId,outcomeTargetLabel:target?.name??''};
+            nextNote=target&&cfg?`${target.name} · ${cfg.effect.type}`:'';
+          }
           // Bottom-up sync: Challenge Related Behavior -> front card [Doing] & note
           if (n.kind === 'challenge' && key === 'relatedBehavior') {
             const behaviorVal = value as ChallengeBehaviorConfig | null | undefined;
@@ -1255,43 +1434,54 @@ export function StudioWorkspace({
             fields: nextFields,
             manualFields,
           };
-        }),
-      );
+        });
+      commitBoardState(nextNodes, edgesRef.current, id);
     },
-    [lang, scopedVariables],
+    [assetItems, commitBoardState, lang, scopedVariables],
   );
 
   const handleResetNodeAutoFields = useCallback(
     (id: string) => {
-      setNodes((prev) =>
-        prev.map((n) =>
-          n.id === id
-            ? {
-                ...n,
-                fields: inferCardFieldsFromText(n.kind, n.note, lang, {
-                  promptInput: n.promptInput,
-                  scopedVariables,
-                }),
-                manualFields: [],
-              }
-            : n,
-        ),
+      const nextNodes = nodesRef.current.map((n) =>
+        n.id === id
+          ? {
+              ...n,
+              fields: inferCardFieldsFromText(n.kind, n.note, lang, {
+                promptInput: n.promptInput,
+                scopedVariables,
+              }),
+              manualFields: [],
+            }
+          : n,
       );
+      commitBoardState(nextNodes, edgesRef.current, id);
     },
-    [lang, scopedVariables],
+    [assetItems, commitBoardState, lang, scopedVariables],
   );
 
-  const handleDeleteNode = useCallback((id: string) => {
-    setNodes((prev) => {
-      const deleted = prev.find((n) => n.id === id);
+  const handleDeleteNode = useCallback(
+    (id: string) => {
+      const prevNodes = nodesRef.current;
+      const ownerGroupId = findOwningSharedGroupId(id, prevNodes);
+      const undoSnapshot={nodes:prevNodes,edges:edgesRef.current};
+      const deleted = prevNodes.find((n) => n.id === id);
       const fallbackParent = deleted?.parentId ?? null;
-      return prev
+      const nextNodes = prevNodes
         .filter((n) => n.id !== id)
         .map((n) => (n.parentId === id ? { ...n, parentId: fallbackParent } : n));
-    });
-    setEdges((prev) => prev.filter((e) => e.fromId !== id && e.toId !== id));
-    setSelectedNodeId((prev) => (prev === id ? null : prev));
-  }, []);
+      const nextEdges = edgesRef.current.filter(
+        (e) => e.fromId !== id && e.toId !== id,
+      );
+      commitBoardState(
+        nextNodes,
+        nextEdges,
+        ownerGroupId && ownerGroupId !== id ? ownerGroupId : null,
+      );
+      setUndoBoard(undoSnapshot);
+      setSelectedNodeId((prev) => (prev === id ? null : prev));
+    },
+    [commitBoardState],
+  );
 
   const handleConnectNodes = useCallback(
     (
@@ -1300,47 +1490,73 @@ export function StudioWorkspace({
       entryOffset?: { dx: number; dy: number },
     ): string | null => {
       if (fromId !== null && fromId === toId) return null;
+      const prevEdges = edgesRef.current;
+      const fromNode = fromId
+        ? nodesRef.current.find((n) => n.id === fromId)
+        : undefined;
+      const toNode = nodesRef.current.find((n) => n.id === toId);
+      const edgeType: EdgeType =
+        fromId === null ? 'flow' : inferDefaultEdgeType(fromNode, toNode);
+
+      if (
+        fromId !== null &&
+        prevEdges.some(
+          (e) =>
+            (e.fromId === fromId && e.toId === toId) ||
+            (edgeType === 'association' && e.fromId === toId && e.toId === fromId),
+        )
+      ) {
+        markCardsConnected();
+        return null;
+      }
       const newEdgeId = `e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
-      let created = false;
-      setEdges((prev) => {
-        if (fromId !== null) {
-          const exists = prev.some((e) => e.fromId === fromId && e.toId === toId);
-          if (exists) return prev;
-        }
-        created = true;
-        return [
-          ...prev,
-          {
-            id: newEdgeId,
-            fromId,
-            toId,
-            ...(fromId === null && entryOffset ? { entryOffset } : {}),
-          },
-        ];
-      });
+      const nextEdges: BoardEdge[] = [
+        ...prevEdges,
+        {
+          id: newEdgeId,
+          fromId,
+          toId,
+          edgeType,
+          ...(fromId === null && entryOffset ? { entryOffset } : {}),
+        },
+      ];
+      const ownerTo = findOwningSharedGroupId(toId, nodesRef.current);
+      const shouldSync =
+        ownerTo !== null &&
+        ownerTo !== toId &&
+        (fromId === null ||
+          findOwningSharedGroupId(fromId, nodesRef.current) === ownerTo);
+      commitBoardState(nodesRef.current, nextEdges, shouldSync ? ownerTo : null);
       markCardsConnected();
-      return created || fromId === null ? newEdgeId : null;
+      return newEdgeId;
     },
-    [markCardsConnected],
+    [commitBoardState, markCardsConnected],
   );
 
   const handleUpdateEntryEdgeOffset = useCallback(
     (edgeId: string, entryOffset: { dx: number; dy: number }) => {
-      setEdges((prev) =>
-        prev.map((e) =>
-          e.id === edgeId && e.fromId === null
-            ? {
-                ...e,
-                entryOffset: {
-                  dx: Math.round(entryOffset.dx),
-                  dy: Math.round(entryOffset.dy),
-                },
-              }
-            : e,
-        ),
+      const prevEdges = edgesRef.current;
+      const edge = prevEdges.find((e) => e.id === edgeId && e.fromId === null);
+      if (!edge) return;
+      const nextEdges = prevEdges.map((e) =>
+        e.id === edgeId && e.fromId === null
+          ? {
+              ...e,
+              entryOffset: {
+                dx: Math.round(entryOffset.dx),
+                dy: Math.round(entryOffset.dy),
+              },
+            }
+          : e,
+      );
+      const ownerTo = findOwningSharedGroupId(edge.toId, nodesRef.current);
+      commitBoardState(
+        nodesRef.current,
+        nextEdges,
+        ownerTo && ownerTo !== edge.toId ? ownerTo : null,
       );
     },
-    [],
+    [commitBoardState],
   );
 
   const handleUpdateEdgeCondition = useCallback(
@@ -1348,29 +1564,306 @@ export function StudioWorkspace({
       edgeId: string,
       condition: string,
       conditionGroup?: EdgeConditionGroup,
+      options?: { scope?: 'single' | 'shared' },
     ) => {
-      setEdges((prev) =>
-        prev.map((e) =>
+      const prevEdges = edgesRef.current;
+      const edge = prevEdges.find((e) => e.id === edgeId);
+      const sharedId = edge?.sharedConditionId;
+      const cleanCondition = condition ? condition : undefined;
+      const cleanGroup =
+        condition && conditionGroup && conditionGroup.clauses.length > 0
+          ? conditionGroup
+          : undefined;
+
+      let nextEdges: BoardEdge[];
+      if (!cleanCondition || options?.scope === 'single') {
+        // Clearing a condition or saving as independent ONLY affects this specific edge
+        const updated = prevEdges.map((e) =>
           e.id === edgeId
             ? {
                 ...e,
-                condition: condition ? condition : undefined,
-                conditionGroup:
-                  condition && conditionGroup && conditionGroup.clauses.length > 0
-                    ? conditionGroup
-                    : undefined,
+                condition: cleanCondition,
+                conditionGroup: cleanGroup,
+                sharedConditionId: undefined,
               }
             : e,
-        ),
-      );
+        );
+        const remainingSameGroup = sharedId
+          ? updated.filter((e) => e.sharedConditionId === sharedId)
+          : [];
+        nextEdges =
+          sharedId && remainingSameGroup.length <= 1
+            ? updated.map((e) =>
+                e.sharedConditionId === sharedId
+                  ? { ...e, sharedConditionId: undefined }
+                  : e,
+              )
+            : updated;
+      } else {
+        nextEdges = prevEdges.map((e) => {
+          const matches = sharedId ? e.sharedConditionId === sharedId : e.id === edgeId;
+          if (!matches) return e;
+          return {
+            ...e,
+            condition: cleanCondition,
+            conditionGroup: cleanGroup,
+          };
+        });
+      }
+
+      let syncOwner: string | null = null;
+      if (edge) {
+        const ownerTo = findOwningSharedGroupId(edge.toId, nodesRef.current);
+        if (
+          ownerTo &&
+          ownerTo !== edge.toId &&
+          (edge.fromId === null ||
+            (edge.fromId !== ownerTo &&
+              findOwningSharedGroupId(edge.fromId, nodesRef.current) === ownerTo))
+        ) {
+          syncOwner = ownerTo;
+        }
+      }
+      commitBoardState(nodesRef.current, nextEdges, syncOwner);
       markCardsConnected();
     },
-    [markCardsConnected],
+    [commitBoardState, markCardsConnected],
   );
 
-  const handleDeleteEdge = useCallback((edgeId: string) => {
-    setEdges((prev) => prev.filter((e) => e.id !== edgeId));
-  }, []);
+  const handleBranchFromSharedCondition = useCallback(
+    (sourceEdgeId: string, targetId: string): string | null => {
+      const prevEdges = edgesRef.current;
+      const sourceEdge = prevEdges.find((e) => e.id === sourceEdgeId);
+      if (!sourceEdge) return null;
+      if (sourceEdge.fromId !== null && sourceEdge.fromId === targetId) return null;
+
+      const hasCond = Boolean(
+        sourceEdge.condition?.trim() || sourceEdge.conditionGroup?.clauses.length,
+      );
+      if (!hasCond) return null;
+
+      const sharedId =
+        sourceEdge.sharedConditionId ??
+        `sc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+
+      const existingTargetEdge = prevEdges.find(
+        (e) => e.fromId === sourceEdge.fromId && e.toId === targetId,
+      );
+
+      let resultEdgeId: string;
+      let nextEdges: BoardEdge[];
+      if (existingTargetEdge) {
+        resultEdgeId = existingTargetEdge.id;
+        nextEdges = prevEdges.map((e) => {
+          if (e.id === sourceEdge.id) {
+            return { ...e, edgeType: 'flow' as EdgeType, sharedConditionId: sharedId };
+          }
+          if (e.id === existingTargetEdge.id) {
+            return {
+              ...e,
+              edgeType: 'flow' as EdgeType,
+              condition: sourceEdge.condition,
+              conditionGroup: sourceEdge.conditionGroup,
+              sharedConditionId: sharedId,
+            };
+          }
+          return e;
+        });
+      } else {
+        resultEdgeId = `e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+        nextEdges = prevEdges.map((e) =>
+          e.id === sourceEdge.id
+            ? { ...e, edgeType: 'flow' as EdgeType, sharedConditionId: sharedId }
+            : e,
+        );
+        nextEdges.push({
+          id: resultEdgeId,
+          fromId: sourceEdge.fromId,
+          toId: targetId,
+          edgeType: 'flow',
+          entryOffset: sourceEdge.entryOffset ? { ...sourceEdge.entryOffset } : undefined,
+          condition: sourceEdge.condition,
+          conditionGroup: sourceEdge.conditionGroup,
+          sharedConditionId: sharedId,
+        });
+      }
+
+      let syncOwner: string | null = null;
+      const ownerTo = findOwningSharedGroupId(targetId, nodesRef.current);
+      if (
+        ownerTo &&
+        ownerTo !== targetId &&
+        (sourceEdge.fromId === null ||
+          (sourceEdge.fromId !== ownerTo &&
+            findOwningSharedGroupId(sourceEdge.fromId, nodesRef.current) === ownerTo))
+      ) {
+        syncOwner = ownerTo;
+      }
+
+      commitBoardState(nodesRef.current, nextEdges, syncOwner);
+      markCardsConnected();
+      return resultEdgeId;
+    },
+    [commitBoardState, markCardsConnected],
+  );
+
+  const handleLinkEdgeToSharedCondition = useCallback(
+    (edgeId: string, donorEdgeId: string) => {
+      const prevEdges = edgesRef.current;
+      const targetEdge = prevEdges.find((e) => e.id === edgeId);
+      const donorEdge = prevEdges.find((e) => e.id === donorEdgeId);
+      if (!targetEdge || !donorEdge || targetEdge.id === donorEdge.id) return;
+      if (targetEdge.fromId !== donorEdge.fromId) return;
+
+      const oldSharedId = targetEdge.sharedConditionId;
+      const sharedId =
+        donorEdge.sharedConditionId ??
+        `sc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+
+      const linked = prevEdges.map((e) => {
+        if (e.id === donorEdge.id) {
+          return { ...e, edgeType: 'flow' as EdgeType, sharedConditionId: sharedId };
+        }
+        if (e.id === targetEdge.id) {
+          return {
+            ...e,
+            edgeType: 'flow' as EdgeType,
+            condition: donorEdge.condition,
+            conditionGroup: donorEdge.conditionGroup,
+            sharedConditionId: sharedId,
+          };
+        }
+        return e;
+      });
+      const remainingOld =
+        oldSharedId && oldSharedId !== sharedId
+          ? linked.filter((e) => e.sharedConditionId === oldSharedId)
+          : [];
+      const nextEdges =
+        oldSharedId && oldSharedId !== sharedId && remainingOld.length <= 1
+          ? linked.map((e) =>
+              e.sharedConditionId === oldSharedId
+                ? { ...e, sharedConditionId: undefined }
+                : e,
+            )
+          : linked;
+      const owner = sharedGroupForEdge(targetEdge, nodesRef.current);
+      const donorOwner = sharedGroupForEdge(donorEdge, nodesRef.current);
+      commitBoardState(nodesRef.current, nextEdges, owner === donorOwner ? owner : null);
+      markCardsConnected();
+    },
+    [commitBoardState, markCardsConnected],
+  );
+
+  const handleDetachSharedCondition = useCallback(
+    (edgeId: string, clearDetachedEdge = false) => {
+      const prevEdges = edgesRef.current;
+      const edge = prevEdges.find((e) => e.id === edgeId);
+      if (!edge?.sharedConditionId) return;
+      const sharedId = edge.sharedConditionId;
+      const afterDetach = prevEdges.map((e) =>
+        e.id === edgeId
+          ? clearDetachedEdge
+            ? {
+                ...e,
+                condition: undefined,
+                conditionGroup: undefined,
+                sharedConditionId: undefined,
+              }
+            : { ...e, sharedConditionId: undefined }
+          : e,
+      );
+      const remainingSameGroup = afterDetach.filter(
+        (e) => e.sharedConditionId === sharedId,
+      );
+      const finalEdges =
+        remainingSameGroup.length <= 1
+          ? afterDetach.map((e) =>
+              e.sharedConditionId === sharedId
+                ? { ...e, sharedConditionId: undefined }
+                : e,
+            )
+          : afterDetach;
+      commitBoardState(nodesRef.current, finalEdges, sharedGroupForEdge(edge, nodesRef.current));
+    },
+    [commitBoardState],
+  );
+
+  const handleUpdateEdgeType = useCallback(
+    (edgeId: string, nextEdgeType: EdgeType) => {
+      const prevEdges = edgesRef.current;
+      const edge = prevEdges.find((e) => e.id === edgeId);
+      if (!edge || edge.fromId === null) return;
+      const sharedId = edge.sharedConditionId;
+      const afterType = prevEdges.map((e) =>
+        e.id === edgeId
+          ? {
+              ...e,
+              edgeType: nextEdgeType,
+              sharedConditionId: nextEdgeType === 'association' ? undefined : e.sharedConditionId,
+            }
+          : e,
+      );
+      const remainingSameGroup = sharedId
+        ? afterType.filter((e) => e.sharedConditionId === sharedId)
+        : [];
+      const nextEdges =
+        sharedId && remainingSameGroup.length <= 1
+          ? afterType.map((e) =>
+              e.sharedConditionId === sharedId
+                ? { ...e, sharedConditionId: undefined }
+                : e,
+            )
+          : afterType;
+      let syncOwner: string | null = null;
+      const ownerTo = findOwningSharedGroupId(edge.toId, nodesRef.current);
+      if (
+        ownerTo &&
+        ownerTo !== edge.toId &&
+        edge.fromId !== ownerTo &&
+        findOwningSharedGroupId(edge.fromId, nodesRef.current) === ownerTo
+      ) {
+        syncOwner = ownerTo;
+      }
+      commitBoardState(nodesRef.current, nextEdges, syncOwner);
+    },
+    [commitBoardState],
+  );
+
+  const handleDeleteEdge = useCallback(
+    (edgeId: string) => {
+      const prevEdges = edgesRef.current;
+      const edge = prevEdges.find((e) => e.id === edgeId);
+      const sharedId = edge?.sharedConditionId;
+      const filtered = prevEdges.filter((e) => e.id !== edgeId);
+      const remainingSameGroup = sharedId
+        ? filtered.filter((e) => e.sharedConditionId === sharedId)
+        : [];
+      const nextEdges =
+        sharedId && remainingSameGroup.length <= 1
+          ? filtered.map((e) =>
+              e.sharedConditionId === sharedId
+                ? { ...e, sharedConditionId: undefined }
+                : e,
+            )
+          : filtered;
+      let syncOwner: string | null = null;
+      if (edge) {
+        const ownerTo = findOwningSharedGroupId(edge.toId, nodesRef.current);
+        if (
+          ownerTo &&
+          ownerTo !== edge.toId &&
+          (edge.fromId === null ||
+            (edge.fromId !== ownerTo &&
+              findOwningSharedGroupId(edge.fromId, nodesRef.current) === ownerTo))
+        ) {
+          syncOwner = ownerTo;
+        }
+      }
+      commitBoardState(nodesRef.current, nextEdges, syncOwner);
+    },
+    [commitBoardState],
+  );
 
   const handleReplayGuide = () => {
     setChecklist({
@@ -1409,7 +1902,7 @@ export function StudioWorkspace({
         <div className="relative flex items-center gap-3 min-w-0">
           <button
             type="button"
-            onClick={onGoHome}
+            onClick={() => void saveBeforeLeaving(onGoHome)}
             aria-label="Tinker 550 Home"
             className="flex items-center shrink-0 rounded-lg cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
           >
@@ -1457,7 +1950,12 @@ export function StudioWorkspace({
           />
         </div>
 
-        <div className="relative flex items-center gap-2.5 shrink-0">
+        <div className="relative flex flex-wrap items-center gap-2 shrink-0">
+          <span role="status" className="text-xs text-slate-500 max-w-40">{saveStatus}</span>
+          <button className="px-3 py-1.5 rounded-lg border text-xs font-semibold" onClick={()=>void persistProject()}>{lang==='zh'?'保存':'Save'}</button>
+          <button className="px-3 py-1.5 rounded-lg border text-xs font-semibold" onClick={()=>exportProject(projectSnapshot)}>{lang==='zh'?'导出':'Export'}</button>
+          <button className="px-3 py-1.5 rounded-lg border text-xs font-semibold" onClick={() => void saveBeforeLeaving(onBackToChoose)}>{lang==='zh'?'我的游戏':'My games'}</button>
+          {undoBoard && <button className="px-3 py-1.5 rounded-lg bg-sky-100 text-xs" onClick={()=>{commitBoardState(undoBoard.nodes,undoBoard.edges);setUndoBoard(null);}}>{lang==='zh'?'撤销删除':'Undo delete'}</button>}
           {spotlightStage === 'free' && (
             <button
               type="button"
@@ -1523,6 +2021,7 @@ export function StudioWorkspace({
             selectedAssetId={selectedAssetId}
             pickingForStage={stageAssetPick === 'picking'}
             aiNotice={aiNotice}
+            onAddStarter={(key)=>{const item=createStarterAsset(key,lang);setAssetItems(prev=>[...prev,item]);setSelectedAssetId(item.id);}}
             onToggle={() => {
               setStageAssetPick(null);
               setLeftOpen((v) => !v);
@@ -1571,7 +2070,8 @@ export function StudioWorkspace({
                 highlightPropertyId={highlightPropertyId}
                 playValues={playValues}
                 leftOffsetPx={leftOpen ? leftWidth + 14 : 56}
-                onChangeTab={setAssetEditorTab}
+                scopedVariables={scopedVariables}
+            onChangeTab={setAssetEditorTab}
                 onClose={() => setSelectedAssetId(null)}
                 onUpdateAsset={handleUpdateAsset}
                 onDeleteAsset={handleDeleteAsset}
@@ -1622,6 +2122,7 @@ export function StudioWorkspace({
               lang={lang}
               nodes={nodes}
               edges={edges}
+              comboFrames={comboFrames}
               assetItems={assetItems}
               scopedVariables={scopedVariables}
               stateManagerOpen={stateManagerOpen}
@@ -1630,13 +2131,7 @@ export function StudioWorkspace({
               autoFocusNodeId={autoFocusNodeId}
               activePlayNodeIds={activePlayNodeIds}
               activePlayEdgeId={activePlayEdgeId}
-              placementCounts={placementCounts}
-              onLocateStage={(nodeId) => {
-                setRightOpen(true);
-                setStageFocus({ nodeId, nonce: Date.now() });
-              }}
-              onToggleStageTemplate={id => setNodes(items => items.map(item => item.id === id ? { ...item, stageTemplate: !item.stageTemplate } : item))}
-              onToggleStageReset={id => setNodes(items => items.map(item => item.id === id ? { ...item, stageResetOnEntry: !item.stageResetOnEntry } : item))}
+              activePlayEdgeIds={activePlayEdgeIds}
               onSelectNode={setSelectedNodeId}
               onConsumeAutoFocus={() => setAutoFocusNodeId(null)}
               onDragNode={handleDragNode}
@@ -1645,15 +2140,32 @@ export function StudioWorkspace({
               onCommitGroupResize={handleCommitGroupResize}
               onToggleGroupCollapse={handleToggleGroupCollapse}
               onDuplicateNode={handleDuplicateNode}
-              onUngroup={handleUngroup}
+              onDetachGroupInstance={handleDetachGroupInstance}
+              onRemoveReusedPlacement={handleRemoveReusedPlacement}
+              onUngroupDefinition={handleUngroupDefinition}
+              onDeleteGroupDefinition={handleDeleteGroupDefinition}
+              placementCounts={placementCounts}
+              onLocateStage={(nodeId) => {
+                setRightOpen(true);
+                setStageFocus({ nodeId, nonce: Date.now() });
+              }}
+              onToggleStageTemplate={id => commitBoardState(nodes.map(item => item.id === id ? { ...item, stageTemplate: !item.stageTemplate } : item), edges, id)}
+              onToggleStageReset={id => commitBoardState(nodes.map(item => item.id === id ? { ...item, stageResetOnEntry: !item.stageResetOnEntry } : item), edges, id)}
               onUpdateNode={handleUpdateNode}
               onUpdateNodeField={handleUpdateNodeField}
               onResetNodeAutoFields={handleResetNodeAutoFields}
               onDeleteNode={handleDeleteNode}
-              onAddNodeAt={addNodeAt}
+              onAddNodeAt={(kind,x,y,mode)=>addNodeAt(kind,x,y,undefined,mode)}
+              onAddComboFrame={handleAddComboFrame}
+              onUpdateComboFrame={handleUpdateComboFrame}
+              onDeleteComboFrame={handleDeleteComboFrame}
               onConnectNodes={handleConnectNodes}
               onUpdateEntryEdgeOffset={handleUpdateEntryEdgeOffset}
               onUpdateEdgeCondition={handleUpdateEdgeCondition}
+              onBranchFromSharedCondition={handleBranchFromSharedCondition}
+              onLinkEdgeToSharedCondition={handleLinkEdgeToSharedCondition}
+              onDetachSharedCondition={handleDetachSharedCondition}
+              onUpdateEdgeType={handleUpdateEdgeType}
               onDeleteEdge={handleDeleteEdge}
               onToggleStateManager={(open) =>
                 setStateManagerOpen((prev) => {
@@ -1701,6 +2213,13 @@ export function StudioWorkspace({
             isOpen={rightOpen}
             width={rightWidth}
             nodes={nodes}
+            comboFrames={comboFrames}
+            sceneDrafts={sceneDrafts}
+            onScenesChange={setSceneDrafts}
+            onPlayVariables={setPlayValues}
+            onUpdatePlayValue={handleUpdatePlayValue}
+            playValueEdit={playValueEdit}
+            spotlightStage={spotlightStage}
             edges={edges}
             assets={assetItems}
             variables={scopedVariables}

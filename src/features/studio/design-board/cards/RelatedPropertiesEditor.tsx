@@ -679,14 +679,14 @@ export function RelatedPropertiesEditor({
         );
       })}
 
-      <button
+      {rules.length===0 && <button
         type="button"
         onClick={addRule}
         className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold text-[#047857] hover:bg-[#D1FAE5]/60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
       >
         <Plus className="w-3 h-3" aria-hidden="true" />
         <span>{b.propAddRule}</span>
-      </button>
+      </button>}
     </div>
   );
 }

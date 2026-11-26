@@ -1,4 +1,4 @@
-import { drawSpriteWithEffects, isHiddenByEffect, type VisualEffectItem } from '../asset-library/effects/visualEffectsModel';
+import { drawSpriteWithEffects, isHiddenByEffect, type RunningVisual, type VisualEffectItem } from '../asset-library/effects/visualEffectsModel';
 import type { ChallengeVisual, SceneTheme } from '../design-board/studioModel';
 
 export function drawChallengeEntity(
@@ -13,6 +13,7 @@ export function drawChallengeEntity(
   baked: { canvas: HTMLCanvasElement; padRatio: number } | null = null,
   effects?: VisualEffectItem[],
   dimensions?: { width: number; height: number; rotation: number },
+  sceneVisual?: { run: RunningVisual; time: number },
 ) {
   ctx.save();
   if (spriteImg) {
@@ -29,6 +30,7 @@ export function drawChallengeEntity(
       time,
       (dimensions?.rotation ?? 0) + rotateDir * time * 5.0,
       1,
+      sceneVisual,
     );
     ctx.restore();
     return;

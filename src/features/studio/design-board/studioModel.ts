@@ -1,3 +1,4 @@
+import type { VisualEffectItem } from '../asset-library/effects/visualEffectsModel';
 import type { EdgeConditionGroup } from './arrowConditionModel';
 import type { Language } from '../../../shared/i18n';
 
@@ -120,6 +121,7 @@ export interface CardPromptInput {
   actorAssetId?: string;
   playerAction?: string;
   // Outcome: [target asset or property] will [change]
+  outcomeMode?: 'property' | 'visual';
   outcomeTargetLabel?: string;
   outcomeTargetKind?: 'asset' | 'variable' | 'custom';
   outcomeTargetRef?: string;
@@ -151,6 +153,7 @@ export interface CardInferenceContext {
 export interface CardFieldConfig {
   stageScoreFormula?: string;
   stageTargetEffect?: 'open' | 'collect' | 'lock-camera' | 'follow-camera';
+  visualOutcome?: { assetId:string; effect:VisualEffectItem; duration:number; restore:boolean };
   // Narration & Dialogue
   subtitlePosition?: SubtitlePosition;
   sceneTheme?: SceneTheme;
@@ -197,8 +200,12 @@ export interface BoardNode {
   manualFields: (keyof CardFieldConfig)[];
   x: number;
   y: number;
-  /** Sequential human-readable Group identifier (e.g. G1, G2) */
+  /** Sequential or custom human-readable Group identifier (e.g. G1, L1-Forest) */
   groupCode?: string;
+  /** Shared definition ID for purely reused Groups; synced across instances with the same groupDefId */
+  groupDefId?: string;
+  /** Stable key matching corresponding child nodes across synced Group reuse instances */
+  syncKey?: string;
   /** Expanded container width (for kind === 'group') */
   width?: number;
   /** Expanded container height (for kind === 'group') */
@@ -211,17 +218,62 @@ export interface BoardNode {
   availableWhenGroup?: EdgeConditionGroup;
 }
 
+export type EdgeType = 'association' | 'flow';
+
 export interface BoardEdge {
   id: string;
   /** Upstream source node ID, or null for a standalone trigger arrow from open space */
   fromId: string | null;
   toId: string;
+  /** Semantic link kind: 'association' (no arrow, e.g. Challenge-Action) vs 'flow' (with arrow, progression) */
+  edgeType?: EdgeType;
   /** World-space offset from target node top-left to the trigger origin dot (when fromId === null) */
   entryOffset?: { dx: number; dy: number };
-  /** Human-readable condition summary displayed on the arrow midpoint */
+  /** Human-readable condition summary displayed on the arrow/line midpoint */
   condition?: string;
   /** Structured multi-clause AND/OR condition definition (Event or Property) */
   conditionGroup?: EdgeConditionGroup;
+  /** Optional shared condition group key so multiple flow branches share one condition hub */
+  sharedConditionId?: string;
+}
+
+export interface BoardComboFrame {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label?: string;
+}
+
+export const COMBO_FRAME_DEFAULT_WIDTH = 320;
+export const COMBO_FRAME_DEFAULT_HEIGHT = 280;
+export const COMBO_FRAME_MIN_WIDTH = 220;
+export const COMBO_FRAME_MIN_HEIGHT = 150;
+
+export function inferDefaultEdgeType(
+  fromNode: Pick<BoardNode, 'kind'> | undefined | null,
+  toNode: Pick<BoardNode, 'kind'> | undefined | null,
+): EdgeType {
+  if (!fromNode || !toNode) return 'flow';
+  if (
+    (fromNode.kind === 'challenge' && toNode.kind === 'action') ||
+    (fromNode.kind === 'action' && toNode.kind === 'challenge')
+  ) {
+    return 'association';
+  }
+  return 'flow';
+}
+
+export function resolveEdgeType(
+  edge: Pick<BoardEdge, 'fromId' | 'toId' | 'edgeType'>,
+  nodeMap: Map<string, Pick<BoardNode, 'kind'>>,
+): EdgeType {
+  if (edge.fromId === null) return 'flow';
+  if (edge.edgeType === 'association' || edge.edgeType === 'flow') {
+    return edge.edgeType;
+  }
+  return inferDefaultEdgeType(nodeMap.get(edge.fromId), nodeMap.get(edge.toId));
 }
 
 export interface OnboardingChecklist {
@@ -274,6 +326,68 @@ export function getNodeDimensions(node: BoardNode) {
     };
   }
   return { width: CARD_WIDTH, height: CARD_HEIGHT };
+}
+
+export function isActionInsideComboFrame(
+  node: BoardNode,
+  frame: BoardComboFrame,
+): boolean {
+  if (node.kind !== 'action') return false;
+  const dim = getNodeDimensions(node);
+  const cx = node.x + dim.width / 2;
+  const cy = node.y + 108;
+  return (
+    cx >= frame.x &&
+    cx <= frame.x + frame.width &&
+    cy >= frame.y &&
+    cy <= frame.y + frame.height
+  );
+}
+
+export function getComboFramesForAction(
+  actionId: string,
+  nodes: BoardNode[],
+  comboFrames: BoardComboFrame[],
+): BoardComboFrame[] {
+  const node = nodes.find((n) => n.id === actionId && n.kind === 'action');
+  if (!node || comboFrames.length === 0) return [];
+  return comboFrames.filter((frame) => isActionInsideComboFrame(node, frame));
+}
+
+export function areActionsInSameComboFrame(
+  actionIdA: string,
+  actionIdB: string,
+  nodes: BoardNode[],
+  comboFrames: BoardComboFrame[],
+): boolean {
+  if (actionIdA === actionIdB) return true;
+  const nodeA = nodes.find((n) => n.id === actionIdA && n.kind === 'action');
+  const nodeB = nodes.find((n) => n.id === actionIdB && n.kind === 'action');
+  if (!nodeA || !nodeB) return false;
+  return comboFrames.some(
+    (frame) =>
+      isActionInsideComboFrame(nodeA, frame) &&
+      isActionInsideComboFrame(nodeB, frame),
+  );
+}
+
+export function getCombinableSiblingActions(
+  actionId: string,
+  nodes: BoardNode[],
+  comboFrames: BoardComboFrame[],
+): BoardNode[] {
+  const frames = getComboFramesForAction(actionId, nodes, comboFrames);
+  if (frames.length === 0) return [];
+  const seen = new Set<string>([actionId]);
+  const siblings: BoardNode[] = [];
+  for (const node of nodes) {
+    if (node.kind !== 'action' || seen.has(node.id)) continue;
+    if (frames.some((frame) => isActionInsideComboFrame(node, frame))) {
+      seen.add(node.id);
+      siblings.push(node);
+    }
+  }
+  return siblings;
 }
 
 export function getNodeDepth(
@@ -374,14 +488,20 @@ export function getDescendantNodeIds(
   return result;
 }
 
+export function getGroupDefId(
+  node: Pick<BoardNode, 'id' | 'groupDefId'>,
+): string {
+  return node.groupDefId?.trim() || node.id;
+}
+
 export function getNextGroupCode(
-  nodes: Pick<BoardNode, 'kind' | 'groupCode'>[],
+  nodes: Pick<BoardNode, 'id' | 'kind' | 'groupCode' | 'groupDefId'>[],
 ): string {
   let maxNum = 0;
-  let groupCount = 0;
+  const distinctDefs = new Set<string>();
   for (const n of nodes) {
     if (n.kind !== 'group') continue;
-    groupCount += 1;
+    distinctDefs.add(getGroupDefId(n));
     const match = n.groupCode?.match(/^G(\d+)$/i);
     if (match) {
       const parsed = Number(match[1]);
@@ -390,21 +510,468 @@ export function getNextGroupCode(
       }
     }
   }
-  return `G${Math.max(maxNum, groupCount) + 1}`;
+  return `G${Math.max(maxNum, distinctDefs.size) + 1}`;
 }
 
 export function resolveGroupCode(
-  node: Pick<BoardNode, 'id' | 'kind' | 'groupCode'>,
-  nodes: Pick<BoardNode, 'id' | 'kind' | 'groupCode'>[],
+  node: Pick<BoardNode, 'id' | 'kind' | 'groupCode' | 'groupDefId'>,
+  nodes: Pick<BoardNode, 'id' | 'kind' | 'groupCode' | 'groupDefId'>[],
 ): string {
   if (node.groupCode?.trim()) return node.groupCode.trim();
-  let idx = 0;
+  const defId = getGroupDefId(node);
+  const seenDefs = new Map<string, number>();
   for (const n of nodes) {
     if (n.kind !== 'group') continue;
-    idx += 1;
-    if (n.id === node.id) return `G${idx}`;
+    const dId = getGroupDefId(n);
+    if (!seenDefs.has(dId)) {
+      seenDefs.set(dId, seenDefs.size + 1);
+    }
+    if (dId === defId) {
+      return `G${seenDefs.get(dId)!}`;
+    }
   }
   return 'G1';
+}
+
+export function isGroupCodeTaken(
+  candidateCode: string,
+  nodes: BoardNode[],
+  excludeDefId?: string,
+): boolean {
+  const normalized = candidateCode.trim().toLowerCase();
+  if (!normalized) return false;
+  for (const n of nodes) {
+    if (n.kind !== 'group') continue;
+    if (excludeDefId && getGroupDefId(n) === excludeDefId) continue;
+    if (resolveGroupCode(n, nodes).trim().toLowerCase() === normalized) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function findOwningSharedGroupId(
+  nodeId: string,
+  nodes: BoardNode[],
+): string | null {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const defCounts = new Map<string, number>();
+  for (const n of nodes) {
+    if (n.kind !== 'group') continue;
+    const defId = getGroupDefId(n);
+    defCounts.set(defId, (defCounts.get(defId) ?? 0) + 1);
+  }
+  let curr = nodeMap.get(nodeId);
+  const visited = new Set<string>();
+  while (curr && !visited.has(curr.id)) {
+    visited.add(curr.id);
+    if (curr.kind === 'group' && (defCounts.get(getGroupDefId(curr)) ?? 0) > 1) {
+      return curr.id;
+    }
+    curr = curr.parentId ? nodeMap.get(curr.parentId) : undefined;
+  }
+  return null;
+}
+
+function cloneEdgeConditionGroup(
+  group: EdgeConditionGroup | undefined,
+): EdgeConditionGroup | undefined {
+  if (!group) return undefined;
+  return {
+    combinator: group.combinator,
+    clauses: group.clauses.map((c) => ({ ...c })),
+  };
+}
+
+function cloneNodeFields(fields: CardFieldConfig): CardFieldConfig {
+  return {
+    ...fields,
+    relatedParameters: fields.relatedParameters
+      ? fields.relatedParameters.map((p) => ({ ...p }))
+      : undefined,
+    relatedProperties: fields.relatedProperties
+      ? fields.relatedProperties.map((r) => ({ ...r }))
+      : undefined,
+  };
+}
+
+/**
+ * Duplicates a Group as a brand-new independent Group (new ID & new groupDefId),
+ * OR places a linked reuse instance sharing the same groupCode & groupDefId.
+ */
+export function cloneGroupSubtree(
+  rootId: string,
+  mode: 'duplicate' | 'reuse',
+  nodes: BoardNode[],
+  edges: BoardEdge[],
+  lang: Language,
+): {
+  nodes: BoardNode[];
+  edges: BoardEdge[];
+  createdRootId: string | null;
+} {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const root = nodeMap.get(rootId);
+  if (!root) {
+    return { nodes, edges, createdRootId: null };
+  }
+
+  const descIds = root.kind === 'group' ? getDescendantNodeIds(root.id, nodes) : [];
+  const subtreeIds = [root.id, ...descIds];
+  const subtreeSet = new Set(subtreeIds);
+  const idMap = new Map<string, string>();
+  const ts = Date.now().toString(36);
+
+  for (const origId of subtreeIds) {
+    const orig = nodeMap.get(origId);
+    if (!orig) continue;
+    const rand = Math.random().toString(36).slice(2, 6);
+    idMap.set(origId, `n-${orig.kind}-${ts}-${rand}`);
+  }
+
+  const sharedDefId = mode === 'reuse' ? getGroupDefId(root) : undefined;
+  const sharedRootCode =
+    mode === 'reuse' && root.kind === 'group'
+      ? resolveGroupCode(root, nodes)
+      : undefined;
+
+  // Ensure source root and descendants have stable groupDefId & syncKey when entering reuse mode
+  const baseNodes =
+    mode === 'reuse' && root.kind === 'group'
+      ? nodes.map((n) => {
+          if (n.id === root.id) {
+            return {
+              ...n,
+              groupDefId: sharedDefId,
+              groupCode: sharedRootCode,
+            };
+          }
+          if (subtreeSet.has(n.id) && !n.syncKey) {
+            return { ...n, syncKey: n.id };
+          }
+          return n;
+        })
+      : nodes;
+
+  const baseNodeMap = new Map(baseNodes.map((n) => [n.id, n]));
+  const clones: BoardNode[] = [];
+
+  for (const origId of subtreeIds) {
+    const orig = baseNodeMap.get(origId);
+    const nextId = idMap.get(origId);
+    if (!orig || !nextId) continue;
+
+    const nextParentId =
+      origId === root.id
+        ? orig.parentId
+        : orig.parentId && idMap.has(orig.parentId)
+          ? idMap.get(orig.parentId)!
+          : orig.parentId;
+
+    let nextGroupCode = orig.groupCode;
+    let nextGroupDefId = orig.groupDefId;
+    let nextTitle = orig.title;
+    let nextSyncKey = orig.syncKey;
+
+    if (mode === 'duplicate') {
+      if (orig.kind === 'group') {
+        nextGroupDefId = nextId;
+        nextGroupCode = getNextGroupCode([...baseNodes, ...clones]);
+        if (origId === root.id && orig.title.trim()) {
+          nextTitle = `${orig.title.trim()} (${lang === 'zh' ? '副本' : 'Copy'})`;
+        }
+      }
+      nextSyncKey = undefined;
+    } else {
+      // Reuse mode: root shares groupDefId & groupCode; descendants share syncKey
+      if (origId === root.id && orig.kind === 'group') {
+        nextGroupDefId = sharedDefId;
+        nextGroupCode = sharedRootCode;
+      } else {
+        nextSyncKey = orig.syncKey || orig.id;
+        if (orig.kind === 'group') {
+          nextGroupDefId = nextId;
+        }
+      }
+    }
+
+    clones.push({
+      ...orig,
+      id: nextId,
+      parentId: nextParentId,
+      groupCode: nextGroupCode,
+      groupDefId: nextGroupDefId,
+      syncKey: nextSyncKey,
+      title: nextTitle,
+      assetIds: orig.assetIds ? [...orig.assetIds] : undefined,
+      promptInput: orig.promptInput ? { ...orig.promptInput } : undefined,
+      fields: cloneNodeFields(orig.fields),
+      manualFields: [...orig.manualFields],
+      availableWhenGroup: cloneEdgeConditionGroup(orig.availableWhenGroup),
+      x: orig.x + 52,
+      y: orig.y + 52,
+    });
+  }
+
+  const internalClonedEdges: BoardEdge[] = [];
+  const clonedHubIds = new Map<string, string>();
+  for (const e of edges) {
+    if (!subtreeSet.has(e.toId) || (e.fromId !== null && !subtreeSet.has(e.fromId))) continue;
+    const rand = Math.random().toString(36).slice(2, 6);
+    let sharedConditionId: string | undefined;
+    if (e.sharedConditionId) {
+      sharedConditionId = clonedHubIds.get(e.sharedConditionId) ?? 'sc-' + crypto.randomUUID();
+      clonedHubIds.set(e.sharedConditionId, sharedConditionId);
+    }
+    internalClonedEdges.push({
+      ...e,
+      id: `e-${ts}-${rand}`,
+      fromId: e.fromId === null ? null : idMap.get(e.fromId)!,
+      toId: idMap.get(e.toId)!,
+      sharedConditionId,
+      entryOffset: e.entryOffset ? { ...e.entryOffset } : undefined,
+      conditionGroup: cloneEdgeConditionGroup(e.conditionGroup),
+    });
+  }
+
+  return {
+    nodes: [...baseNodes, ...clones],
+    edges: [...edges, ...internalClonedEdges],
+    createdRootId: idMap.get(root.id) ?? null,
+  };
+}
+
+/**
+ * Detaches one reused Group instance into an independent new Group with its own new ID.
+ */
+export function detachGroupInstance(
+  groupId: string,
+  nodes: BoardNode[],
+): BoardNode[] {
+  const target = nodes.find((n) => n.id === groupId && n.kind === 'group');
+  if (!target) return nodes;
+  const newCode = getNextGroupCode(nodes);
+  const descSet = new Set(getDescendantNodeIds(groupId, nodes));
+  return nodes.map((n) => {
+    if (n.id === groupId) {
+      return {
+        ...n,
+        groupDefId: n.id,
+        groupCode: newCode,
+      };
+    }
+    if (descSet.has(n.id)) {
+      return {
+        ...n,
+        syncKey: undefined,
+      };
+    }
+    return n;
+  });
+}
+
+/**
+ * Synchronizes a shared Group definition (metadata + internal subtree + internal edges)
+ * from `sourceGroupId` to all other Group placements sharing the same `groupDefId`.
+ */
+export function propagateGroupDefinitionFrom(
+  sourceGroupId: string,
+  nodes: BoardNode[],
+  edges: BoardEdge[],
+): { nodes: BoardNode[]; edges: BoardEdge[] } {
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const sourceGroup = nodeMap.get(sourceGroupId);
+  if (!sourceGroup || sourceGroup.kind !== 'group') {
+    return { nodes, edges };
+  }
+
+  const defId = getGroupDefId(sourceGroup);
+  const siblingGroups = nodes.filter(
+    (n) => n.kind === 'group' && n.id !== sourceGroupId && getGroupDefId(n) === defId,
+  );
+  if (siblingGroups.length === 0) {
+    return { nodes, edges };
+  }
+
+  const sourceDescIds = getDescendantNodeIds(sourceGroupId, nodes);
+  const sourceDescSet = new Set(sourceDescIds);
+  const sourceDescSorted = sourceDescIds
+    .map((id) => nodeMap.get(id))
+    .filter((n): n is BoardNode => Boolean(n))
+    .sort((a, b) => getNodeDepth(a.id, nodeMap) - getNodeDepth(b.id, nodeMap));
+
+  // Ensure every source descendant has a syncKey
+  const normalizedSyncKey = new Map<string, string>();
+  for (const d of sourceDescSorted) {
+    normalizedSyncKey.set(d.id, d.syncKey || d.id);
+  }
+
+  const sourceInternalEdges = edges.filter(
+    (e) =>
+      (e.fromId === null && sourceDescSet.has(e.toId)) ||
+      (e.fromId !== null && sourceDescSet.has(e.fromId) && sourceDescSet.has(e.toId)),
+  );
+
+  const removedNodeIds = new Set<string>();
+  const addedNodes: BoardNode[] = [];
+  const updatedGroupMetadata = new Map<string, Partial<BoardNode>>();
+  const updatedTargetDescendants = new Map<string, BoardNode>();
+  const targetOldDescSets: Set<string>[] = [];
+  const rebuiltInternalEdges: BoardEdge[] = [];
+  const ts = Date.now().toString(36);
+
+  for (const targetGrp of siblingGroups) {
+    updatedGroupMetadata.set(targetGrp.id, {
+      groupDefId: defId,
+      groupCode: sourceGroup.groupCode,
+      title: sourceGroup.title,
+      note: sourceGroup.note,
+    });
+
+    const tDescIds = getDescendantNodeIds(targetGrp.id, nodes);
+    const tDescSet = new Set(tDescIds);
+    targetOldDescSets.push(tDescSet);
+
+    const existingBySyncKey = new Map<string, BoardNode>();
+    for (const tid of tDescIds) {
+      const td = nodeMap.get(tid);
+      if (td) {
+        existingBySyncKey.set(td.syncKey || td.id, td);
+      }
+    }
+
+    const srcToTargetId = new Map<string, string>([[sourceGroupId, targetGrp.id]]);
+    const matchedTargetIds = new Set<string>();
+
+    for (const srcDesc of sourceDescSorted) {
+      const sKey = normalizedSyncKey.get(srcDesc.id)!;
+      const existing = existingBySyncKey.get(sKey);
+      const targetId =
+        existing?.id ?? `n-${srcDesc.kind}-${ts}-${Math.random().toString(36).slice(2, 6)}`;
+      srcToTargetId.set(srcDesc.id, targetId);
+      if (existing) matchedTargetIds.add(existing.id);
+
+      const targetParentId =
+        (srcDesc.parentId ? srcToTargetId.get(srcDesc.parentId) : undefined) ??
+        targetGrp.id;
+      const relX = srcDesc.x - sourceGroup.x;
+      const relY = srcDesc.y - sourceGroup.y;
+
+      const syncedNode: BoardNode = {
+        ...srcDesc,
+        id: targetId,
+        parentId: targetParentId,
+        syncKey: sKey,
+        groupDefId: srcDesc.kind === 'group' ? targetId : srcDesc.groupDefId,
+        x: targetGrp.x + relX,
+        y: targetGrp.y + relY,
+        collapsed: existing ? existing.collapsed : srcDesc.collapsed,
+        assetIds: srcDesc.assetIds ? [...srcDesc.assetIds] : undefined,
+        promptInput: srcDesc.promptInput ? { ...srcDesc.promptInput } : undefined,
+        fields: cloneNodeFields(srcDesc.fields),
+        manualFields: [...srcDesc.manualFields],
+        availableWhenGroup: cloneEdgeConditionGroup(srcDesc.availableWhenGroup),
+      };
+
+      if (existing) {
+        updatedTargetDescendants.set(existing.id, syncedNode);
+      } else {
+        addedNodes.push(syncedNode);
+      }
+    }
+
+    for (const oldId of tDescIds) {
+      if (!matchedTargetIds.has(oldId)) {
+        removedNodeIds.add(oldId);
+      }
+    }
+
+    // Preserve existing internal edge IDs where endpoint pairs match
+    const existingTargetEdges = edges.filter(
+      (e) =>
+        (e.fromId === null && tDescSet.has(e.toId)) ||
+        (e.fromId !== null && tDescSet.has(e.fromId) && tDescSet.has(e.toId)),
+    );
+    const usedEdgeIds = new Set<string>();
+    const targetEdgeIds = new Set(existingTargetEdges.map(edge => edge.id));
+    const usedHubIds = new Set(edges.filter(edge => !targetEdgeIds.has(edge.id)).map(edge => edge.sharedConditionId));
+    const targetHubIds = new Map<string, string>();
+
+    for (const srcEdge of sourceInternalEdges) {
+      const mappedFrom =
+        srcEdge.fromId === null ? null : (srcToTargetId.get(srcEdge.fromId) ?? null);
+      const mappedTo = srcToTargetId.get(srcEdge.toId);
+      if (!mappedTo) continue;
+      if (srcEdge.fromId !== null && !mappedFrom) continue;
+
+      const existingMatch = existingTargetEdges.find(
+        (te) =>
+          !usedEdgeIds.has(te.id) &&
+          te.fromId === mappedFrom &&
+          te.toId === mappedTo,
+      );
+      const edgeId =
+        existingMatch?.id ?? `e-${ts}-${Math.random().toString(36).slice(2, 6)}`;
+      usedEdgeIds.add(edgeId);
+
+      let sharedConditionId: string | undefined;
+      if (srcEdge.sharedConditionId) {
+        sharedConditionId = targetHubIds.get(srcEdge.sharedConditionId);
+        if (!sharedConditionId) {
+          const existingHubId = existingMatch?.sharedConditionId;
+          sharedConditionId = existingHubId && !usedHubIds.has(existingHubId) ? existingHubId : 'sc-' + crypto.randomUUID();
+          targetHubIds.set(srcEdge.sharedConditionId, sharedConditionId);
+          usedHubIds.add(sharedConditionId);
+        }
+      }
+      rebuiltInternalEdges.push({
+        ...srcEdge,
+        id: edgeId,
+        fromId: mappedFrom,
+        toId: mappedTo,
+        sharedConditionId,
+        entryOffset: srcEdge.entryOffset ? { ...srcEdge.entryOffset } : undefined,
+        conditionGroup: cloneEdgeConditionGroup(srcEdge.conditionGroup),
+      });
+    }
+  }
+
+  const nextNodes: BoardNode[] = [];
+  for (const n of nodes) {
+    if (removedNodeIds.has(n.id)) continue;
+    if (n.id === sourceGroupId) {
+      nextNodes.push({ ...n, groupDefId: defId });
+    } else if (sourceDescSet.has(n.id)) {
+      nextNodes.push({ ...n, syncKey: normalizedSyncKey.get(n.id) });
+    } else if (updatedGroupMetadata.has(n.id)) {
+      nextNodes.push({ ...n, ...updatedGroupMetadata.get(n.id) });
+    } else if (updatedTargetDescendants.has(n.id)) {
+      nextNodes.push(updatedTargetDescendants.get(n.id)!);
+    } else {
+      nextNodes.push(n);
+    }
+  }
+  nextNodes.push(...addedNodes);
+
+  const nextNodeIdSet = new Set(nextNodes.map((n) => n.id));
+  const isOldTargetInternalEdge = (e: BoardEdge) =>
+    targetOldDescSets.some(
+      (set) =>
+        (e.fromId === null && set.has(e.toId)) ||
+        (e.fromId !== null && set.has(e.fromId) && set.has(e.toId)),
+    );
+
+  const preservedEdges = edges.filter(
+    (e) =>
+      !isOldTargetInternalEdge(e) &&
+      nextNodeIdSet.has(e.toId) &&
+      (e.fromId === null || nextNodeIdSet.has(e.fromId)),
+  );
+
+  return {
+    nodes: nextNodes,
+    edges: [...preservedEdges, ...rebuiltInternalEdges],
+  };
 }
 
 export function computeChildSlotInParent(parent: BoardNode, slotIndex: number) {
@@ -980,7 +1547,7 @@ function inferOutcomePropertyRule(
       return { ...base, op: 'set', numberValue: Number(loneNum[1]) };
     }
 
-    return { ...base, op: 'formula', formula: `${fullKey} + 1` };
+    return { ...base, op: 'formula', formula: '' };
   }
 
   if (variable.type === 'boolean') {
@@ -999,7 +1566,8 @@ function inferOutcomePropertyRule(
     if (/false|否|关闭|关掉|取消|失去|禁用|锁上|未|off|disable|lock|remove/i.test(s)) {
       return { ...base, op: 'set', booleanValue: false };
     }
-    return { ...base, op: 'set', booleanValue: true };
+    if (/true|是|开启|启用|获得|打开|on|enable|unlock/i.test(s)) return {...base,op:'set',booleanValue:true};
+    return {...base,op:'formula',formula:''};
   }
 
   if (variable.type === 'choice') {
@@ -1024,7 +1592,7 @@ function inferOutcomePropertyRule(
     if (matchedOpt) {
       return { ...base, op: 'set', choiceValue: matchedOpt };
     }
-    return base;
+    return {...base,op:'formula',formula:''};
   }
 
   // Text variable

@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Check,
   ChevronDown,
+  Link2,
   Plus,
   Search,
   SlidersHorizontal,
@@ -43,22 +44,29 @@ import {
   type NumericFormulaSymbol,
   type ScopedStateVariable,
 } from '../properties/stateModel';
-import type { BoardEdge, BoardNode } from './studioModel';
+import type { BoardEdge, BoardNode, EdgeType } from './studioModel';
 
 interface ArrowConditionBuilderProps {
   lang: Language;
   edge: BoardEdge;
+  edgeType?: EdgeType;
   fromNode: BoardNode | undefined;
   nodes: BoardNode[];
   assetItems: AssetItem[];
   scopedVariables: ScopedStateVariable[];
   numericParameters: NumericFormulaSymbol[];
+  siblingDonorEdges?: BoardEdge[];
   anchorX: number;
   anchorY: number;
   containerWidth: number;
   containerHeight: number;
   titleOverride?: string;
-  onSave: (condition: string, conditionGroup: EdgeConditionGroup) => void;
+  onSave: (
+    condition: string,
+    conditionGroup: EdgeConditionGroup,
+    options?: { scope?: 'single' | 'shared' },
+  ) => void;
+  onLinkSibling?: (donorEdgeId: string) => void;
   onClear: () => void;
   onClose: () => void;
 }
@@ -1033,22 +1041,36 @@ function InlinePropertyPicker({
 export function ArrowConditionBuilder({
   lang,
   edge,
+  edgeType = 'flow',
   fromNode,
   nodes,
   assetItems,
   scopedVariables,
   numericParameters,
+  siblingDonorEdges = [],
   anchorX,
   anchorY,
   containerWidth,
   containerHeight,
   titleOverride,
   onSave,
+  onLinkSibling,
   onClear,
   onClose,
 }: ArrowConditionBuilderProps) {
   const t = COPY[lang].studio.board;
   const ec = t.edgeCond;
+
+  const canInheritSibling = edgeType === 'flow' && siblingDonorEdges.length > 0 && Boolean(onLinkSibling);
+  const matchingSharedDonor = edge.sharedConditionId
+    ? siblingDonorEdges.find((d) => d.sharedConditionId === edge.sharedConditionId)
+    : undefined;
+  const [inheritChecked, setInheritChecked] = useState<boolean>(
+    () => Boolean(edge.sharedConditionId && matchingSharedDonor),
+  );
+  const [selectedDonorId, setSelectedDonorId] = useState<string>(
+    () => matchingSharedDonor?.id ?? siblingDonorEdges[0]?.id ?? '',
+  );
 
   const [group, setGroup] = useState<EdgeConditionGroup>(() => {
     if (edge.conditionGroup && edge.conditionGroup.clauses.length > 0) {
@@ -1192,9 +1214,73 @@ export function ArrowConditionBuilder({
         </div>
       </div>
 
-      {/* Clause Rows */}
-      <div className="p-2.5 space-y-2 max-h-[340px] overflow-y-auto overscroll-contain">
-        {group.clauses.map((clause, index) => (
+      {/* Optional Sibling Condition Inheritance Checkbox (Unchecked by Default) */}
+      {canInheritSibling && (
+        <div className="px-3 py-2 border-b border-[#E2E8F0] bg-[#F8FAFC]/70 space-y-1.5">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={inheritChecked}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setInheritChecked(next);
+                if (next && !selectedDonorId && siblingDonorEdges[0]) {
+                  setSelectedDonorId(siblingDonorEdges[0].id);
+                }
+              }}
+              className="w-3.5 h-3.5 rounded border-[#94A3B8] text-[#0284C7] focus:ring-[#0284C7] cursor-pointer"
+            />
+            <span className="text-[11px] font-semibold text-[#14244B]">
+              {ec.inheritToggleLabel}
+            </span>
+          </label>
+
+          {inheritChecked && (
+            <div className="pl-5 space-y-1">
+              <div className="text-[10px] font-medium text-[#64748B]">
+                {ec.inheritPickPrompt}
+              </div>
+              <div className="space-y-1 max-h-[120px] overflow-y-auto">
+                {siblingDonorEdges.map((donor) => {
+                  const targetNode = nodes.find((n) => n.id === donor.toId);
+                  const targetLabel =
+                    targetNode?.note.trim() ||
+                    targetNode?.title.trim() ||
+                    targetNode?.kind ||
+                    donor.toId;
+                  const isPicked = selectedDonorId === donor.id;
+                  return (
+                    <button
+                      key={donor.id}
+                      type="button"
+                      onClick={() => setSelectedDonorId(donor.id)}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg border text-[11px] flex items-center gap-2 transition-colors cursor-pointer ${
+                        isPicked
+                          ? 'bg-[#E0F2FE] border-[#38BDF8] text-[#0369A1] font-semibold'
+                          : 'bg-white border-[#E2E8F0] hover:border-[#94A3B8] text-[#334155]'
+                      }`}
+                    >
+                      <Link2 className="w-3 h-3 shrink-0" aria-hidden="true" />
+                      <span className="truncate flex-1">
+                        → {targetLabel}: {donor.condition}
+                      </span>
+                      {isPicked && <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-[#64748B] leading-snug">
+                {ec.inheritActiveNote}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Clause Rows (hidden while inheriting sibling condition directly) */}
+      {!inheritChecked && (
+        <div className="p-2.5 space-y-2 max-h-[340px] overflow-y-auto overscroll-contain">
+          {group.clauses.map((clause, index) => (
           <div key={clause.id} className="space-y-1.5">
             {index > 0 && (
               <div className="flex items-center gap-2 px-1">
@@ -1279,43 +1365,74 @@ export function ArrowConditionBuilder({
             </div>
           </div>
         ))}
-      </div>
+        </div>
+      )}
 
       {/* Footer: Add Clause + Preview Summary + Save */}
       <div className="px-3 py-2 border-t border-[#E2E8F0] bg-[#F8FAFC] rounded-b-2xl flex items-center justify-between gap-2">
-        <button
-          type="button"
-          onClick={handleAddClause}
-          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold text-[#0369A1] hover:bg-[#E0F2FE] transition-colors cursor-pointer whitespace-nowrap shrink-0"
-        >
-          <Plus className="w-3.5 h-3.5" aria-hidden="true" />
-          <span>{ec.addClause}</span>
-        </button>
+        {!inheritChecked ? (
+          <button
+            type="button"
+            onClick={handleAddClause}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold text-[#0369A1] hover:bg-[#E0F2FE] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>{ec.addClause}</span>
+          </button>
+        ) : (
+          <span className="text-[10.5px] font-medium text-[#0369A1] truncate">
+            {ec.inheritToggleLabel}
+          </span>
+        )}
 
         <div className="min-w-0 flex-1 text-right">
-          {summaryPreview && (
+          {!inheritChecked && summaryPreview && (
             <span className="text-[10.5px] font-medium text-[#64748B] truncate block">
               if {summaryPreview}
             </span>
           )}
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            if (!summaryPreview) return;
-            onSave(summaryPreview, group);
-          }}
-          disabled={!summaryPreview}
-          className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-            summaryPreview
-              ? 'bg-[#14244B] hover:bg-[#1E3468] text-white cursor-pointer'
-              : 'bg-[#E2E8F0] text-[#94A3B8] cursor-not-allowed'
-          }`}
-        >
-          <Check className="w-3.5 h-3.5" aria-hidden="true" />
-          <span>{t.saveCondition}</span>
-        </button>
+        {inheritChecked ? (
+          <button
+            type="button"
+            onClick={() => {
+              if (!selectedDonorId || !onLinkSibling) return;
+              onLinkSibling(selectedDonorId);
+            }}
+            disabled={!selectedDonorId || !onLinkSibling}
+            className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              selectedDonorId && onLinkSibling
+                ? 'bg-[#0284C7] hover:bg-[#0369A1] text-white cursor-pointer'
+                : 'bg-[#E2E8F0] text-[#94A3B8] cursor-not-allowed'
+            }`}
+          >
+            <Link2 className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>{ec.inheritSaveBtn}</span>
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              if (!summaryPreview) return;
+              const detachedFromShared = Boolean(edge.sharedConditionId && !inheritChecked);
+              onSave(
+                summaryPreview,
+                group,
+                detachedFromShared ? { scope: 'single' } : undefined,
+              );
+            }}
+            disabled={!summaryPreview}
+            className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              summaryPreview
+                ? 'bg-[#14244B] hover:bg-[#1E3468] text-white cursor-pointer'
+                : 'bg-[#E2E8F0] text-[#94A3B8] cursor-not-allowed'
+            }`}
+          >
+            <Check className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>{t.saveCondition}</span>
+          </button>
+        )}
       </div>
     </div>
   );

@@ -1,15 +1,20 @@
 .stage-editor{height:100%;min-height:0;flex:none;display:flex;flex-direction:column;overflow:hidden;background:#fff;border-left:1px solid #e2e8f0;color:#14244b;font-size:12px}
 .stage-editor.stage-full{position:fixed;inset:0;width:100%;height:100%;z-index:1000}
+.stage-editor.stage-spotlight{box-shadow:inset 0 0 0 2px #fbc53d}
 .stage-editor:fullscreen{width:100%;height:100%}
 .stage-header,.stage-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
 .stage-header{padding:8px 10px;min-height:48px;justify-content:space-between;border-bottom:1px solid #e2e8f0}
 .stage-header h2{font-size:14px;font-weight:750}
 .stage-header small,.stage-editor small{color:#64748b;font-size:11px}
-.stage-editor button,.stage-editor select,.stage-editor input:not([type=checkbox]):not([type=range]){padding:4px 7px;border:1px solid #cbd5e1;border-radius:6px;background:white;color:inherit;min-width:0;max-width:100%}
-.stage-editor button:hover,.stage-editor button[aria-pressed=true]{background:#e8f1fc;border-color:#93b5d9}
-.stage-editor button:disabled{opacity:.5}
+.stage-editor button:not(:is(.stage-action-controls,.stage-play-properties,.stage-play-switches,.stage-play-chapters,.stage-team-ending) button),.stage-editor select:not(.stage-play-properties select),.stage-editor input:not([type=checkbox]):not([type=range]){padding:4px 7px;border:1px solid #cbd5e1;border-radius:6px;background:white;color:inherit;min-width:0;max-width:100%}
+.stage-editor button:is(:hover,[aria-pressed=true]):not(:is(.stage-action-controls,.stage-play-properties,.stage-play-switches,.stage-play-chapters,.stage-team-ending) button){background:#e8f1fc;border-color:#93b5d9}
+.stage-editor button:disabled:not(:is(.stage-action-controls,.stage-play-switches) button){opacity:.5}
 .stage-editor .stage-primary{background:#14244b;color:white;border-color:#14244b}
 .stage-editor .stage-primary:hover{background:#253e6e}
+.stage-editor :is(.stage-team-play,.stage-team-stop){display:inline-flex;align-items:center;gap:4px;padding:6px 10px;border-radius:8px;font-weight:600}
+.stage-editor .stage-team-play:disabled{background:#e2e8f0;color:#94a3b8;border-color:transparent;opacity:1}
+.stage-editor .stage-team-stop{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
+.stage-editor .stage-team-stop:hover{background:#fee2e2;border-color:#fecaca}
 .stage-editor .stage-icon{display:grid;place-items:center;margin:0}
 .stage-editor[style*="44px"]>.stage-icon{margin:10px auto}
 .stage-editor .stage-body{overflow:auto;min-height:0;flex:1;padding:10px;display:flex;flex-direction:column;gap:12px}
@@ -143,6 +148,16 @@
   gap: 3px;
   color: #475569;
 }
+.stage-editor .stage-map-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+.stage-editor .stage-map-label small {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .stage-editor .stage-map-rail {
   position: relative;
   display: block;
@@ -204,7 +219,9 @@
   background: #dbeafe;
   border-radius: 4px;
   border-color: #7c9fc2;
+  cursor: grab;
 }
+.stage-editor .stage-background-track[data-placing=true] button { cursor: crosshair; }
 .stage-editor button.stage-background-section[aria-pressed=true] {
   border: 2px solid #1d4ed8;
 }
@@ -331,9 +348,20 @@
   border-radius: 10px;
   background: #1e293b;
 }
+.stage-editor .stage-team-view {
+  width: min(100%, 550px);
+  aspect-ratio: 16 / 11;
+  border-radius: 16px;
+  border-color: #1e293b;
+  box-shadow: 0 12px 28px rgb(11 19 43 / .16);
+}
+.stage-editor .stage-team-empty {
+  border-color: #e2e8f0;
+  background: radial-gradient(#cbd5e1 1.15px, transparent 1.15px) 0 0 / 24px 24px #f1f5f9;
+  box-shadow: none;
+}
 .stage-editor canvas{display:block;width:100%;height:100%;touch-action:none}
 .stage-editor canvas:focus-visible{outline:2px solid #2563eb;outline-offset:-2px}
-.stage-editor .stage-overlay{position:absolute;inset:auto 0 0;padding:12px;background:#fffffff0;text-align:center}
 .stage-editor .stage-inspector{border-top:1px solid #e2e8f0;padding-top:10px}
 .stage-editor h3{font-weight:700}
 .stage-editor fieldset{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:6px;padding:6px;border:1px solid #e2e8f0;border-radius:7px}

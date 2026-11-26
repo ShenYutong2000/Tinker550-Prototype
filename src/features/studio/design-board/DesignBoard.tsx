@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   Award,
   BookOpen,
+  Check,
   ChevronDown,
   ChevronUp,
   Copy,
@@ -18,6 +19,7 @@ import {
   FileText,
   GitCommitHorizontal,
   Layers,
+  Link2,
   ListOrdered,
   Maximize2,
   MessageSquareQuote,
@@ -28,7 +30,7 @@ import {
   SlidersHorizontal,
   StickyNote,
   Trash2,
-  Ungroup,
+  Unlink,
   X,
   Zap,
 } from 'lucide-react';
@@ -47,6 +49,10 @@ import {
 } from '../properties/stateModel';
 import {
   CARD_EXPANDED_WIDTH,
+  COMBO_FRAME_DEFAULT_HEIGHT,
+  COMBO_FRAME_DEFAULT_WIDTH,
+  COMBO_FRAME_MIN_HEIGHT,
+  COMBO_FRAME_MIN_WIDTH,
   GROUP_HEADER_HEIGHT,
   GROUP_MIN_HEIGHT,
   GROUP_MIN_WIDTH,
@@ -54,14 +60,19 @@ import {
   formatActionControlKey,
   getCollapsedAncestorGroup,
   getDescendantNodeIds,
+  getGroupDefId,
   getNodeAssetIds,
   getNodeDepth,
   getNodeDimensions,
+  isActionInsideComboFrame,
   isDescendantOf,
+  resolveEdgeType,
   resolveGroupCode,
+  type BoardComboFrame,
   type BoardEdge,
   type BoardNode,
   type CardFieldConfig,
+  type EdgeType,
   type NodeKind,
 } from './studioModel';
 import type { EdgeConditionGroup } from './arrowConditionModel';
@@ -76,6 +87,7 @@ interface DesignBoardProps {
   lang: Language;
   nodes: BoardNode[];
   edges: BoardEdge[];
+  comboFrames: BoardComboFrame[];
   assetItems: AssetItem[];
   scopedVariables: ScopedStateVariable[];
   stateManagerOpen: boolean;
@@ -88,6 +100,7 @@ interface DesignBoardProps {
   onLocateStage: (nodeId: string) => void;
   onToggleStageTemplate: (nodeId: string) => void;
   onToggleStageReset: (nodeId: string) => void;
+  activePlayEdgeIds?: string[];
   onSelectNode: (id: string | null) => void;
   onConsumeAutoFocus: () => void;
   onDragNode: (id: string, dx: number, dy: number) => void;
@@ -98,11 +111,16 @@ interface DesignBoardProps {
   ) => void;
   onCommitGroupResize: (id: string) => void;
   onToggleGroupCollapse: (id: string) => void;
-  onDuplicateNode: (id: string) => void;
-  onUngroup: (id: string) => void;
+  onDuplicateNode: (id: string, mode?: 'duplicate' | 'reuse') => void;
+  onDetachGroupInstance: (id: string) => void;
+  onRemoveReusedPlacement: (id: string) => void;
+  onUngroupDefinition: (defId: string) => void;
+  onDeleteGroupDefinition: (defId: string) => void;
   onUpdateNode: (
     id: string,
-    patch: Partial<Pick<BoardNode, 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>>,
+    patch: Partial<
+      Pick<BoardNode, 'groupCode' | 'title' | 'note' | 'assetId' | 'assetIds' | 'promptInput'>
+    >,
   ) => void;
   onUpdateNodeField: <K extends keyof CardFieldConfig>(
     id: string,
@@ -111,7 +129,10 @@ interface DesignBoardProps {
   ) => void;
   onResetNodeAutoFields: (id: string) => void;
   onDeleteNode: (id: string) => void;
-  onAddNodeAt: (kind: NodeKind, worldX: number, worldY: number) => void;
+  onAddNodeAt: (kind: NodeKind, worldX: number, worldY: number, outcomeMode?: 'property'|'visual') => void;
+  onAddComboFrame: (x: number, y: number, width?: number, height?: number) => string;
+  onUpdateComboFrame: (id: string, patch: Partial<BoardComboFrame>) => void;
+  onDeleteComboFrame: (id: string) => void;
   onConnectNodes: (
     fromId: string | null,
     toId: string,
@@ -125,7 +146,12 @@ interface DesignBoardProps {
     edgeId: string,
     condition: string,
     conditionGroup?: EdgeConditionGroup,
+    options?: { scope?: 'single' | 'shared' },
   ) => void;
+  onBranchFromSharedCondition: (sourceEdgeId: string, targetId: string) => string | null;
+  onLinkEdgeToSharedCondition: (edgeId: string, donorEdgeId: string) => void;
+  onDetachSharedCondition: (edgeId: string, clearDetachedEdge?: boolean) => void;
+  onUpdateEdgeType: (edgeId: string, edgeType: EdgeType) => void;
   onDeleteEdge: (edgeId: string) => void;
   onToggleStateManager: (open?: boolean) => void;
   onAddGlobalVariable: (variable: StateVariable) => void;
@@ -190,15 +216,17 @@ interface EdgePathResult {
   path: string;
   midX: number;
   midY: number;
-  startX?: number;
-  startY?: number;
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
 }
 
 function getEntryEdgeGeometry(
   edge: BoardEdge,
   to: BoardNode,
   expandedNodeId: string | null = null,
-): EdgePathResult & { startX: number; startY: number } {
+): EdgePathResult {
   const toBase = getNodeDimensions(to);
   const toDim = {
     width:
@@ -229,6 +257,8 @@ function getEntryEdgeGeometry(
       midY,
       startX,
       startY,
+      endX,
+      endY,
     };
   }
 
@@ -245,6 +275,8 @@ function getEntryEdgeGeometry(
     midY,
     startX,
     startY,
+    endX,
+    endY,
   };
 }
 
@@ -301,6 +333,10 @@ function getEdgeGeometry(
       path: `M ${startX} ${startY} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${endX} ${endY}`,
       midX,
       midY,
+      startX,
+      startY,
+      endX,
+      endY,
     };
   }
 
@@ -323,6 +359,10 @@ function getEdgeGeometry(
       path: `M ${startX} ${startY} C ${c1x} ${startY}, ${c2x} ${endY}, ${endX} ${endY}`,
       midX,
       midY,
+      startX,
+      startY,
+      endX,
+      endY,
     };
   }
 
@@ -341,16 +381,83 @@ function getEdgeGeometry(
     path: `M ${startX} ${startY} C ${startX} ${c1y}, ${endX} ${c2y}, ${endX} ${endY}`,
     midX,
     midY,
+    startX,
+    startY,
+    endX,
+    endY,
   };
 }
 
+function buildSmoothCubicPath(
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+): EdgePathResult {
+  const dx = endX - startX;
+  const dy = endY - startY;
+  if (Math.abs(dx) >= Math.abs(dy) * 0.55) {
+    const offset = Math.max(32, Math.abs(dx) * 0.42);
+    const c1x = dx >= 0 ? startX + offset : startX - offset;
+    const c2x = dx >= 0 ? endX - offset : endX + offset;
+    const midX = 0.125 * startX + 0.375 * c1x + 0.375 * c2x + 0.125 * endX;
+    const midY = 0.125 * startY + 0.375 * startY + 0.375 * endY + 0.125 * endY;
+    return {
+      path: `M ${startX} ${startY} C ${c1x} ${startY}, ${c2x} ${endY}, ${endX} ${endY}`,
+      midX,
+      midY,
+      startX,
+      startY,
+      endX,
+      endY,
+    };
+  }
+  const offset = Math.max(28, Math.abs(dy) * 0.42);
+  const c1y = dy >= 0 ? startY + offset : startY - offset;
+  const c2y = dy >= 0 ? endY - offset : endY + offset;
+  const midX = 0.125 * startX + 0.375 * startX + 0.375 * endX + 0.125 * endX;
+  const midY = 0.125 * startY + 0.375 * c1y + 0.375 * c2y + 0.125 * endY;
+  return {
+    path: `M ${startX} ${startY} C ${startX} ${c1y}, ${endX} ${c2y}, ${endX} ${endY}`,
+    midX,
+    midY,
+    startX,
+    startY,
+    endX,
+    endY,
+  };
+}
+
+function getAnchorPointToward(
+  node: BoardNode,
+  towardX: number,
+  towardY: number,
+  expandedNodeId: string | null = null,
+): { x: number; y: number } {
+  const base = getNodeDimensions(node);
+  const w =
+    expandedNodeId === node.id && NODE_CATALOG[node.kind].isPlayable
+      ? CARD_EXPANDED_WIDTH
+      : base.width;
+  const h = base.height;
+  const cx = node.x + w / 2;
+  const cy = node.y + h / 2;
+  const dx = towardX - cx;
+  const dy = towardY - cy;
+  if (Math.abs(dx) >= Math.abs(dy) * 0.55) {
+    return { x: dx >= 0 ? node.x + w : node.x, y: cy };
+  }
+  return { x: cx, y: dy >= 0 ? node.y + h : node.y };
+}
+
 const NARRATIVE_KINDS: NodeKind[] = ['narration', 'dialogue'];
-const GAMEPLAY_KINDS: NodeKind[] = ['challenge', 'action', 'outcome'];
+const GAMEPLAY_KINDS: NodeKind[] = ['challenge', 'action'];
 
 export function DesignBoard({
   lang,
   nodes,
   edges,
+  comboFrames,
   assetItems,
   scopedVariables,
   stateManagerOpen,
@@ -363,6 +470,7 @@ export function DesignBoard({
   onLocateStage,
   onToggleStageTemplate,
   onToggleStageReset,
+  activePlayEdgeIds,
   onSelectNode,
   onConsumeAutoFocus,
   onDragNode,
@@ -371,15 +479,25 @@ export function DesignBoard({
   onCommitGroupResize,
   onToggleGroupCollapse,
   onDuplicateNode,
-  onUngroup,
+  onDetachGroupInstance,
+  onRemoveReusedPlacement,
+  onUngroupDefinition,
+  onDeleteGroupDefinition,
   onUpdateNode,
   onUpdateNodeField,
   onResetNodeAutoFields,
   onDeleteNode,
   onAddNodeAt,
+  onAddComboFrame,
+  onUpdateComboFrame,
+  onDeleteComboFrame,
   onConnectNodes,
   onUpdateEntryEdgeOffset,
   onUpdateEdgeCondition,
+  onBranchFromSharedCondition,
+  onLinkEdgeToSharedCondition,
+  onDetachSharedCondition,
+  onUpdateEdgeType,
   onDeleteEdge,
   onToggleStateManager,
   onAddGlobalVariable,
@@ -408,10 +526,18 @@ export function DesignBoard({
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
   const [editingGroupInfo, setEditingGroupInfo] = useState<{
     id: string;
-    focusField: 'title' | 'note';
+    focusField: 'code' | 'title' | 'note';
   } | null>(null);
   const [groupDirectoryOpen, setGroupDirectoryOpen] = useState(false);
+  const [groupCopyMenuId, setGroupCopyMenuId] = useState<string | null>(null);
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
+  const actionCardElements = useRef(new Map<string, HTMLDivElement>());
+  const [multiSelectedActionIds, setMultiSelectedActionIds] = useState<string[]>([]);
+  const [nodeContextMenu, setNodeContextMenu] = useState<{
+    nodeId: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const [edgeContextMenu, setEdgeContextMenu] = useState<{
     edgeId: string;
     x: number;
@@ -421,6 +547,7 @@ export function DesignBoard({
   const [connectingFrom, setConnectingFrom] = useState<
     | { kind: 'node'; nodeId: string; side: 'left' | 'right' }
     | { kind: 'air'; worldX: number; worldY: number }
+    | { kind: 'shared-condition'; sourceEdgeId: string; hubX: number; hubY: number }
     | null
   >(null);
   const connectingFromId = connectingFrom?.kind === 'node' ? connectingFrom.nodeId : null;
@@ -464,6 +591,8 @@ export function DesignBoard({
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
   const [resizingGroupId, setResizingGroupId] = useState<string | null>(null);
+  const [draggingComboId, setDraggingComboId] = useState<string | null>(null);
+  const [resizingComboId, setResizingComboId] = useState<string | null>(null);
   const [draggingEntryEdgeId, setDraggingEntryEdgeId] = useState<string | null>(null);
   const [isPanning, setIsPanning] = useState(false);
 
@@ -492,6 +621,22 @@ export function DesignBoard({
     startH: number;
   } | null>(null);
 
+  const comboDragRef = useRef<{
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    origX: number;
+    origY: number;
+  } | null>(null);
+
+  const comboResizeRef = useRef<{
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    startW: number;
+    startH: number;
+  } | null>(null);
+
   const portDragRef = useRef<{
     fromNodeId: string;
     startClientX: number;
@@ -515,6 +660,11 @@ export function DesignBoard({
   } | null>(null);
 
   const activePlaySet = useMemo(() => new Set(activePlayNodeIds), [activePlayNodeIds]);
+  const activePlayEdgeSet = useMemo(() => {
+    const set = new Set<string>(activePlayEdgeIds ?? []);
+    if (activePlayEdgeId) set.add(activePlayEdgeId);
+    return set;
+  }, [activePlayEdgeId, activePlayEdgeIds]);
   const loopEdgeIds = useMemo(() => computeLoopEdgeIds(nodes, edges), [nodes, edges]);
   const nodeMap = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const edgeMap = useMemo(() => new Map(edges.map((e) => [e.id, e])), [edges]);
@@ -576,10 +726,16 @@ export function DesignBoard({
     () => collectNumericBoardParameters(nodes),
     [nodes],
   );
-  const groupCountTotal = useMemo(
-    () => nodes.filter((n) => n.kind === 'group').length,
-    [nodes],
-  );
+  const groupDefCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const n of nodes) {
+      if (n.kind !== 'group') continue;
+      const defId = getGroupDefId(n);
+      counts.set(defId, (counts.get(defId) ?? 0) + 1);
+    }
+    return counts;
+  }, [nodes]);
+  const groupCountTotal = groupDefCounts.size;
   const dirtyVarCount = useMemo(
     () => scopedVariables.filter((v) => v.isDirty).length,
     [scopedVariables],
@@ -713,13 +869,27 @@ export function DesignBoard({
         setEditingEdgeId(null);
         setEditingGroupInfo(null);
         setGroupDirectoryOpen(false);
+        setGroupCopyMenuId(null);
         setEdgeContextMenu(null);
+        setNodeContextMenu(null);
+        setMultiSelectedActionIds([]);
         setAddMenuOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [exitConnectMode]);
+
+  useEffect(() => {
+    setMultiSelectedActionIds((prev) => {
+      if (prev.length === 0) return prev;
+      const validIds = prev.filter((id) => {
+        const n = nodeMap.get(id);
+        return Boolean(n && n.kind === 'action' && !getCollapsedAncestorGroup(id, nodeMap));
+      });
+      return validIds.length === prev.length ? prev : validIds;
+    });
+  }, [nodeMap]);
 
   const handleFitView = useCallback(() => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -794,15 +964,18 @@ export function DesignBoard({
 
   const handleCanvasPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     setEdgeContextMenu(null);
+    setNodeContextMenu(null);
     if (event.target !== event.currentTarget) return;
     if (event.button !== 0) return;
 
     onSelectNode(null);
+    setMultiSelectedActionIds([]);
     setEditingNodeId(null);
     setExpandedNodeId(null);
     setEditingEdgeId(null);
     setEditingGroupInfo(null);
     setGroupDirectoryOpen(false);
+    setGroupCopyMenuId(null);
     setAddMenuOpen(false);
 
     if (isConnectMode && (!connectingFrom || connectingFrom.kind === 'air')) {
@@ -901,6 +1074,28 @@ export function DesignBoard({
       setConnectPointerWorld(clientToWorld(event.clientX, event.clientY));
     }
 
+    if (comboResizeRef.current) {
+      const cr = comboResizeRef.current;
+      const dx = (event.clientX - cr.startClientX) / zoom;
+      const dy = (event.clientY - cr.startClientY) / zoom;
+      onUpdateComboFrame(cr.id, {
+        width: Math.max(COMBO_FRAME_MIN_WIDTH, cr.startW + dx),
+        height: Math.max(COMBO_FRAME_MIN_HEIGHT, cr.startH + dy),
+      });
+      return;
+    }
+
+    if (comboDragRef.current) {
+      const cd = comboDragRef.current;
+      const dx = (event.clientX - cd.startClientX) / zoom;
+      const dy = (event.clientY - cd.startClientY) / zoom;
+      onUpdateComboFrame(cd.id, {
+        x: Math.round(cd.origX + dx),
+        y: Math.round(cd.origY + dy),
+      });
+      return;
+    }
+
     if (groupResizeRef.current) {
       applyGroupResizeMove(event.clientX, event.clientY);
       return;
@@ -974,6 +1169,8 @@ export function DesignBoard({
       onCommitGroupResize(groupResizeRef.current.id);
     }
     groupResizeRef.current = null;
+    comboDragRef.current = null;
+    comboResizeRef.current = null;
     entryTailDragRef.current = null;
     setDraggingEntryEdgeId(null);
 
@@ -998,14 +1195,39 @@ export function DesignBoard({
     setDraggingNodeId(null);
     setDropTargetGroupId(null);
     setResizingGroupId(null);
+    setDraggingComboId(null);
+    setResizingComboId(null);
     setIsPanning(false);
   }, [exitConnectMode, onCommitGroupResize, onCommitNodeDrop]);
 
-  // Keep Group resizing & entry-dot dragging responsive even if cursor moves outside the board
+  // Keep Group & Combo Frame dragging/resizing and entry-dot dragging responsive even outside the board
   useEffect(() => {
-    if (!resizingGroupId && !draggingEntryEdgeId) return;
+    if (
+      !resizingGroupId &&
+      !draggingEntryEdgeId &&
+      !draggingComboId &&
+      !resizingComboId
+    ) {
+      return;
+    }
     const onWindowPointerMove = (e: PointerEvent) => {
-      if (groupResizeRef.current) {
+      if (comboResizeRef.current) {
+        const cr = comboResizeRef.current;
+        const dx = (e.clientX - cr.startClientX) / zoom;
+        const dy = (e.clientY - cr.startClientY) / zoom;
+        onUpdateComboFrame(cr.id, {
+          width: Math.max(COMBO_FRAME_MIN_WIDTH, cr.startW + dx),
+          height: Math.max(COMBO_FRAME_MIN_HEIGHT, cr.startH + dy),
+        });
+      } else if (comboDragRef.current) {
+        const cd = comboDragRef.current;
+        const dx = (e.clientX - cd.startClientX) / zoom;
+        const dy = (e.clientY - cd.startClientY) / zoom;
+        onUpdateComboFrame(cd.id, {
+          x: Math.round(cd.origX + dx),
+          y: Math.round(cd.origY + dy),
+        });
+      } else if (groupResizeRef.current) {
         applyGroupResizeMove(e.clientX, e.clientY);
       } else if (entryTailDragRef.current) {
         const worldPt = clientToWorld(e.clientX, e.clientY);
@@ -1030,10 +1252,14 @@ export function DesignBoard({
   }, [
     applyGroupResizeMove,
     clientToWorld,
+    draggingComboId,
     draggingEntryEdgeId,
     handleCanvasPointerUp,
+    onUpdateComboFrame,
     onUpdateEntryEdgeOffset,
+    resizingComboId,
     resizingGroupId,
+    zoom,
   ]);
 
   const handleZoomStep = (delta: number) => {
@@ -1060,11 +1286,45 @@ export function DesignBoard({
   ) => {
     const target = event.target as HTMLElement;
     if (
-      target.closest('button') ||
-      target.closest('input') ||
-      target.closest('textarea') ||
       target.closest('[data-card-popover="true"]') ||
       target.closest('[data-resize-handle="true"]')
+    ) {
+      return;
+    }
+
+    // Shift / Cmd (Mac) / Ctrl + Left-Click anywhere on an Action card toggles multi-selection for Combo creation
+    if (
+      !isConnectingActive &&
+      event.button === 0 &&
+      node.kind === 'action' &&
+      (event.shiftKey || event.metaKey || event.ctrlKey)
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      setAddMenuOpen(false);
+      setEditingEdgeId(null);
+      setEdgeContextMenu(null);
+      setNodeContextMenu(null);
+      setGroupCopyMenuId(null);
+      const prevSelectedNode =
+        selectedNodeId && selectedNodeId !== node.id ? nodeMap.get(selectedNodeId) : undefined;
+      const seed =
+        multiSelectedActionIds.length > 0
+          ? multiSelectedActionIds
+          : prevSelectedNode?.kind === 'action'
+            ? [prevSelectedNode.id]
+            : [];
+      const exists = seed.includes(node.id);
+      const next = exists ? seed.filter((id) => id !== node.id) : [...seed, node.id];
+      setMultiSelectedActionIds(next);
+      onSelectNode(exists ? (next[next.length - 1] ?? null) : node.id);
+      return;
+    }
+
+    if (
+      target.closest('button') ||
+      target.closest('input') ||
+      target.closest('textarea')
     ) {
       return;
     }
@@ -1072,6 +1332,8 @@ export function DesignBoard({
     setAddMenuOpen(false);
     setEditingEdgeId(null);
     setEdgeContextMenu(null);
+    setNodeContextMenu(null);
+    setGroupCopyMenuId(null);
 
     // Dragging from open air inside an expanded Group in Connect mode -> start a standalone trigger arrow!
     if (
@@ -1092,6 +1354,19 @@ export function DesignBoard({
         moved: false,
         wasAlreadyAir,
       };
+      return;
+    }
+
+    if (connectingFrom?.kind === 'shared-condition') {
+      const srcEdge = edgeMap.get(connectingFrom.sourceEdgeId);
+      if (
+        NODE_CATALOG[node.kind].isPlayable &&
+        srcEdge &&
+        srcEdge.fromId !== node.id
+      ) {
+        onBranchFromSharedCondition(connectingFrom.sourceEdgeId, node.id);
+      }
+      exitConnectMode();
       return;
     }
 
@@ -1127,6 +1402,11 @@ export function DesignBoard({
       return;
     }
 
+    if (event.button !== 0) {
+      return;
+    }
+
+    setMultiSelectedActionIds([]);
     onSelectNode(node.id);
     setDraggingNodeId(node.id);
     nodeDragRef.current = {
@@ -1149,6 +1429,19 @@ export function DesignBoard({
     setEditingEdgeId(null);
     setEditingGroupInfo(null);
     setEdgeContextMenu(null);
+
+    if (connectingFrom?.kind === 'shared-condition') {
+      const srcEdge = edgeMap.get(connectingFrom.sourceEdgeId);
+      if (
+        NODE_CATALOG[node.kind].isPlayable &&
+        srcEdge &&
+        srcEdge.fromId !== node.id
+      ) {
+        onBranchFromSharedCondition(connectingFrom.sourceEdgeId, node.id);
+      }
+      exitConnectMode();
+      return;
+    }
 
     if (connectingFrom?.kind === 'air') {
       if (NODE_CATALOG[node.kind].isPlayable) {
@@ -1221,13 +1514,14 @@ export function DesignBoard({
     }
   };
 
-  const handleAddKindInViewport = (kind: NodeKind) => {
+  const handleAddKindInViewport = (kind: NodeKind, outcomeMode: 'property'|'visual' = 'property') => {
+    const add = (kind:NodeKind,x:number,y:number) => onAddNodeAt(kind,x,y,outcomeMode);
     setAddMenuOpen(false);
     const selected = selectedNodeId ? nodeMap.get(selectedNodeId) : null;
     if (selected) {
       if (selected.kind === 'group' && !selected.collapsed && kind !== 'group') {
         const siblingCount = nodes.filter((n) => n.parentId === selected.id).length;
-        onAddNodeAt(
+        add(
           kind,
           Math.round(selected.x + 24 + (siblingCount % 2) * 284),
           Math.round(selected.y + GROUP_HEADER_HEIGHT + 24 + Math.floor(siblingCount / 2) * 156),
@@ -1235,26 +1529,128 @@ export function DesignBoard({
         return;
       }
       const sDim = getNodeDimensions(selected);
-      onAddNodeAt(kind, Math.round(selected.x + sDim.width + 48), Math.round(selected.y));
+      add(kind, Math.round(selected.x + sDim.width + 48), Math.round(selected.y));
       return;
     }
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) {
-      onAddNodeAt(kind, 180, 180);
+      add(kind, 180, 180);
       return;
     }
     const cx = (rect.width / 2 - pan.x) / zoom - (kind === 'group' ? 240 : 122);
     const cy = ((rect.height + 80) / 2 - pan.y) / zoom - (kind === 'group' ? 140 : 64);
     const offset = nodes.length === 0 ? 0 : ((nodes.length % 4) - 1.5) * 32;
-    onAddNodeAt(kind, Math.round(cx + offset), Math.round(cy + offset * 0.6));
+    add(kind, Math.round(cx + offset), Math.round(cy + offset * 0.6));
+  };
+
+  const createComboBoxAroundActions = useCallback(
+    (actionIds: string[]) => {
+      const actionNodes = actionIds
+        .map((id) => nodeMap.get(id))
+        .filter((n): n is BoardNode => Boolean(n && n.kind === 'action'));
+      if (actionNodes.length === 0) return;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const n of actionNodes) {
+        const dim = getNodeDimensions(n);
+        const element = actionCardElements.current.get(n.id);
+        const w = element?.offsetWidth ?? (expandedNodeId === n.id ? CARD_EXPANDED_WIDTH : dim.width);
+        const h = element?.offsetHeight ?? dim.height;
+        minX = Math.min(minX, n.x);
+        minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x + w);
+        maxY = Math.max(maxY, n.y + h);
+      }
+      const padX = 20;
+      const padY = 20;
+      onAddComboFrame(
+        Math.round(minX - padX),
+        Math.round(minY - padY),
+        Math.round(maxX - minX + padX * 2),
+        Math.round(maxY - minY + padY * 2),
+      );
+      setMultiSelectedActionIds(actionIds);
+    },
+    [expandedNodeId, nodeMap, onAddComboFrame],
+  );
+
+  const handleAddComboFrameInViewport = () => {
+    setAddMenuOpen(false);
+    setNodeContextMenu(null);
+    if (multiSelectedActionIds.length >= 2) {
+      createComboBoxAroundActions(multiSelectedActionIds);
+      return;
+    }
+    const selected = selectedNodeId ? nodeMap.get(selectedNodeId) : null;
+    if (selected && selected.kind === 'action') {
+      createComboBoxAroundActions([selected.id]);
+      return;
+    }
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) {
+      onAddComboFrame(220, 180);
+      return;
+    }
+    const offset = comboFrames.length * 24;
+    const cx = (rect.width / 2 - pan.x) / zoom - COMBO_FRAME_DEFAULT_WIDTH / 2 + offset;
+    const cy = ((rect.height + 40) / 2 - pan.y) / zoom - COMBO_FRAME_DEFAULT_HEIGHT / 2 + offset;
+    onAddComboFrame(Math.round(cx), Math.round(cy));
   };
 
   const openEdgeConditionEditor = (edge: BoardEdge) => {
     setEdgeContextMenu(null);
+    setNodeContextMenu(null);
     setEditingNodeId(null);
     setExpandedNodeId(null);
     setEditingGroupInfo(null);
     setEditingEdgeId(edge.id);
+  };
+
+  const handleActionContextMenu = (
+    node: BoardNode,
+    event: ReactMouseEvent<HTMLDivElement>,
+  ) => {
+    if (node.kind !== 'action') return;
+    const target = event.target as HTMLElement;
+    if (target.closest('input') || target.closest('textarea')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const rawX = event.clientX - rect.left;
+    const rawY = event.clientY - rect.top;
+    const x = Math.max(12, Math.min(rect.width - 252, rawX));
+    const y = Math.max(12, Math.min(rect.height - 148, rawY));
+    if (
+      (event.shiftKey || event.metaKey || event.ctrlKey) &&
+      !multiSelectedActionIds.includes(node.id)
+    ) {
+      const prevSelectedNode =
+        selectedNodeId && selectedNodeId !== node.id ? nodeMap.get(selectedNodeId) : undefined;
+      const base =
+        multiSelectedActionIds.length > 0
+          ? multiSelectedActionIds
+          : prevSelectedNode?.kind === 'action'
+            ? [prevSelectedNode.id]
+            : [];
+      setMultiSelectedActionIds([...base, node.id]);
+    }
+    setAddMenuOpen(false);
+    setEditingEdgeId(null);
+    setEdgeContextMenu(null);
+    setGroupCopyMenuId(null);
+    setNodeContextMenu({ nodeId: node.id, x, y });
+  };
+
+  const handleEdgeConditionContextMenu = (
+    edge: BoardEdge,
+    event: ReactMouseEvent<SVGElement | HTMLDivElement | HTMLButtonElement>,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openEdgeConditionEditor(edge);
   };
 
   const handleEdgeContextMenu = (
@@ -1271,6 +1667,7 @@ export function DesignBoard({
     const y = Math.max(12, Math.min(rect.height - 132, rawY));
     setAddMenuOpen(false);
     setEditingEdgeId(null);
+    setNodeContextMenu(null);
     setEdgeContextMenu({ edgeId: edge.id, x, y });
   };
 
@@ -1302,6 +1699,7 @@ export function DesignBoard({
       .map((edge) => {
         const rawTo = nodeMap.get(edge.toId);
         if (!rawTo) return null;
+        const edgeType = resolveEdgeType(edge, nodeMap);
 
         if (edge.fromId === null) {
           // Hide internal standalone trigger arrow while owning Group is collapsed
@@ -1309,6 +1707,7 @@ export function DesignBoard({
           const geom = getEntryEdgeGeometry(edge, rawTo, expandedNodeId);
           return {
             edge,
+            edgeType: 'flow' as EdgeType,
             from: undefined as BoardNode | undefined,
             to: rawTo,
             isLoop: false,
@@ -1322,10 +1721,11 @@ export function DesignBoard({
         const from = getCollapsedAncestorGroup(rawFrom.id, nodeMap) ?? rawFrom;
         const to = getCollapsedAncestorGroup(rawTo.id, nodeMap) ?? rawTo;
         if (from.id === to.id) return null;
-        const isLoop = loopEdgeIds.has(edge.id);
+        const isLoop = edgeType === 'flow' && loopEdgeIds.has(edge.id);
         const geom = getEdgeGeometry(from, to, isLoop, expandedNodeId);
         return {
           edge,
+          edgeType,
           from: from as BoardNode | undefined,
           to,
           isLoop,
@@ -1335,6 +1735,107 @@ export function DesignBoard({
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
   }, [edges, expandedNodeId, loopEdgeIds, nodeMap]);
+
+  const { sharedConditionGroups, groupedEdgeIdSet } = useMemo(() => {
+    const byKey = new Map<string, (typeof computedEdges)[number][]>();
+    for (const item of computedEdges) {
+      if (item.edgeType !== 'flow' || !item.edge.sharedConditionId) continue;
+      const srcKey = item.from ? item.from.id : '__entry__';
+      const bucketKey = `${item.edge.sharedConditionId}::${srcKey}`;
+      const list = byKey.get(bucketKey) ?? [];
+      list.push(item);
+      byKey.set(bucketKey, list);
+    }
+
+    const groups: {
+      key: string;
+      sharedId: string;
+      primaryItem: (typeof computedEdges)[number];
+      items: (typeof computedEdges)[number][];
+      isEntry: boolean;
+      srcX: number;
+      srcY: number;
+      hubX: number;
+      hubY: number;
+      trunkPath: string;
+      branches: {
+        item: (typeof computedEdges)[number];
+        path: string;
+        endX: number;
+        endY: number;
+      }[];
+    }[] = [];
+    const idSet = new Set<string>();
+
+    for (const [key, items] of byKey.entries()) {
+      if (items.length < 2) continue;
+      items.forEach((i) => idSet.add(i.edge.id));
+      const primaryItem = items[0];
+      const isEntry = primaryItem.isEntry;
+
+      const targetCenters = items.map((i) => {
+        const dim = getNodeDimensions(i.to);
+        const w =
+          expandedNodeId === i.to.id && NODE_CATALOG[i.to.kind].isPlayable
+            ? CARD_EXPANDED_WIDTH
+            : dim.width;
+        return { x: i.to.x + w / 2, y: i.to.y + dim.height / 2 };
+      });
+      const avgTargetCx =
+        targetCenters.reduce((acc, p) => acc + p.x, 0) / targetCenters.length;
+      const avgTargetCy =
+        targetCenters.reduce((acc, p) => acc + p.y, 0) / targetCenters.length;
+
+      const srcPt =
+        isEntry || !primaryItem.from
+          ? { x: primaryItem.startX, y: primaryItem.startY }
+          : getAnchorPointToward(
+              primaryItem.from,
+              avgTargetCx,
+              avgTargetCy,
+              expandedNodeId,
+            );
+
+      const initialEnds = items.map((i) =>
+        getAnchorPointToward(i.to, srcPt.x, srcPt.y, expandedNodeId),
+      );
+      const avgEndX =
+        initialEnds.reduce((acc, p) => acc + p.x, 0) / initialEnds.length;
+      const avgEndY =
+        initialEnds.reduce((acc, p) => acc + p.y, 0) / initialEnds.length;
+
+      const hubX = Math.round(srcPt.x + (avgEndX - srcPt.x) * 0.44);
+      const hubY = Math.round(srcPt.y + (avgEndY - srcPt.y) * 0.44);
+      const trunkPath = buildSmoothCubicPath(srcPt.x, srcPt.y, hubX, hubY).path;
+
+      const branches = items.map((item) => {
+        const endPt = getAnchorPointToward(item.to, hubX, hubY, expandedNodeId);
+        const branchGeom = buildSmoothCubicPath(hubX, hubY, endPt.x, endPt.y);
+        return {
+          item,
+          path: branchGeom.path,
+          endX: endPt.x,
+          endY: endPt.y,
+        };
+      });
+
+      groups.push({
+        key,
+        sharedId: primaryItem.edge.sharedConditionId!,
+        primaryItem,
+        items,
+        isEntry,
+        srcX: srcPt.x,
+        srcY: srcPt.y,
+        hubX,
+        hubY,
+        trunkPath,
+        branches,
+      });
+    }
+
+    return { sharedConditionGroups: groups, groupedEdgeIdSet: idSet };
+  }, [computedEdges, expandedNodeId]);
 
   const getCompactCardSummary = (node: BoardNode): string[] => {
     const parts: string[] = [];
@@ -1396,11 +1897,13 @@ export function DesignBoard({
   const renderCard = (node: BoardNode) => {
     const meta = NODE_CATALOG[node.kind];
     const dim = getNodeDimensions(node);
-    const kindLabel = lang === 'zh' ? meta.labelZh : meta.labelEn;
+    const kindLabel = node.kind==='outcome' ? (node.promptInput?.outcomeMode==='visual' ? (lang==='zh'?'视觉变化':'Visual outcome') : (lang==='zh'?'属性变化':'Property outcome')) : lang === 'zh' ? meta.labelZh : meta.labelEn;
     const placeholderText = lang === 'zh' ? meta.placeholderZh : meta.placeholderEn;
     const isGroup = node.kind === 'group';
     const isDraft = node.kind === 'draft';
     const isSelected = selectedNodeId === node.id;
+    const isComboMember = comboFrames.some((frame) => isActionInsideComboFrame(node, frame));
+    const isMultiSelected = node.kind === 'action' && multiSelectedActionIds.includes(node.id);
     const isPlaying = activePlaySet.has(node.id);
     const depth = getNodeDepth(node.id, nodeMap);
 
@@ -1422,9 +1925,15 @@ export function DesignBoard({
       const isConnectCandidate = Boolean(
         (isConnectMode && !connectingFrom) ||
           (connectingFrom?.kind === 'node' && connectingFrom.nodeId !== node.id) ||
-          connectingFrom?.kind === 'air',
+          connectingFrom?.kind === 'air' ||
+          (connectingFrom?.kind === 'shared-condition' &&
+            edgeMap.get(connectingFrom.sourceEdgeId)?.fromId !== node.id),
       );
       const groupCode = resolveGroupCode(node, nodes);
+      const groupDefId = getGroupDefId(node);
+      const reusedCount = groupDefCounts.get(groupDefId) ?? 1;
+      const isReusedInstance = reusedCount > 1;
+      const isCopyMenuOpen = groupCopyMenuId === node.id;
       const hasGroupNote = Boolean(node.note.trim());
       const summaryParts: string[] = [];
       if (cardCount > 0) {
@@ -1449,7 +1958,9 @@ export function DesignBoard({
           ? '#F59E0B'
           : isSelected || hasSelectedChild
             ? '#14244B'
-            : '#94A3B8';
+            : isReusedInstance
+              ? '#0284C7'
+              : '#94A3B8';
 
       return (
         <div
@@ -1462,13 +1973,15 @@ export function DesignBoard({
             width: `${dim.width}px`,
             height: `${dim.height}px`,
             borderColor: groupBorder,
-            zIndex: node.collapsed
-              ? isDragging
-                ? 36
-                : 18 + depth
-              : isDragging || isResizing
-                ? 16
-                : 4 + depth,
+            zIndex: isCopyMenuOpen
+              ? 42
+              : node.collapsed
+                ? isDragging
+                  ? 36
+                  : 18 + depth
+                : isDragging || isResizing
+                  ? 16
+                  : 4 + depth,
           }}
           className={`pointer-events-auto absolute rounded-2xl border transition-shadow duration-150 flex flex-col ${
             node.collapsed
@@ -1491,10 +2004,39 @@ export function DesignBoard({
           {/* Group Header Bar */}
           <div className="px-3 h-10 border-b border-[#CBD5E1]/80 bg-white/95 flex items-center justify-between gap-2 shrink-0 rounded-t-[14px]">
             <div className="flex items-center gap-1.5 min-w-0 flex-1">
-              <Layers className="w-3.5 h-3.5 text-[#475569] shrink-0" aria-hidden="true" />
-              <span className="px-1.5 py-0.5 rounded bg-[#14244B] text-white font-mono text-[10px] font-bold tracking-tight shrink-0">
+              {isReusedInstance ? (
+                <Link2 className="w-3.5 h-3.5 text-[#0284C7] shrink-0" aria-hidden="true" />
+              ) : (
+                <Layers className="w-3.5 h-3.5 text-[#475569] shrink-0" aria-hidden="true" />
+              )}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setGroupCopyMenuId(null);
+                  setEditingEdgeId(null);
+                  setEdgeContextMenu(null);
+                  setEditingGroupInfo({ id: node.id, focusField: 'code' });
+                  onSelectNode(node.id);
+                }}
+                title={t.groupIdEditTitle}
+                aria-label={`${t.groupIdEditTitle}: ${groupCode}`}
+                className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold tracking-tight shrink-0 transition-opacity hover:opacity-90 cursor-pointer ${
+                  isReusedInstance
+                    ? 'bg-[#0284C7] text-white'
+                    : 'bg-[#14244B] text-white'
+                }`}
+              >
                 {groupCode}
-              </span>
+              </button>
+              {isReusedInstance && (
+                <span
+                  title={t.groupReuseSameIdHint}
+                  className="px-1 py-0.5 rounded bg-[#E0F2FE] text-[#0369A1] font-mono text-[9.5px] font-bold shrink-0"
+                >
+                  ×{reusedCount}
+                </span>
+              )}
               {isEditingGroupTitle ? (
                 <input
                   type="text"
@@ -1517,6 +2059,7 @@ export function DesignBoard({
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
+                    setGroupCopyMenuId(null);
                     onSelectNode(node.id);
                     setEditingNodeId(node.id);
                   }}
@@ -1540,6 +2083,7 @@ export function DesignBoard({
             </div>
 
             <div className="flex items-center gap-0.5 shrink-0">
+              <button title={lang==='zh'?'移除这个分组，保留内部卡片':'Remove this group; keep its cards'} aria-label={lang==='zh'?'移除分组':'Remove group'} onClick={e=>{e.stopPropagation();onDeleteNode(node.id);}} className="p-1.5 rounded hover:bg-red-50 text-slate-400 hover:text-red-600"><Trash2 className="w-3.5 h-3.5"/></button>
               {hasPlayingChild && (
                 <span className="text-[10px] font-bold text-[#B45309] mr-1 whitespace-nowrap">
                   · {t.playingNow}
@@ -1550,6 +2094,7 @@ export function DesignBoard({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
+                  setGroupCopyMenuId(null);
                   setEditingEdgeId(null);
                   setEdgeContextMenu(null);
                   setEditingGroupInfo({ id: node.id, focusField: 'note' });
@@ -1566,18 +2111,6 @@ export function DesignBoard({
                 <span>{t.groupDescLabel}</span>
               </button>
 
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDuplicateNode(node.id);
-                }}
-                title={t.groupDuplicate}
-                aria-label={t.groupDuplicate}
-                className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
-              >
-                <Copy className="w-3 h-3" aria-hidden="true" />
-              </button>
               <button type="button" aria-pressed={Boolean(node.stageTemplate)}
                 title={lang === 'zh' ? '可复用舞台玩法' : 'Reusable stage mechanism'}
                 onPointerDown={event => event.stopPropagation()}
@@ -1593,10 +2126,106 @@ export function DesignBoard({
                 {lang === 'zh' ? '入场重置' : 'Reset on entry'}
               </button>
 
+              {/* Copy as New vs Linked Reuse Popover */}
+              <div className="relative" data-card-popover="true">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingEdgeId(null);
+                    setEdgeContextMenu(null);
+                    setGroupCopyMenuId((prev) => (prev === node.id ? null : node.id));
+                    onSelectNode(node.id);
+                  }}
+                  title={t.groupDuplicate}
+                  aria-label={t.groupDuplicate}
+                  aria-expanded={isCopyMenuOpen}
+                  className={`w-6 h-6 rounded-md flex items-center justify-center transition-colors cursor-pointer ${
+                    isCopyMenuOpen
+                      ? 'bg-[#14244B] text-white'
+                      : 'text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9]'
+                  }`}
+                >
+                  <Copy className="w-3 h-3" aria-hidden="true" />
+                </button>
+
+                {isCopyMenuOpen && (
+                  <div
+                    data-card-popover="true"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                    className="absolute right-0 top-full mt-1.5 w-60 bg-white rounded-xl border border-[#CBD5E1] shadow-[0_14px_34px_rgba(20,36,75,0.2)] p-1.5 space-y-0.5 z-50"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGroupCopyMenuId(null);
+                        onDuplicateNode(node.id, 'duplicate');
+                      }}
+                      className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[#F8FAFC] flex items-start gap-2 transition-colors cursor-pointer"
+                    >
+                      <Copy className="w-3.5 h-3.5 text-[#14244B] mt-0.5 shrink-0" aria-hidden="true" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-[#14244B]">
+                          {t.groupDuplicateAsNew}
+                        </div>
+                        <div className="text-[10.5px] text-[#64748B] leading-snug">
+                          {t.groupDuplicateAsNewHint}
+                        </div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGroupCopyMenuId(null);
+                        onDuplicateNode(node.id, 'reuse');
+                      }}
+                      className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[#F0F9FF] flex items-start gap-2 transition-colors cursor-pointer"
+                    >
+                      <Link2 className="w-3.5 h-3.5 text-[#0284C7] mt-0.5 shrink-0" aria-hidden="true" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-[#0369A1]">
+                          {t.groupReuseSameId}
+                        </div>
+                        <div className="text-[10.5px] text-[#64748B] leading-snug">
+                          {t.groupReuseSameIdHint}
+                        </div>
+                      </div>
+                    </button>
+
+                    {isReusedInstance && (
+                      <>
+                        <div className="my-1 border-t border-[#F1F5F9]" />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setGroupCopyMenuId(null);
+                            onDetachGroupInstance(node.id);
+                          }}
+                          className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[#FFFBEB] flex items-start gap-2 transition-colors cursor-pointer"
+                        >
+                          <Unlink className="w-3.5 h-3.5 text-[#B45309] mt-0.5 shrink-0" aria-hidden="true" />
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-[#B45309]">
+                              {t.groupDetachInstance}
+                            </div>
+                            <div className="text-[10.5px] text-[#64748B] leading-snug">
+                              {t.groupDetachInstanceHint}
+                            </div>
+                          </div>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
+                  setGroupCopyMenuId(null);
                   onToggleGroupCollapse(node.id);
                   onSelectNode(node.id);
                 }}
@@ -1611,35 +2240,22 @@ export function DesignBoard({
                 )}
               </button>
 
-              {directChildren.length > 0 && (
+              {isReusedInstance && (
                 <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
+                    setGroupCopyMenuId(null);
                     if (editingGroupInfo?.id === node.id) setEditingGroupInfo(null);
-                    onUngroup(node.id);
+                    onRemoveReusedPlacement(node.id);
                   }}
-                  title={t.groupUngroup}
-                  aria-label={t.groupUngroup}
-                  className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#14244B] hover:bg-[#F1F5F9] flex items-center justify-center transition-colors cursor-pointer"
+                  title={t.groupRemovePlacement}
+                  aria-label={t.groupRemovePlacement}
+                  className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#DC2626] hover:bg-[#FEF2F2] flex items-center justify-center transition-colors cursor-pointer"
                 >
-                  <Ungroup className="w-3 h-3" aria-hidden="true" />
+                  <X className="w-3 h-3" aria-hidden="true" />
                 </button>
               )}
-
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (editingGroupInfo?.id === node.id) setEditingGroupInfo(null);
-                  onDeleteNode(node.id);
-                }}
-                title={t.deleteCard}
-                aria-label={t.deleteCard}
-                className="w-6 h-6 rounded-md text-[#64748B] hover:text-[#DC2626] hover:bg-[#FEF2F2] flex items-center justify-center transition-colors cursor-pointer"
-              >
-                <Trash2 className="w-3 h-3" aria-hidden="true" />
-              </button>
             </div>
           </div>
 
@@ -1867,7 +2483,9 @@ export function DesignBoard({
       meta.isPlayable &&
         ((isConnectMode && !connectingFrom) ||
           (connectingFrom?.kind === 'node' && connectingFrom.nodeId !== node.id) ||
-          connectingFrom?.kind === 'air'),
+          connectingFrom?.kind === 'air' ||
+          (connectingFrom?.kind === 'shared-condition' &&
+            edgeMap.get(connectingFrom.sourceEdgeId)?.fromId !== node.id)),
     );
 
     const cardWidth = isExpanded ? CARD_EXPANDED_WIDTH : dim.width;
@@ -1905,8 +2523,13 @@ export function DesignBoard({
     return (
       <div
         key={node.id}
+        ref={(element) => {
+          if (element) actionCardElements.current.set(node.id, element);
+          else actionCardElements.current.delete(node.id);
+        }}
         onPointerDown={(e) => handleNodePointerDown(node, e)}
         onPointerUp={(e) => handleTargetCardPointerUp(node, e)}
+        onContextMenu={(e) => handleActionContextMenu(node, e)}
         onDoubleClick={(e) => {
           if (!isDraft) return;
           e.stopPropagation();
@@ -1919,24 +2542,26 @@ export function DesignBoard({
           width: `${cardWidth}px`,
           minHeight: `${dim.height}px`,
           backgroundColor: meta.surfaceBg,
-          borderColor: activeBorderColor,
+          borderColor: isMultiSelected ? '#0EA5E9' : activeBorderColor,
         }}
         className={`pointer-events-auto absolute ${meta.shapeClass} ${
           isDraft ? 'border border-dashed' : 'border-2'
         } transition-shadow duration-150 flex flex-col ${zIndexClass} ${
           highlightedNodeId === node.id
             ? 'ring-4 ring-[#4E9AE3]/80 shadow-[0_14px_34px_rgba(78,154,227,0.3)]'
-            : isExpanded
-              ? 'shadow-[0_22px_50px_rgba(15,23,42,0.22)]'
-              : isDragging
-                ? 'shadow-[0_20px_42px_rgba(20,36,75,0.2)] cursor-grabbing'
-                : isPlaying
-                  ? 'ring-4 ring-[#FBC53D]/70 shadow-[0_14px_34px_rgba(245,158,11,0.28)]'
-                  : isConnectCandidate
-                    ? 'hover:ring-2 hover:ring-[#4E9AE3] cursor-crosshair'
-                    : isDraft
-                      ? 'shadow-[0_4px_12px_rgba(15,23,42,0.06)] hover:shadow-[0_8px_18px_rgba(15,23,42,0.1)] cursor-grab'
-                      : 'shadow-[0_6px_18px_rgba(20,36,75,0.07)] hover:shadow-[0_10px_24px_rgba(20,36,75,0.12)] cursor-grab'
+            : isMultiSelected
+              ? 'ring-4 ring-[#0EA5E9]/75 shadow-[0_14px_30px_rgba(14,165,233,0.24)]'
+              : isExpanded
+                ? 'shadow-[0_22px_50px_rgba(15,23,42,0.22)]'
+                : isDragging
+                  ? 'shadow-[0_20px_42px_rgba(20,36,75,0.2)] cursor-grabbing'
+                  : isPlaying
+                    ? 'ring-4 ring-[#FBC53D]/70 shadow-[0_14px_34px_rgba(245,158,11,0.28)]'
+                    : isConnectCandidate
+                      ? 'hover:ring-2 hover:ring-[#4E9AE3] cursor-crosshair'
+                      : isDraft
+                        ? 'shadow-[0_4px_12px_rgba(15,23,42,0.06)] hover:shadow-[0_8px_18px_rgba(15,23,42,0.1)] cursor-grab'
+                        : 'shadow-[0_6px_18px_rgba(20,36,75,0.07)] hover:shadow-[0_10px_24px_rgba(20,36,75,0.12)] cursor-grab'
         }`}
       >
         {/* Header Bar (Drag Handle) */}
@@ -1955,15 +2580,15 @@ export function DesignBoard({
             >
               {isDraft ? t.draftBadge : kindLabel}
             </span>
+            {(isMultiSelected || isComboMember) && (
+              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.25 rounded-full bg-[#0284C7] text-white text-[9.5px] font-bold shrink-0">
+                <Check className="w-2.5 h-2.5" aria-hidden="true" />
+                {isComboMember && <span>Combo</span>}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-0.5 shrink-0">
-            {!!placementCounts[node.id] && <button type="button"
-              className="px-1.5 py-0.5 text-[10px] text-[#2563EB] underline"
-              onPointerDown={event => event.stopPropagation()}
-              onClick={event => { event.stopPropagation(); onLocateStage(node.id); }}>
-              {placementCounts[node.id]} {lang === 'zh' ? '个实例' : 'instances'}
-            </button>}
             {isPlaying && (
               <span className="text-[10px] font-bold text-[#B45309] mr-1 whitespace-nowrap">
                 · {t.playingNow}
@@ -2040,39 +2665,47 @@ export function DesignBoard({
             />
 
             {/* Compact Unboxed Summary & Expand Strip */}
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setEditingEdgeId(null);
-                setExpandedNodeId(isExpanded ? null : node.id);
-                onSelectNode(node.id);
-              }}
-              style={
-                !isExpanded && isSpeechBubble
-                  ? { backgroundColor: speechTailFill }
-                  : undefined
-              }
-              className={`w-full px-3 py-1.5 border-t border-black/8 flex items-center justify-between gap-2 text-left transition-colors cursor-pointer ${
-                isExpanded
-                  ? 'bg-white/95 text-[#14244B]'
-                  : isSpeechBubble
-                    ? 'text-[#475569] hover:brightness-[0.98]'
-                    : 'bg-white/45 hover:bg-white/80 text-[#475569]'
-              } ${!isExpanded ? 'rounded-b-[inherit]' : ''}`}
-            >
-              <span className="text-[10.5px] text-[#64748B] truncate">
-                {summaryParts.length > 0 ? summaryParts.join(' · ') : t.autoMappedTag}
-              </span>
-              <span className="inline-flex items-center gap-0.5 text-[10.5px] font-semibold text-[#14244B] whitespace-nowrap shrink-0">
-                <span>{isExpanded ? t.collapseCard : t.expandCard}</span>
-                {isExpanded ? (
-                  <ChevronUp className="w-3 h-3" aria-hidden="true" />
-                ) : (
-                  <ChevronDown className="w-3 h-3" aria-hidden="true" />
-                )}
-              </span>
-            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditingEdgeId(null);
+                  setExpandedNodeId(isExpanded ? null : node.id);
+                  onSelectNode(node.id);
+                }}
+                style={
+                  !isExpanded && isSpeechBubble
+                    ? { backgroundColor: speechTailFill }
+                    : undefined
+                }
+                className={`w-full px-3 py-1.5 border-t border-black/8 flex items-center justify-between gap-2 text-left transition-colors cursor-pointer ${
+                  isExpanded
+                    ? 'bg-white/95 text-[#14244B]'
+                    : isSpeechBubble
+                      ? 'text-[#475569] hover:brightness-[0.98]'
+                      : 'bg-white/45 hover:bg-white/80 text-[#475569]'
+                } ${!isExpanded ? 'rounded-b-[inherit]' : ''}`}
+              >
+                <span className={`text-[10.5px] text-[#64748B] truncate ${placementCounts[node.id] ? 'max-w-[35%]' : ''}`}>
+                  {summaryParts.length > 0 ? summaryParts.join(' · ') : t.autoMappedTag}
+                </span>
+                <span className="inline-flex items-center gap-0.5 text-[10.5px] font-semibold text-[#14244B] whitespace-nowrap shrink-0">
+                  <span>{isExpanded ? t.collapseCard : t.expandCard}</span>
+                  {isExpanded ? (
+                    <ChevronUp className="w-3 h-3" aria-hidden="true" />
+                  ) : (
+                    <ChevronDown className="w-3 h-3" aria-hidden="true" />
+                  )}
+                </span>
+              </button>
+              {!!placementCounts[node.id] && <button type="button"
+                className="absolute right-[5rem] top-1/2 -translate-y-1/2 text-[10.5px] text-[#2563EB] underline whitespace-nowrap"
+                onPointerDown={event => event.stopPropagation()}
+                onClick={event => { event.stopPropagation(); onLocateStage(node.id); }}>
+                {placementCounts[node.id]} {lang === 'zh' ? '个实例' : placementCounts[node.id] === 1 ? 'instance' : 'instances'}
+              </button>}
+            </div>
 
             {/* In-Place Widened Floating Expanded Attributes Panel */}
             {isExpanded && (
@@ -2257,6 +2890,9 @@ export function DesignBoard({
   const contextMenuEdge = edgeContextMenu
     ? edgeMap.get(edgeContextMenu.edgeId) ?? null
     : null;
+  const contextMenuNode = nodeContextMenu
+    ? nodeMap.get(nodeContextMenu.nodeId) ?? null
+    : null;
 
   return (
     <div
@@ -2272,6 +2908,7 @@ export function DesignBoard({
       onContextMenu={(e) => {
         if (e.target === e.currentTarget) {
           setEdgeContextMenu(null);
+          setNodeContextMenu(null);
         }
       }}
       onScroll={(e) => {
@@ -2318,7 +2955,13 @@ export function DesignBoard({
       {/* Active Connect Mode Banner */}
       {isConnectingActive && (
         <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-40 bg-[#14244B] text-white text-xs font-medium px-4 py-2 rounded-xl shadow-md flex items-center gap-2.5 whitespace-nowrap">
-          <span>{connectingFrom ? t.connectingHint : t.connectPickSourceHint}</span>
+          <span>
+            {connectingFrom?.kind === 'shared-condition'
+              ? t.menuShareHint
+              : connectingFrom
+                ? t.connectingHint
+                : t.connectPickSourceHint}
+          </span>
           <button
             type="button"
             onClick={exitConnectMode}
@@ -2381,106 +3024,280 @@ export function DesignBoard({
             </marker>
           </defs>
 
-          {computedEdges.map(({ edge, to, path, isLoop, isEntry, startX, startY }) => {
-            const isActive = activePlayEdgeId === edge.id;
-            const isLocated = highlightedEdgeId === edge.id;
-            const isHovered =
-              hoveredEdgeId === edge.id ||
-              editingEdgeId === edge.id ||
-              edgeContextMenu?.edgeId === edge.id;
-            const hasCond = Boolean(
-              edge.condition?.trim() || edge.conditionGroup?.clauses.length,
-            );
+          {computedEdges.map(
+            ({ edge, edgeType, to, path, isLoop, isEntry, startX, startY, endX, endY }) => {
+              if (groupedEdgeIdSet.has(edge.id)) return null;
+              const isAssoc = edgeType === 'association';
+              const isActive = activePlayEdgeSet.has(edge.id);
+              const isLocated = highlightedEdgeId === edge.id;
+              const isHovered =
+                hoveredEdgeId === edge.id ||
+                editingEdgeId === edge.id ||
+                edgeContextMenu?.edgeId === edge.id;
+              const hasCond = Boolean(
+                edge.condition?.trim() || edge.conditionGroup?.clauses.length,
+              );
 
-            const strokeColor = isActive
-              ? '#F59E0B'
-              : isLocated
-                ? '#2563EB'
-                : isHovered
-                  ? '#14244B'
+              const strokeColor = isActive
+                ? '#F59E0B'
+                : isLocated
+                  ? '#2563EB'
+                  : isAssoc
+                    ? isHovered
+                      ? '#312E81'
+                      : '#6366F1'
+                    : isHovered
+                      ? '#14244B'
+                      : isLoop
+                        ? '#0D9488'
+                        : isEntry && hasCond
+                          ? '#0284C7'
+                          : '#64748B';
+
+              const marker = isAssoc
+                ? undefined
+                : isActive
+                  ? 'url(#board-arrow-active)'
                   : isLoop
-                    ? '#0D9488'
-                    : isEntry && hasCond
-                      ? '#0284C7'
-                      : '#64748B';
+                    ? 'url(#board-arrow-loop)'
+                    : 'url(#board-arrow)';
 
-            const marker = isActive
-              ? 'url(#board-arrow-active)'
-              : isLoop
-                ? 'url(#board-arrow-loop)'
-                : 'url(#board-arrow)';
+              return (
+                <g
+                  key={edge.id}
+                  onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                  onMouseLeave={() =>
+                    setHoveredEdgeId((prev) => (prev === edge.id ? null : prev))
+                  }
+                  onPointerDown={(e) => {
+                    if (!isConnectingActive && e.button === 0) {
+                      e.stopPropagation();
+                    }
+                  }}
+                  onClick={(e) => {
+                    if (isConnectingActive) return;
+                    e.stopPropagation();
+                    handleEdgeContextMenu(edge, e);
+                  }}
+                  onContextMenu={(e) => handleEdgeConditionContextMenu(edge, e)}
+                  className={`pointer-events-auto ${isConnectingActive ? '' : 'cursor-pointer'}`}
+                >
+                  <path d={path} fill="none" stroke="transparent" strokeWidth="20" />
+                  <path
+                    d={path}
+                    fill="none"
+                    stroke={strokeColor}
+                    strokeWidth={isActive || isLocated ? '3.4' : isHovered ? '2.8' : '2.1'}
+                    strokeDasharray={
+                      isAssoc ? '4 4' : isLoop ? '6 4' : undefined
+                    }
+                    markerEnd={marker}
+                  />
+                  {isAssoc && (
+                    <>
+                      <circle
+                        cx={startX}
+                        cy={startY}
+                        r="3.4"
+                        fill="#FFFFFF"
+                        stroke={strokeColor}
+                        strokeWidth="2"
+                      />
+                      <circle
+                        cx={endX}
+                        cy={endY}
+                        r="3.4"
+                        fill="#FFFFFF"
+                        stroke={strokeColor}
+                        strokeWidth="2"
+                      />
+                    </>
+                  )}
+                  {isEntry && (
+                    <g
+                      role="button"
+                      aria-label={t.entryArrowOriginAria}
+                      onPointerDown={(e) => {
+                        if (isConnectingActive || e.button !== 0) return;
+                        e.stopPropagation();
+                        setDraggingEntryEdgeId(edge.id);
+                        entryTailDragRef.current = {
+                          edgeId: edge.id,
+                          toX: to.x,
+                          toY: to.y,
+                        };
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      className="cursor-grab active:cursor-grabbing"
+                    >
+                      <circle cx={startX} cy={startY} r="12" fill="transparent" />
+                      <circle
+                        cx={startX}
+                        cy={startY}
+                        r="7.5"
+                        fill="#FFFFFF"
+                        stroke={strokeColor}
+                        strokeWidth="2.2"
+                      />
+                      <circle
+                        cx={startX}
+                        cy={startY}
+                        r="3.5"
+                        fill={
+                          isActive
+                            ? '#F59E0B'
+                            : isLocated
+                              ? '#2563EB'
+                              : hasCond
+                                ? '#0284C7'
+                                : '#64748B'
+                        }
+                      />
+                    </g>
+                  )}
+                </g>
+              );
+            },
+          )}
+
+          {/* Shared Condition Hub Trunks & Forked Branches */}
+          {sharedConditionGroups.map((group) => {
+            const { key, primaryItem, items, isEntry, srcX, srcY, trunkPath, branches } =
+              group;
+            const anyActive = items.some((i) => activePlayEdgeSet.has(i.edge.id));
+            const anyLocated = items.some((i) => highlightedEdgeId === i.edge.id);
+            const anyHovered = items.some(
+              (i) =>
+                hoveredEdgeId === i.edge.id ||
+                editingEdgeId === i.edge.id ||
+                edgeContextMenu?.edgeId === i.edge.id,
+            );
+            const trunkStroke = anyActive
+              ? '#F59E0B'
+              : anyLocated
+                ? '#2563EB'
+                : anyHovered
+                  ? '#14244B'
+                  : '#0284C7';
 
             return (
-              <g
-                key={edge.id}
-                onMouseEnter={() => setHoveredEdgeId(edge.id)}
-                onMouseLeave={() =>
-                  setHoveredEdgeId((prev) => (prev === edge.id ? null : prev))
-                }
-                onPointerDown={(e) => {
-                  if (!isConnectingActive && e.button === 0) {
-                    e.stopPropagation();
+              <g key={`shared-svg-${key}`}>
+                <g
+                  onMouseEnter={() => setHoveredEdgeId(primaryItem.edge.id)}
+                  onMouseLeave={() =>
+                    setHoveredEdgeId((prev) =>
+                      prev === primaryItem.edge.id ? null : prev,
+                    )
                   }
-                }}
-                onClick={(e) => {
-                  if (isConnectingActive) return;
-                  e.stopPropagation();
-                  openEdgeConditionEditor(edge);
-                }}
-                onContextMenu={(e) => handleEdgeContextMenu(edge, e)}
-                className={`pointer-events-auto ${isConnectingActive ? '' : 'cursor-pointer'}`}
-              >
-                <path d={path} fill="none" stroke="transparent" strokeWidth="20" />
-                <path
-                  d={path}
-                  fill="none"
-                  stroke={strokeColor}
-                  strokeWidth={isActive || isLocated ? '3.4' : isHovered ? '2.8' : '2.1'}
-                  strokeDasharray={isLoop ? '6 4' : undefined}
-                  markerEnd={marker}
-                />
-                {isEntry && startX !== undefined && startY !== undefined && (
-                  <g
-                    role="button"
-                    aria-label={t.entryArrowOriginAria}
-                    onPointerDown={(e) => {
-                      if (isConnectingActive || e.button !== 0) return;
-                      e.stopPropagation();
-                      setDraggingEntryEdgeId(edge.id);
-                      entryTailDragRef.current = {
-                        edgeId: edge.id,
-                        toX: to.x,
-                        toY: to.y,
-                      };
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    className="cursor-grab active:cursor-grabbing"
-                  >
-                    <circle cx={startX} cy={startY} r="12" fill="transparent" />
-                    <circle
-                      cx={startX}
-                      cy={startY}
-                      r="7.5"
-                      fill="#FFFFFF"
-                      stroke={strokeColor}
-                      strokeWidth="2.2"
-                    />
-                    <circle
-                      cx={startX}
-                      cy={startY}
-                      r="3.5"
-                      fill={
-                        isActive
-                          ? '#F59E0B'
-                          : isLocated
-                            ? '#2563EB'
-                            : hasCond
-                              ? '#0284C7'
-                              : '#64748B'
+                  onPointerDown={(e) => {
+                    if (!isConnectingActive && e.button === 0) e.stopPropagation();
+                  }}
+                  onClick={(e) => {
+                    if (isConnectingActive) return;
+                    e.stopPropagation();
+                    handleEdgeContextMenu(primaryItem.edge, e);
+                  }}
+                  onContextMenu={(e) => handleEdgeConditionContextMenu(primaryItem.edge, e)}
+                  className={`pointer-events-auto ${isConnectingActive ? '' : 'cursor-pointer'}`}
+                >
+                  <path d={trunkPath} fill="none" stroke="transparent" strokeWidth="20" />
+                  <path
+                    d={trunkPath}
+                    fill="none"
+                    stroke={trunkStroke}
+                    strokeWidth={anyActive || anyLocated ? '3.4' : anyHovered ? '2.8' : '2.3'}
+                  />
+                  {isEntry && (
+                    <g
+                      role="button"
+                      aria-label={t.entryArrowOriginAria}
+                      onPointerDown={(e) => {
+                        if (isConnectingActive || e.button !== 0) return;
+                        e.stopPropagation();
+                        setDraggingEntryEdgeId(primaryItem.edge.id);
+                        entryTailDragRef.current = {
+                          edgeId: primaryItem.edge.id,
+                          toX: primaryItem.to.x,
+                          toY: primaryItem.to.y,
+                        };
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      className="cursor-grab active:cursor-grabbing"
+                    >
+                      <circle cx={srcX} cy={srcY} r="12" fill="transparent" />
+                      <circle
+                        cx={srcX}
+                        cy={srcY}
+                        r="7.5"
+                        fill="#FFFFFF"
+                        stroke={trunkStroke}
+                        strokeWidth="2.2"
+                      />
+                      <circle cx={srcX} cy={srcY} r="3.5" fill={trunkStroke} />
+                    </g>
+                  )}
+                </g>
+
+                {branches.map(({ item, path }) => {
+                  const isBranchActive = activePlayEdgeSet.has(item.edge.id);
+                  const isBranchLocated = highlightedEdgeId === item.edge.id;
+                  const isBranchHovered =
+                    hoveredEdgeId === item.edge.id ||
+                    editingEdgeId === item.edge.id ||
+                    edgeContextMenu?.edgeId === item.edge.id;
+                  const branchStroke = isBranchActive
+                    ? '#F59E0B'
+                    : isBranchLocated
+                      ? '#2563EB'
+                      : isBranchHovered
+                        ? '#14244B'
+                        : item.isLoop
+                          ? '#0D9488'
+                          : '#0284C7';
+                  const marker = isBranchActive
+                    ? 'url(#board-arrow-active)'
+                    : item.isLoop
+                      ? 'url(#board-arrow-loop)'
+                      : 'url(#board-arrow)';
+
+                  return (
+                    <g
+                      key={`branch-${item.edge.id}`}
+                      onMouseEnter={() => setHoveredEdgeId(item.edge.id)}
+                      onMouseLeave={() =>
+                        setHoveredEdgeId((prev) =>
+                          prev === item.edge.id ? null : prev,
+                        )
                       }
-                    />
-                  </g>
-                )}
+                      onPointerDown={(e) => {
+                        if (!isConnectingActive && e.button === 0) e.stopPropagation();
+                      }}
+                      onClick={(e) => {
+                        if (isConnectingActive) return;
+                        e.stopPropagation();
+                        handleEdgeContextMenu(item.edge, e);
+                      }}
+                      onContextMenu={(e) => handleEdgeConditionContextMenu(item.edge, e)}
+                      className={`pointer-events-auto ${isConnectingActive ? '' : 'cursor-pointer'}`}
+                    >
+                      <path d={path} fill="none" stroke="transparent" strokeWidth="20" />
+                      <path
+                        d={path}
+                        fill="none"
+                        stroke={branchStroke}
+                        strokeWidth={
+                          isBranchActive || isBranchLocated
+                            ? '3.4'
+                            : isBranchHovered
+                              ? '2.8'
+                              : '2.1'
+                        }
+                        strokeDasharray={item.isLoop ? '6 4' : undefined}
+                        markerEnd={marker}
+                      />
+                    </g>
+                  );
+                })}
               </g>
             );
           })}
@@ -2502,6 +3319,17 @@ export function DesignBoard({
                 markerEnd="url(#board-arrow)"
               />
             )}
+
+          {connectingFrom?.kind === 'shared-condition' && connectPointerWorld && (
+            <path
+              d={`M ${connectingFrom.hubX} ${connectingFrom.hubY} L ${connectPointerWorld.x} ${connectPointerWorld.y}`}
+              fill="none"
+              stroke="#0284C7"
+              strokeWidth="2.3"
+              strokeDasharray="6 4"
+              markerEnd="url(#board-arrow)"
+            />
+          )}
 
           {connectingFrom?.kind === 'air' && connectPointerWorld && (
             <g>
@@ -2531,18 +3359,190 @@ export function DesignBoard({
           )}
         </svg>
 
+        {/* Unfilled Action Combo Frames (Combinable vs Default Exclusive) */}
+        {comboFrames.map((frame) => {
+          const enclosedActions = nodes.filter(
+            (n) =>
+              !getCollapsedAncestorGroup(n.id, nodeMap) &&
+              isActionInsideComboFrame(n, frame),
+          );
+          const isAnyActive = enclosedActions.some((a) => activePlaySet.has(a.id));
+          const isDraggingCombo = draggingComboId === frame.id;
+          const isResizingCombo = resizingComboId === frame.id;
+
+          const startComboDrag = (e: ReactPointerEvent<HTMLElement>) => {
+            if (isConnectingActive || e.button !== 0) return;
+            e.stopPropagation();
+            setAddMenuOpen(false);
+            setEditingEdgeId(null);
+            setEdgeContextMenu(null);
+            setDraggingComboId(frame.id);
+            comboDragRef.current = {
+              id: frame.id,
+              startClientX: e.clientX,
+              startClientY: e.clientY,
+              origX: frame.x,
+              origY: frame.y,
+            };
+          };
+
+          const startComboResize = (e: ReactPointerEvent<HTMLElement>) => {
+            if (isConnectingActive || e.button !== 0) return;
+            e.stopPropagation();
+            e.preventDefault();
+            setAddMenuOpen(false);
+            setEditingEdgeId(null);
+            setEdgeContextMenu(null);
+            setResizingComboId(frame.id);
+            comboResizeRef.current = {
+              id: frame.id,
+              startClientX: e.clientX,
+              startClientY: e.clientY,
+              startW: frame.width,
+              startH: frame.height,
+            };
+          };
+
+          return (
+            <div
+              key={frame.id}
+              style={{
+                left: `${Math.round(frame.x)}px`,
+                top: `${Math.round(frame.y)}px`,
+                width: `${Math.round(frame.width)}px`,
+                height: `${Math.round(frame.height)}px`,
+                zIndex: isDraggingCombo || isResizingCombo ? 38 : 12,
+              }}
+              className={`pointer-events-none absolute rounded-2xl border-2 border-dashed transition-colors ${
+                isAnyActive
+                  ? 'border-[#F59E0B] shadow-[0_0_0_4px_rgba(251,197,61,0.22)]'
+                  : isDraggingCombo || isResizingCombo
+                    ? 'border-[#0284C7] shadow-[0_0_0_3px_rgba(56,189,248,0.2)]'
+                    : 'border-[#0EA5E9]/80'
+              }`}
+            >
+              {/* Compact Top-Left Drag Handle (no cluttered text) */}
+              <div
+                onPointerDown={startComboDrag}
+                className={`pointer-events-auto absolute -top-6 left-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10.5px] font-bold shadow-xs select-none cursor-grab active:cursor-grabbing whitespace-nowrap ${
+                  isAnyActive
+                    ? 'bg-[#FFFBEB] border-[#F59E0B] text-[#B45309]'
+                    : 'bg-[#F0F9FF]/95 border-[#38BDF8] text-[#0369A1]'
+                }`}
+              >
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  aria-hidden="true"
+                  className="shrink-0"
+                >
+                  <rect
+                    x="1.5"
+                    y="1.5"
+                    width="9"
+                    height="9"
+                    rx="2"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeDasharray="2.5 1.8"
+                  />
+                </svg>
+                <span>{t.comboFrameTag}</span>
+                {enclosedActions.length >= 2 && (
+                  <span className="font-mono text-[10px] opacity-80">
+                    ×{enclosedActions.length}
+                  </span>
+                )}
+              </div>
+
+              {/* Prominent Top-Right Delete Button */}
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteComboFrame(frame.id);
+                }}
+                title={t.comboFrameDeleteAria}
+                aria-label={t.comboFrameDeleteAria}
+                className="pointer-events-auto absolute -top-3 -right-3 w-6 h-6 rounded-full bg-white border border-[#FCA5A5] text-[#DC2626] hover:bg-[#DC2626] hover:text-white hover:border-[#DC2626] shadow-sm flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-3 h-3" aria-hidden="true" />
+              </button>
+
+              {/* Thin Border Hit-Strips (keep interior 100% click-through to cards!) */}
+              <div
+                onPointerDown={startComboDrag}
+                className="pointer-events-auto absolute -top-1.5 inset-x-3 h-3 cursor-grab active:cursor-grabbing"
+              />
+              <div
+                onPointerDown={startComboDrag}
+                className="pointer-events-auto absolute -bottom-1.5 inset-x-6 h-3 cursor-grab active:cursor-grabbing"
+              />
+              <div
+                onPointerDown={startComboDrag}
+                className="pointer-events-auto absolute inset-y-3 -left-1.5 w-3 cursor-grab active:cursor-grabbing"
+              />
+              <div
+                onPointerDown={startComboDrag}
+                className="pointer-events-auto absolute inset-y-6 -right-1.5 w-3 cursor-grab active:cursor-grabbing"
+              />
+
+              {/* Bottom-right Resize Handle */}
+              <div
+                data-resize-handle="true"
+                role="separator"
+                title={t.comboFrameResizeAria}
+                aria-label={t.comboFrameResizeAria}
+                onPointerDown={startComboResize}
+                className={`pointer-events-auto absolute -bottom-1 -right-1 w-6 h-6 cursor-nwse-resize flex items-end justify-end p-1 rounded-br-xl transition-colors ${
+                  isAnyActive
+                    ? 'text-[#B45309] hover:bg-[#FEF3C7]/80'
+                    : 'text-[#0284C7] hover:bg-[#E0F2FE]/80'
+                }`}
+              >
+                <svg width="10" height="10" viewBox="0 0 11 11" aria-hidden="true">
+                  <path
+                    d="M10 1L1 10M10 5.5L5.5 10"
+                    stroke="currentColor"
+                    strokeWidth="1.7"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </div>
+            </div>
+          );
+        })}
+
         {/* Render Groups, Experience Cards & Draft Stickies */}
         {visibleNodesSorted.map(renderCard)}
 
-        {/* Condition Mini-Cards on Arrow Midpoints */}
-        {computedEdges.map(({ edge, midX, midY, isLoop, isEntry }) => {
+        {/* Condition & Hover Relationship Chips on Connections */}
+        {computedEdges.map(({ edge, edgeType, from, to, midX, midY, isLoop, isEntry }) => {
+          if (groupedEdgeIdSet.has(edge.id)) return null;
+          const isAssoc = edgeType === 'association';
           const isEditing = editingEdgeId === edge.id;
-          const isActive = activePlayEdgeId === edge.id;
+          const isActive = activePlayEdgeSet.has(edge.id);
+          const isHovered = hoveredEdgeId === edge.id || edgeContextMenu?.edgeId === edge.id;
           const hasCondition = Boolean(
             edge.condition?.trim() || edge.conditionGroup?.clauses.length,
           );
 
-          if (!hasCondition && !isEntry) return null;
+          if (!hasCondition && !isHovered) return null;
+
+          const relationLabel = isAssoc
+            ? t.edgeAssocHoverTag
+            : isEntry
+              ? t.edgeFlowEntryTag
+              : isLoop
+                ? t.edgeFlowLoopTag
+                : from?.kind === 'action' && to.kind === 'outcome'
+                  ? t.edgeFlowActionOutcomeTag
+                  : from?.kind === 'group' || to.kind === 'group'
+                    ? t.edgeFlowGroupTag
+                    : t.edgeFlowHoverTag;
 
           const firstKind = edge.conditionGroup?.clauses[0]?.kind;
 
@@ -2558,8 +3558,8 @@ export function DesignBoard({
                 setHoveredEdgeId((prev) => (prev === edge.id ? null : prev))
               }
               onPointerDown={(e) => e.stopPropagation()}
-              onContextMenu={(e) => handleEdgeContextMenu(edge, e)}
-              className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 ${
+              onContextMenu={(e) => handleEdgeConditionContextMenu(edge, e)}
+              className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1 ${
                 isEditing ? 'z-40' : 'z-35'
               }`}
             >
@@ -2567,7 +3567,7 @@ export function DesignBoard({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  openEdgeConditionEditor(edge);
+                  handleEdgeContextMenu(edge, e);
                 }}
                 className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white border text-[11px] font-semibold shadow-xs transition-all whitespace-nowrap cursor-pointer ${
                   isEditing
@@ -2576,11 +3576,19 @@ export function DesignBoard({
                       ? 'border-[#F59E0B] ring-2 ring-[#FBC53D]/60 text-[#14244B]'
                       : highlightedEdgeId === edge.id
                         ? 'border-[#2563EB] ring-2 ring-[#4E9AE3]/60 text-[#14244B]'
-                        : !hasCondition && isEntry
-                          ? 'border-dashed border-[#94A3B8] text-[#64748B] hover:border-[#0284C7] hover:text-[#0369A1]'
-                          : isLoop
-                            ? 'border-[#0D9488]/60 text-[#14244B] hover:border-[#14244B]'
-                            : 'border-[#CBD5E1] text-[#14244B] hover:border-[#14244B]'
+                        : isAssoc && !hasCondition
+                          ? 'border-[#C7D2FE] text-[#4338CA] hover:border-[#6366F1]'
+                          : !hasCondition && isLoop
+                            ? 'border-[#99F6E4] text-[#0F766E] hover:border-[#0D9488]'
+                            : !hasCondition && isEntry
+                              ? 'border-[#BAE6FD] text-[#0369A1] hover:border-[#0284C7]'
+                              : !hasCondition
+                                ? 'border-[#CBD5E1] text-[#334155] hover:border-[#14244B]'
+                                : isLoop
+                                  ? 'border-[#0D9488]/60 text-[#14244B] hover:border-[#14244B]'
+                                  : isAssoc
+                                    ? 'border-[#C7D2FE] text-[#14244B] hover:border-[#6366F1]'
+                                    : 'border-[#CBD5E1] text-[#14244B] hover:border-[#14244B]'
                 }`}
               >
                 {isLoop && (
@@ -2589,6 +3597,124 @@ export function DesignBoard({
                     aria-hidden="true"
                   />
                 )}
+                {!hasCondition ? (
+                  <span
+                    className={`text-[10.5px] font-semibold ${
+                      isAssoc
+                        ? 'text-[#4338CA]'
+                        : isLoop
+                          ? 'text-[#0F766E]'
+                          : isEntry
+                            ? 'text-[#0369A1]'
+                            : 'text-[#334155]'
+                    }`}
+                  >
+                    {relationLabel}
+                  </span>
+                ) : (
+                  <>
+                    {isHovered && (
+                      <span
+                        className={`text-[10px] font-semibold shrink-0 ${
+                          isAssoc ? 'text-[#4338CA]' : 'text-[#64748B]'
+                        }`}
+                      >
+                        {relationLabel} ·
+                      </span>
+                    )}
+                    {firstKind === 'event' ? (
+                      <Zap className="w-3 h-3 text-[#0284C7] shrink-0" aria-hidden="true" />
+                    ) : firstKind === 'property' ? (
+                      <SlidersHorizontal
+                        className="w-3 h-3 text-[#047857] shrink-0"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <span className="font-mono text-[10px] font-bold text-[#0369A1]">
+                        if
+                      </span>
+                    )}
+                    <span className="max-w-[190px] truncate">{edge.condition}</span>
+                  </>
+                )}
+              </button>
+
+              {!isAssoc && hasCondition && isHovered && (
+                <button
+                  type="button"
+                  title={t.menuShareBranchBtn}
+                  aria-label={t.menuShareBranchBtn}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEdgeContextMenu(null);
+                    setEditingEdgeId(null);
+                    setConnectingFrom({
+                      kind: 'shared-condition',
+                      sourceEdgeId: edge.id,
+                      hubX: midX,
+                      hubY: midY,
+                    });
+                    setConnectPointerWorld({ x: midX, y: midY });
+                  }}
+                  className="w-5 h-5 rounded-md bg-white border border-[#38BDF8] hover:bg-[#0284C7] hover:text-white text-[#0369A1] shadow-xs flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Shared Condition Hubs (1 Condition -> Multiple Targets) */}
+        {sharedConditionGroups.map((group) => {
+          const { key, primaryItem, items, hubX, hubY } = group;
+          const primaryEdge = primaryItem.edge;
+          const isEditing = items.some((i) => editingEdgeId === i.edge.id);
+          const isActive = items.some((i) => activePlayEdgeSet.has(i.edge.id));
+          const isLocated = items.some((i) => highlightedEdgeId === i.edge.id);
+          const isHovered = items.some(
+            (i) => hoveredEdgeId === i.edge.id || edgeContextMenu?.edgeId === i.edge.id,
+          );
+          const firstKind = primaryEdge.conditionGroup?.clauses[0]?.kind;
+          const hasCond = Boolean(
+            primaryEdge.condition?.trim() || primaryEdge.conditionGroup?.clauses.length,
+          );
+
+          return (
+            <div
+              key={`shared-hub-${key}`}
+              style={{
+                left: `${hubX}px`,
+                top: `${hubY}px`,
+              }}
+              onMouseEnter={() => setHoveredEdgeId(primaryEdge.id)}
+              onMouseLeave={() =>
+                setHoveredEdgeId((prev) => (prev === primaryEdge.id ? null : prev))
+              }
+              onPointerDown={(e) => e.stopPropagation()}
+              onContextMenu={(e) => handleEdgeConditionContextMenu(primaryEdge, e)}
+              className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1 ${
+                isEditing ? 'z-40' : 'z-35'
+              }`}
+            >
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleEdgeContextMenu(primaryEdge, e);
+                }}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border text-[11px] font-semibold shadow-sm transition-all whitespace-nowrap cursor-pointer ${
+                  isEditing
+                    ? 'border-[#0284C7] ring-2 ring-[#7DD3FC]/80 text-[#14244B]'
+                    : isActive
+                      ? 'border-[#F59E0B] ring-2 ring-[#FBC53D]/70 text-[#14244B]'
+                      : isLocated
+                        ? 'border-[#2563EB] ring-2 ring-[#4E9AE3]/60 text-[#14244B]'
+                        : isHovered
+                          ? 'border-[#14244B] text-[#14244B]'
+                          : 'border-[#38BDF8] text-[#14244B]'
+                }`}
+              >
                 {firstKind === 'event' ? (
                   <Zap className="w-3 h-3 text-[#0284C7] shrink-0" aria-hidden="true" />
                 ) : firstKind === 'property' ? (
@@ -2596,16 +3722,36 @@ export function DesignBoard({
                     className="w-3 h-3 text-[#047857] shrink-0"
                     aria-hidden="true"
                   />
-                ) : hasCondition ? (
-                  <span className="font-mono text-[10px] font-bold text-[#0369A1]">
-                    if
-                  </span>
                 ) : (
-                  <Zap className="w-3 h-3 text-[#64748B] shrink-0" aria-hidden="true" />
+                  <span className="font-mono text-[10px] font-bold text-[#0369A1]">if</span>
                 )}
-                <span className="max-w-[190px] truncate">
-                  {hasCondition ? edge.condition : t.entryArrowEmptyLabel}
+                <span className="max-w-[180px] truncate">
+                  {hasCond ? primaryEdge.condition : t.menuAddCondition}
                 </span>
+                <span className="px-1 py-0.25 rounded bg-[#E0F2FE] text-[#0369A1] font-mono text-[10px] font-bold shrink-0">
+                  ×{items.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                title={t.menuShareBranchBtn}
+                aria-label={t.menuShareBranchBtn}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEdgeContextMenu(null);
+                  setEditingEdgeId(null);
+                  setConnectingFrom({
+                    kind: 'shared-condition',
+                    sourceEdgeId: primaryEdge.id,
+                    hubX,
+                    hubY,
+                  });
+                  setConnectPointerWorld({ x: hubX, y: hubY });
+                }}
+                className="w-6 h-6 rounded-lg bg-white border border-[#38BDF8] hover:bg-[#0284C7] hover:text-white text-[#0369A1] shadow-sm flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" aria-hidden="true" />
               </button>
             </div>
           );
@@ -2617,25 +3763,59 @@ export function DesignBoard({
         if (editingEdgeId) {
           const targetComputed = computedEdges.find((item) => item.edge.id === editingEdgeId);
           if (!targetComputed) return null;
-          const anchorX = targetComputed.midX * zoom + pan.x;
-          const anchorY = targetComputed.midY * zoom + pan.y;
+          const sharedGroup = targetComputed.edge.sharedConditionId
+            ? sharedConditionGroups.find((g) =>
+                g.items.some((i) => i.edge.id === targetComputed.edge.id),
+              )
+            : undefined;
+          const rawWorldX = sharedGroup ? sharedGroup.hubX : targetComputed.midX;
+          const rawWorldY = sharedGroup ? sharedGroup.hubY : targetComputed.midY;
+          const anchorX = rawWorldX * zoom + pan.x;
+          const anchorY = rawWorldY * zoom + pan.y;
+
+          const seenDonorKeys = new Set<string>();
+          const siblingDonorEdges =
+            targetComputed.edgeType === 'flow'
+              ? edges.filter((e) => {
+                  if (e.id === targetComputed.edge.id) return false;
+                  if (e.fromId !== targetComputed.edge.fromId) return false;
+                  if (resolveEdgeType(e, nodeMap) !== 'flow') return false;
+                  const condText = (e.condition ?? '').trim();
+                  if (!condText && !e.conditionGroup?.clauses.length) return false;
+                  const key = e.sharedConditionId ?? condText;
+                  if (seenDonorKeys.has(key)) return false;
+                  seenDonorKeys.add(key);
+                  return true;
+                })
+              : [];
 
           return (
             <ArrowConditionBuilder
               key={targetComputed.edge.id}
               lang={lang}
               edge={targetComputed.edge}
+              edgeType={targetComputed.edgeType}
               fromNode={targetComputed.from ?? targetComputed.to}
               nodes={nodes}
               assetItems={assetItems}
               scopedVariables={scopedVariables}
               numericParameters={numericBoardParameters}
+              siblingDonorEdges={siblingDonorEdges}
               anchorX={anchorX}
               anchorY={anchorY}
               containerWidth={boardSize.width}
               containerHeight={boardSize.height}
-              onSave={(summary, conditionGroup) => {
-                onUpdateEdgeCondition(targetComputed.edge.id, summary, conditionGroup);
+              titleOverride={
+                targetComputed.edgeType === 'association'
+                  ? t.edgeCond.headerTitleAssoc
+                  : t.edgeCond.headerTitleFlow
+              }
+              onSave={(summary, conditionGroup, options) => {
+                onUpdateEdgeCondition(targetComputed.edge.id, summary, conditionGroup, options);
+                setEditingEdgeId(null);
+              }}
+              onLinkSibling={(donorEdgeId) => {
+                onLinkEdgeToSharedCondition(targetComputed.edge.id, donorEdgeId);
                 setEditingEdgeId(null);
               }}
               onClear={() => {
@@ -2650,20 +3830,26 @@ export function DesignBoard({
         return null;
       })()}
 
-      {/* Group Design Notes Window (shown after Add Group or when editing Group notes) */}
+      {/* Group Design Notes & ID Window (shown after Add Group or when editing Group ID/notes) */}
       {editingGroupInfo && (() => {
         const groupNode = nodeMap.get(editingGroupInfo.id);
         if (!groupNode || groupNode.kind !== 'group') return null;
+        const defId = getGroupDefId(groupNode);
+        const reusedCount = groupDefCounts.get(defId) ?? 1;
         return (
           <GroupInfoModal
             key={groupNode.id}
             lang={lang}
-            groupCode={resolveGroupCode(groupNode, nodes)}
+            groupNode={groupNode}
+            nodes={nodes}
+            initialCode={resolveGroupCode(groupNode, nodes)}
             initialTitle={groupNode.title}
             initialNote={groupNode.note}
+            isReusedInstance={reusedCount > 1}
+            reusedCount={reusedCount}
             focusField={editingGroupInfo.focusField}
-            onSave={(title, note) => {
-              onUpdateNode(groupNode.id, { title, note });
+            onSave={(groupCode, title, note) => {
+              onUpdateNode(groupNode.id, { groupCode, title, note });
               setEditingGroupInfo(null);
             }}
             onClose={() => setEditingGroupInfo(null)}
@@ -2671,54 +3857,297 @@ export function DesignBoard({
         );
       })()}
 
-      {/* Screen-Space Right-Click Arrow Context Menu */}
-      {edgeContextMenu && contextMenuEdge && (
-        <div
-          style={{
-            left: `${Math.max(12, Math.min(Math.max(12, boardSize.width - 204), edgeContextMenu.x))}px`,
-            top: `${Math.max(12, Math.min(Math.max(12, boardSize.height - 132), edgeContextMenu.y))}px`,
-          }}
-          onPointerDown={(e) => e.stopPropagation()}
-          onContextMenu={(e) => e.preventDefault()}
-          className="absolute z-50 w-48 bg-white rounded-xl border border-[#CBD5E1] shadow-[0_14px_34px_rgba(20,36,75,0.2)] p-1.5 space-y-0.5"
-        >
-          <button
-            type="button"
-            onClick={() => openEdgeConditionEditor(contextMenuEdge)}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#14244B] hover:bg-[#F0F9FF] hover:text-[#0369A1] transition-colors cursor-pointer"
+      {/* Screen-Space Edge Context Menu: 1) Line Format vs 2) Optional Condition */}
+      {edgeContextMenu && contextMenuEdge && (() => {
+        const ctxEdgeType = resolveEdgeType(contextMenuEdge, nodeMap);
+        const isAssocEdge = ctxEdgeType === 'association';
+        const isEntryEdge = contextMenuEdge.fromId === null;
+        const hasCtxCondition = Boolean(
+          contextMenuEdge.condition?.trim() ||
+            contextMenuEdge.conditionGroup?.clauses.length,
+        );
+        return (
+          <div
+            data-board-overlay="true"
+            style={{
+              left: `${Math.max(12, Math.min(Math.max(12, boardSize.width - 284), edgeContextMenu.x))}px`,
+              top: `${Math.max(12, Math.min(Math.max(12, boardSize.height - 320), edgeContextMenu.y))}px`,
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+            className="absolute z-50 w-[272px] bg-white rounded-xl border border-[#CBD5E1] shadow-[0_14px_34px_rgba(20,36,75,0.2)] p-2 space-y-2"
           >
-            {contextMenuEdge.condition?.trim()
-              ? t.menuEditCondition
-              : t.menuAddCondition}
-          </button>
+            {/* Section 1: Line Format */}
+            <div className="space-y-1">
+              <div className="px-1 text-[10.5px] font-bold uppercase tracking-wider text-[#64748B]">
+                {t.menuSectionFormat}
+              </div>
 
-          {contextMenuEdge.condition?.trim() && (
+              {!isEntryEdge ? (
+                <div className="space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!isAssocEdge) {
+                        onUpdateEdgeType(contextMenuEdge.id, 'association');
+                      }
+                    }}
+                    className={`w-full text-left px-2.5 py-2 rounded-lg border transition-colors flex items-center gap-2.5 cursor-pointer ${
+                      isAssocEdge
+                        ? 'bg-[#EEF2FF] border-[#818CF8] text-[#312E81]'
+                        : 'bg-white border-[#E2E8F0] hover:bg-[#F8FAFC] text-[#334155]'
+                    }`}
+                  >
+                    <svg
+                      width="26"
+                      height="12"
+                      viewBox="0 0 26 12"
+                      className="shrink-0"
+                      aria-hidden="true"
+                    >
+                      <line
+                        x1="4"
+                        y1="6"
+                        x2="22"
+                        y2="6"
+                        stroke={isAssocEdge ? '#4F46E5' : '#64748B'}
+                        strokeWidth="2"
+                        strokeDasharray="3 3"
+                      />
+                      <circle
+                        cx="4"
+                        cy="6"
+                        r="2.4"
+                        fill="#FFFFFF"
+                        stroke={isAssocEdge ? '#4F46E5' : '#64748B'}
+                        strokeWidth="1.6"
+                      />
+                      <circle
+                        cx="22"
+                        cy="6"
+                        r="2.4"
+                        fill="#FFFFFF"
+                        stroke={isAssocEdge ? '#4F46E5' : '#64748B'}
+                        strokeWidth="1.6"
+                      />
+                    </svg>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11.5px] font-bold leading-tight">
+                        {t.menuFormatAssocTitle}
+                      </div>
+                      <div className="text-[10px] text-[#64748B] leading-snug">
+                        {t.menuFormatAssocHint}
+                      </div>
+                    </div>
+                    {isAssocEdge && (
+                      <Check
+                        className="w-3.5 h-3.5 text-[#4F46E5] shrink-0"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isAssocEdge) {
+                        onUpdateEdgeType(contextMenuEdge.id, 'flow');
+                      }
+                    }}
+                    className={`w-full text-left px-2.5 py-2 rounded-lg border transition-colors flex items-center gap-2.5 cursor-pointer ${
+                      !isAssocEdge
+                        ? 'bg-[#F0F9FF] border-[#38BDF8] text-[#14244B]'
+                        : 'bg-white border-[#E2E8F0] hover:bg-[#F8FAFC] text-[#334155]'
+                    }`}
+                  >
+                    <svg
+                      width="26"
+                      height="12"
+                      viewBox="0 0 26 12"
+                      className="shrink-0"
+                      aria-hidden="true"
+                    >
+                      <line
+                        x1="2"
+                        y1="6"
+                        x2="19"
+                        y2="6"
+                        stroke={!isAssocEdge ? '#0284C7' : '#64748B'}
+                        strokeWidth="2"
+                      />
+                      <path
+                        d="M 17 2.2 L 24 6 L 17 9.8 Z"
+                        fill={!isAssocEdge ? '#0284C7' : '#64748B'}
+                      />
+                    </svg>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11.5px] font-bold leading-tight">
+                        {t.menuFormatFlowTitle}
+                      </div>
+                      <div className="text-[10px] text-[#64748B] leading-snug">
+                        {t.menuFormatFlowHint}
+                      </div>
+                    </div>
+                    {!isAssocEdge && (
+                      <Check
+                        className="w-3.5 h-3.5 text-[#0284C7] shrink-0"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                </div>
+              ) : (
+                <div className="px-2.5 py-2 rounded-lg bg-[#F0F9FF] border border-[#BAE6FD] flex items-center gap-2.5">
+                  <svg
+                    width="26"
+                    height="12"
+                    viewBox="0 0 26 12"
+                    className="shrink-0"
+                    aria-hidden="true"
+                  >
+                    <circle cx="4" cy="6" r="2.6" fill="#0284C7" />
+                    <line
+                      x1="6.5"
+                      y1="6"
+                      x2="19"
+                      y2="6"
+                      stroke="#0284C7"
+                      strokeWidth="2"
+                    />
+                    <path d="M 17 2.2 L 24 6 L 17 9.8 Z" fill="#0284C7" />
+                  </svg>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11.5px] font-bold text-[#14244B] leading-tight">
+                      {t.menuFormatFlowTitle}
+                    </div>
+                    <div className="text-[10px] text-[#0369A1] leading-snug">
+                      {t.menuFormatEntryLockedHint}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-[#E2E8F0]" />
+
             <button
               type="button"
               onClick={() => {
-                onUpdateEdgeCondition(contextMenuEdge.id, '');
+                onDeleteEdge(contextMenuEdge.id);
                 setEdgeContextMenu(null);
               }}
-              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-[#475569] hover:bg-[#F1F5F9] hover:text-[#14244B] transition-colors cursor-pointer"
+              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] flex items-center gap-1.5 transition-colors cursor-pointer"
             >
-              {t.menuRemoveCondition}
+              <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>{t.menuDeleteEdge}</span>
             </button>
-          )}
+          </div>
+        );
+      })()}
 
-          <div className="my-1 border-t border-[#F1F5F9]" />
-
-          <button
-            type="button"
-            onClick={() => {
-              onDeleteEdge(contextMenuEdge.id);
-              setEdgeContextMenu(null);
+      {/* Screen-Space Action Card Context Menu (Shift / Cmd+Click Multi-Select -> Combo) */}
+      {nodeContextMenu && contextMenuNode && contextMenuNode.kind === 'action' && (() => {
+        const comboTargetIds =
+          multiSelectedActionIds.length >= 2 &&
+          multiSelectedActionIds.includes(contextMenuNode.id)
+            ? multiSelectedActionIds
+            : multiSelectedActionIds.length >= 2
+              ? multiSelectedActionIds
+              : [contextMenuNode.id];
+        const canCombineMulti = comboTargetIds.length >= 2;
+        return (
+          <div
+            data-board-overlay="true"
+            style={{
+              left: `${Math.max(12, Math.min(Math.max(12, boardSize.width - 252), nodeContextMenu.x))}px`,
+              top: `${Math.max(12, Math.min(Math.max(12, boardSize.height - 160), nodeContextMenu.y))}px`,
             }}
-            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] transition-colors cursor-pointer"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+            className="absolute z-50 w-[240px] bg-white rounded-xl border border-[#CBD5E1] shadow-[0_14px_34px_rgba(20,36,75,0.2)] p-2 space-y-1.5"
           >
-            {t.menuDeleteEdge}
-          </button>
-        </div>
-      )}
+            <div className="px-1 flex items-center justify-between text-[10.5px] font-bold text-[#64748B]">
+              <span>Action</span>
+              {canCombineMulti && (
+                <span className="px-1.5 py-0.25 rounded-full bg-[#E0F2FE] text-[#0369A1] font-mono">
+                  {comboTargetIds.length} {t.actionMenuSelectedSuffix}
+                </span>
+              )}
+            </div>
+
+            {canCombineMulti ? (
+              <button
+                type="button"
+                onClick={() => {
+                  createComboBoxAroundActions(comboTargetIds);
+                  setNodeContextMenu(null);
+                }}
+                className="w-full text-left px-2.5 py-2 rounded-lg bg-[#F0F9FF] hover:bg-[#E0F2FE] border border-[#38BDF8] text-xs font-bold text-[#0369A1] flex items-center gap-2 transition-colors cursor-pointer"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  aria-hidden="true"
+                  className="shrink-0"
+                >
+                  <rect
+                    x="1.5"
+                    y="1.5"
+                    width="9"
+                    height="9"
+                    rx="2"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeDasharray="2.5 1.8"
+                  />
+                </svg>
+                <span className="truncate">
+                  {t.actionMenuComboCreate} ({comboTargetIds.length})
+                </span>
+              </button>
+            ) : (
+              <div className="space-y-1.5">
+                <div className="px-2 py-1.5 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0] text-[10.5px] text-[#64748B] leading-snug">
+                  {t.actionMenuComboNeedMore}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    createComboBoxAroundActions([contextMenuNode.id]);
+                    setNodeContextMenu(null);
+                  }}
+                  className="w-full text-left px-2.5 py-1.5 rounded-lg border border-dashed border-[#38BDF8] hover:bg-[#F0F9FF] text-[11px] font-semibold text-[#0369A1] flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span className="truncate">{t.addComboBtn}</span>
+                </button>
+              </div>
+            )}
+
+            <div className="border-t border-[#E2E8F0]" />
+
+            <button
+              type="button"
+              onClick={() => {
+                if (expandedNodeId === contextMenuNode.id) setExpandedNodeId(null);
+                setMultiSelectedActionIds((prev) =>
+                  prev.filter((id) => id !== contextMenuNode.id),
+                );
+                onDeleteNode(contextMenuNode.id);
+                setNodeContextMenu(null);
+              }}
+              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#DC2626] hover:bg-[#FEF2F2] flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>{t.deleteCard}</span>
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Centralized Groups Directory Panel */}
       {groupDirectoryOpen && (
@@ -2728,10 +4157,13 @@ export function DesignBoard({
           edges={edges}
           onClose={() => setGroupDirectoryOpen(false)}
           onAddGroup={() => handleAddKindInViewport('group')}
-          onUpdateGroupInfo={(id, title, note) => onUpdateNode(id, { title, note })}
+          onUpdateGroupInfo={(id, groupCode, title, note) =>
+            onUpdateNode(id, { groupCode, title, note })
+          }
           onToggleGroupCollapse={onToggleGroupCollapse}
           onLocateGroup={(id) => onLocateBoardReference({ nodeId: id })}
-          onDeleteGroup={onDeleteNode}
+          onUngroupDefinition={onUngroupDefinition}
+          onDeleteGroupDefinition={onDeleteGroupDefinition}
         />
       )}
 
@@ -2839,6 +4271,7 @@ export function DesignBoard({
                       </button>
                     );
                   })}
+                  {(['property','visual'] as const).map(mode=><button key={mode} onClick={()=>handleAddKindInViewport('outcome',mode)} className="w-full text-left px-2 py-2 rounded-lg hover:bg-emerald-50"><div className="text-xs font-semibold text-emerald-800">{mode==='property'?(lang==='zh'?'属性变化':'Property outcome'):(lang==='zh'?'视觉变化':'Visual outcome')}</div><div className="text-[10.5px] text-slate-500">{mode==='property'?(lang==='zh'?'改变一个属性的值':'Change one property value'):(lang==='zh'?'对一个目标施加一种效果':'Apply one effect to one target')}</div></button>)}
                 </div>
               </div>
 
@@ -2922,6 +4355,34 @@ export function DesignBoard({
                   {groupCountTotal}
                 </span>
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleAddComboFrameInViewport}
+              title={t.addComboTitle}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#F0F9FF] hover:bg-[#E0F2FE] text-[#0369A1] border border-[#BAE6FD] text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14244B]"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 14 14"
+                fill="none"
+                aria-hidden="true"
+                className="shrink-0"
+              >
+                <rect
+                  x="1.5"
+                  y="1.5"
+                  width="11"
+                  height="11"
+                  rx="2.5"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeDasharray="3 2"
+                />
+              </svg>
+              <span>{t.addComboBtn}</span>
             </button>
 
             <button

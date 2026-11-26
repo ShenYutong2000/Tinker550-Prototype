@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { cameraX, colliderBox, createLibraryPlacement, createPlacement, createScene, copyPlacements, overlaps, patchScenePlacement, placementBox, projectBoardScenes, resizeCollider, resizePlacement, retainChallengeAnchors, rotatePlacement, rotateStagePoint } from './stageProject.ts';
-import { beginSceneRules, clickStageObject, setStageEntityHidden, startScene, stageEditPose, stepScene, restoreSceneCheckpoint, syncRunScenes } from './sceneRuntime.ts';
+import { activateStageEvent, advanceOverlay, beginSceneRules, clickStageObject, getStageActionControls, isActive, setStageEntityHidden, startScene, stageEditPose, stepScene, restoreSceneCheckpoint, syncRunScenes } from './sceneRuntime.ts';
+import { getOutcomeVisualEffects } from '../asset-library/effects/visualEffectsModel.ts';
+import { emptyProject, parseProject } from '../projectStore.ts';
+import { cloneGroupSubtree, propagateGroupDefinitionFrom } from '../design-board/studioModel.ts';
 import { cardPreviewBehavior, challengeMotion, challengeSpeed } from './cardPreviewMotion.ts';
-import { backgroundBoundaries, backgroundImageExtent, backgroundImagePlacement, backgroundRangeAt, backgroundSegments, backgroundTransition, dragBackgroundBoundary, resizeBackgroundImage } from './stageBackground.ts';
+import { backgroundBoundaries, backgroundImageExtent, backgroundImagePlacement, backgroundRangeAt, backgroundRangeForDrop, backgroundRangeInView, backgroundSegments, backgroundTransition, dragBackgroundBoundary, insertBackgroundSegment, moveBackgroundSegment, resizeBackgroundImage } from './stageBackground.ts';
 
 const node = (id, kind, fields = {}) => ({ id, kind, fields, title: id, note: '', parentId: null, manualFields: [], x: 0, y: 0 });
 const edge = (id, fromId, toId, event) => ({
@@ -24,6 +27,39 @@ test('separate background assets occupy world ranges and share a movable boundar
   const limited = dragBackgroundBoundary(shifted, seam, 1080, 0, 8);
   assert.equal(limited[0].end, 16);
   assert.equal(limited[1].start, 16);
+});
+
+test('placing a background in the leftmost view starts at zero and the next image starts at the seam', () => {
+  assert.deepEqual(backgroundRangeInView([], 1080, 0, 360, 360), { start: 0, end: 360 });
+  assert.deepEqual(backgroundRangeInView([meadow], 1080, 0, 360, 360), { start: 360, end: 720 });
+  assert.deepEqual(backgroundRangeInView([], 1080, 420, 360, 360), { start: 420, end: 780 });
+});
+
+test('dropping a different image onto an occupied background splits it without changing the existing framing', () => {
+  const framing = { x: -25, y: -8, width: 1200, height: 270 };
+  const original = { ...meadow, end: 1080, imagePlacement: framing };
+  const range = backgroundRangeForDrop([original], 1080, 360, 360);
+  const other = { ...range, id: 'forest', assetId: 'forest', transition: 0 };
+  assert.deepEqual(insertBackgroundSegment([original], other, 'right-fragment'), [
+    { ...original, end: 360 }, other,
+    { ...original, id: 'right-fragment', start: 720, transitionFrom: undefined },
+  ]);
+  const neighbor = { ...forest, id: 'neighbor', start: 1080, end: 1440 };
+  const withNeighbor = insertBackgroundSegment([original, neighbor], other, 'right-fragment');
+  assert.equal(backgroundTransition(withNeighbor[2], withNeighbor[3]), neighbor.transition);
+  assert.deepEqual(backgroundRangeForDrop([meadow], 1080, 0, 360), { start: 0, end: 344 });
+});
+
+test('moving and reordering background sections preserves width and follows with locked framing', () => {
+  const framing = { x: 175, y: -15, width: 400, height: 270 };
+  const offset = { ...meadow, start: 180, end: 540, imagePlacement: framing };
+  assert.deepEqual(moveBackgroundSegment([offset], 'meadow', 1080, 4, 8), [
+    { ...offset, start: 0, end: 360, imagePlacement: { ...framing, x: -5 } },
+  ]);
+  const other = { ...forest, end: 720, transition: 0 };
+  const moved = moveBackgroundSegment([{ ...meadow, imagePlacement: { ...framing, x: -5 } }, other], 'meadow', 1080, 520);
+  assert.deepEqual(moved.map(({ id, start, end }) => [id, start, end]), [['forest', 0, 360], ['meadow', 360, 720]]);
+  assert.equal(moved[1].imagePlacement.x, 355);
 });
 
 test('background seams snap to an adjacent segment and fade only where sections touch', () => {
@@ -386,4 +422,247 @@ test('checkpoint preserves run state while reading compatible edits from the sce
   assert.equal(restored.entities[1].collected, true);
   assert.equal(restoreSceneCheckpoint(snap, [scene], []), undefined);
   assert.equal(cameraX(1080, 900), 702);
+});
+
+test('bidirectional associations combine framed actions and lock competing ones for that instance', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const spark = { ...createPlacement('challenge', 'Spark', 100, 200), nodeId: 'spark-card' };
+  scene.placements.push(spark);
+  const control = (id, x, key, mechanic) => ({
+    ...node(id, 'action', { actionMechanic: mechanic, actionControl: { device: 'keyboard', input: key, interactionType: 'press' } }),
+    note: id,
+    x,
+  });
+  const shield = control('shield', 0, 'S', 'shield');
+  const pulse = control('pulse', 0, 'D', 'ability');
+  const dodge = control('dodge', 450, 'W', 'dodge');
+  const graph = {
+    scenes: [scene], nodes: [node('spark-card', 'challenge'), shield, pulse, dodge],
+    edges: [
+      { id: 'reverse', fromId: shield.id, toId: 'spark-card', edgeType: 'association' },
+      ...[pulse, dodge].map(action => ({ id: 'to-' + action.id, fromId: 'spark-card', toId: action.id, edgeType: 'association' })),
+    ],
+    comboFrames: [{ id: 'combo', x: 0, y: 0, width: 300, height: 250 }],
+  };
+  const run = startScene(scene, []);
+  stepScene(run, graph, { ...input, keys: new Set(['s', 'd', 'w']) }, .01);
+  assert.deepEqual(Object.keys(run.activeActions), ['shield', 'pulse']);
+  assert.ok(run.guardUntil > run.time);
+  assert.equal(run.waves.length, 1);
+  assert.equal(getStageActionControls(run, graph).find(item => item.action.id === dodge.id).locked, true);
+  assert.equal(run.firedEdges.reverse, .01);
+  assert.equal(run.firedEdges['to-pulse'], .01);
+});
+
+test('shared branches execute together and visual outcomes use the paused simulation clock', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const spark = { ...createPlacement('challenge', 'Spark', 100, 200), nodeId: 'spark-card', assetId: 'spark' };
+  scene.placements.push(spark);
+  const fx = { type: 'visibility', enabled: true, visible: false };
+  const visual = {
+    ...node('visual', 'outcome', { visualOutcome: { assetId: 'spark', effect: fx, duration: .2, restore: true } }),
+    promptInput: { outcomeMode: 'visual' },
+  };
+  const property = (id, variableId, numberValue) => ({
+    ...node(id, 'outcome', { relatedProperties: [{ id: 'change-' + id, variableId, op: 'set', numberValue }] }),
+    promptInput: { outcomeMode: 'property' },
+  });
+  const before = property('immediate', 'first', 2);
+  const after = property('after-animation', 'second', 3);
+  const graph = {
+    scenes: [scene], nodes: [node('spark-card', 'challenge'), visual, before, after],
+    edges: [
+      { ...edge('fx', 'spark-card', visual.id, 'is_clicked'), sharedConditionId: 'branches' },
+      { ...edge('property', 'spark-card', before.id, 'is_clicked'), sharedConditionId: 'branches' },
+      { id: 'after', fromId: visual.id, toId: after.id },
+    ],
+  };
+  const variable = id => ({ variable: { id, name: id, type: 'number', initialValue: 0 }, fullKey: id, scope: 'global', playValue: 0 });
+  const run = startScene(scene, [variable('first'), variable('second')]);
+  clickStageObject(run, graph, spark.x, spark.y);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [2, 0]);
+  assert.deepEqual(getOutcomeVisualEffects(undefined, run.visualOutcomes.spark, run.time), [fx]);
+  assert.equal(run.pendingOutcomes.length, 1);
+  assert.deepEqual(Object.keys(run.firedEdges), ['fx', 'property']);
+  stepScene(run, graph, input, .1);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [2, 0]);
+  stepScene(run, graph, input, .11);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [2, 3]);
+  assert.equal(getOutcomeVisualEffects(undefined, run.visualOutcomes.spark, run.time), undefined);
+});
+
+test('version-one project files round-trip Canvas edits and accept teammate files without scenes', () => {
+  const project = emptyProject('Forest');
+  const scene = createScene('Forest', 'Spawn');
+  const spark = { ...createPlacement('challenge', 'Spark B', 160, 190), isHidden: true, rotation: 28,
+    collider: { width: 49, height: 21 }, parameters: { reward: 3 } };
+  scene.placements.push(spark);
+  scene.boardOverrides = { 'board:shared:challenge:0': { x: 200, width: 36 } };
+  scene.background = { mode: 'segments', color: '#203020', segments: [
+    meadow, { ...forest, imagePlacement: { x: 300, y: -20, width: 650, height: 260 } },
+  ] };
+  assert.equal(parseProject(JSON.stringify(project)).scenes, undefined);
+  const json = JSON.stringify({ ...project, scenes: [scene] });
+  assert.deepEqual(parseProject(json).scenes, JSON.parse(json).scenes);
+});
+
+const numberEntry = (id, initialValue = 0) => ({
+  variable: { id, name: id, type: 'number', initialValue }, fullKey: id, scope: 'global', playValue: initialValue,
+});
+const propertyOutcome = (id, variableId, numberValue) => ({
+  ...node(id, 'outcome', { relatedProperties: [{ id, variableId, op: 'set', numberValue }] }),
+  promptInput: { outcomeMode: 'property' },
+});
+
+test('two passing Outcome arrows from a Challenge run together without a shared condition hub', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const spark = { ...createPlacement('challenge', 'Spark', 100, 200), nodeId: 'spark' };
+  scene.placements.push(spark);
+  const nodes = [node('spark', 'challenge'), propertyOutcome('one', 'first', 2), propertyOutcome('two', 'second', 3)];
+  const edges = [edge('first-branch', 'spark', 'one', 'is_clicked'), edge('second-branch', 'spark', 'two', 'is_clicked')];
+  const run = startScene(scene, [numberEntry('first'), numberEntry('second')]);
+  clickStageObject(run, { nodes, edges, scenes: [scene] }, spark.x, spark.y);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [2, 3]);
+});
+
+test('a standalone trigger inside a chapter waits for the chapter to unlock', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const chapter = { ...node('chapter', 'group'), availableWhen: 'Score >= 2' };
+  const result = { ...propertyOutcome('result', 'value', 5), parentId: chapter.id };
+  const graph = { nodes: [chapter, result], edges: [{ id: 'entry', fromId: null, toId: result.id, edgeType: 'flow', condition: 'Score >= 0' }], scenes: [scene] };
+  const run = startScene(scene, [numberEntry('value')]);
+  beginSceneRules(run, scene, graph);
+  stepScene(run, graph, input, .01);
+  assert.equal(run.variables[0].playValue, 0);
+  assert.deepEqual(run.unlockedGroups, []);
+  run.score = 2;
+  stepScene(run, graph, input, .01);
+  stepScene(run, graph, input, .01);
+  assert.deepEqual(run.unlockedGroups, [chapter.id]);
+  assert.equal(run.variables[0].playValue, 5);
+});
+
+test('an authored flow delays the Challenge in Play while its Canvas placement stays available', () => {
+  const draft = createScene('Forest', 'Spawn');
+  const intro = { ...node('intro', 'narration'), note: 'Start the challenge' };
+  const spark = { ...node('spark', 'challenge'), note: 'Moving spark' };
+  const graph = { nodes: [intro, spark], edges: [{ id: 'intro-flow', fromId: intro.id, toId: spark.id, edgeType: 'flow' }], scenes: [] };
+  graph.scenes = projectBoardScenes([draft], graph.nodes, []);
+  const [scene] = graph.scenes;
+  const original = scene.placements.find(item => item.nodeId === spark.id);
+  const run = startScene(scene, []);
+  beginSceneRules(run, scene, graph);
+  assert.equal(isActive(original, run), false);
+  assert.deepEqual(stageEditPose(original, run.entities.find(item => item.id === original.id)), { ...original, spin: undefined, collected: undefined, open: undefined });
+  advanceOverlay(run, graph);
+  assert.equal(isActive(original, run), true);
+});
+
+test('a pending Action can finish when a debug condition changes after the input', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const action = { ...node('pulse', 'action', { actionMechanic: 'ability',
+    actionControl: { device: 'keyboard', input: 'Space', interactionType: 'press' } }), note: 'Pulse' };
+  const result = propertyOutcome('result', 'charge', 3);
+  const graph = { nodes: [action, result], scenes: [scene],
+    edges: [{ id: 'wait-for-toggle', fromId: action.id, toId: result.id, edgeType: 'flow', condition: 'Enable pulse' }] };
+  const run = startScene(scene, [numberEntry('charge')]);
+  beginSceneRules(run, scene, graph);
+  stepScene(run, graph, { ...input, keys: new Set(['space']) }, .01);
+  assert.equal(run.variables[0].playValue, 0);
+  activateStageEvent(run, 'Enable pulse', graph);
+  stepScene(run, graph, input, .01);
+  assert.equal(run.variables[0].playValue, 3);
+  assert.equal(run.activeActions.pulse.resolved, true);
+});
+
+test('a locked chapter blocks interaction and only emits appearance after its challenge is available', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const chapter = { ...node('chapter', 'group'), availableWhen: 'Score >= 2' };
+  const spark = { ...createPlacement('challenge', 'Spark', 250, 200), nodeId: 'spark' };
+  scene.placements.push(spark);
+  const nodes = [chapter, { ...node('spark', 'challenge'), parentId: chapter.id },
+    { ...propertyOutcome('click', 'clicked', 3), parentId: chapter.id },
+    { ...propertyOutcome('appear', 'visible', 5), parentId: chapter.id }];
+  const edges = [edge('clicked', 'spark', 'click', 'is_clicked'), edge('appeared', 'spark', 'appear', 'appears')];
+  const graph = { nodes, edges, scenes: [scene] };
+  const run = startScene(scene, [numberEntry('clicked'), numberEntry('visible')]);
+  beginSceneRules(run, scene, graph);
+  clickStageObject(run, graph, spark.x, spark.y);
+  stepScene(run, graph, input, .01);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [0, 0]);
+  run.score = 2;
+  stepScene(run, graph, input, .01);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [0, 5]);
+  clickStageObject(run, graph, spark.x, spark.y);
+  assert.deepEqual(run.variables.map(entry => entry.playValue), [3, 5]);
+});
+
+test('nested chapter roots unlock and a parallel chapter progresses without taking initial focus', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const focus = node('focus', 'group');
+  const nested = { ...node('nested', 'group'), parentId: focus.id };
+  const helper = { ...node('helper', 'challenge'), parentId: nested.id };
+  const result = { ...propertyOutcome('result', 'points', 3), parentId: nested.id };
+  const parallel = { ...node('parallel', 'group'), x: 500 };
+  const next = { ...node('next', 'group'), x: 1000 };
+  const graph = {
+    nodes: [focus, nested, helper, result, parallel, next], scenes: [scene],
+    edges: [
+      edge('inside-nested', helper.id, result.id, 'is_clicked'),
+      { id: 'parallel-progress', fromId: parallel.id, toId: next.id, edgeType: 'flow', condition: 'Score >= 2' },
+    ],
+  };
+  const run = startScene(scene, [numberEntry('points')]);
+  beginSceneRules(run, scene, graph);
+  assert.equal(run.groupId, focus.id);
+  assert.ok(run.unlockedGroups.includes(nested.id));
+  assert.ok(run.unlockedGroups.includes(parallel.id));
+  run.score = 2;
+  stepScene(run, graph, input, .01);
+  assert.equal(run.groupId, next.id);
+});
+
+test('a Challenge property condition reacts once for each instance without a collision', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const spark = { ...createPlacement('challenge', 'Spark', 300, 200), nodeId: 'spark' };
+  scene.placements.push(spark);
+  const result = {
+    ...node('result', 'outcome', { relatedProperties: [{ id: 'reward', variableId: 'value', op: 'formula', formula: 'value + 1' }] }),
+    promptInput: { outcomeMode: 'property' },
+  };
+  const next = propertyOutcome('next', 'chained', 2);
+  const graph = { nodes: [node('spark', 'challenge'), result, next],
+    edges: [
+      { id: 'on-score', fromId: 'spark', toId: result.id, condition: 'Score >= 2' },
+      { id: 'after-score', fromId: result.id, toId: next.id },
+    ], scenes: [scene] };
+  const run = startScene(scene, [numberEntry('value'), numberEntry('chained')]);
+  stepScene(run, graph, input, .01);
+  assert.equal(run.variables[0].playValue, 0);
+  run.score = 2;
+  stepScene(run, graph, input, .01);
+  stepScene(run, graph, input, .01);
+  assert.equal(run.variables[0].playValue, 1);
+  assert.equal(run.variables[1].playValue, 2);
+});
+
+test('duplicated and linked groups each use their own shared condition hub ID', () => {
+  const group = node('group', 'group');
+  const children = ['origin', 'branch1', 'branch2'].map(id => ({ ...node(id, 'challenge'), parentId: group.id }));
+  const edges = [
+    { id: 'e1', fromId: 'origin', toId: 'branch1', edgeType: 'flow', condition: 'Score >= 2', sharedConditionId: 'hub' },
+    { id: 'e2', fromId: 'origin', toId: 'branch2', edgeType: 'flow', condition: 'Score >= 2', sharedConditionId: 'hub' },
+  ];
+  const duplicate = cloneGroupSubtree(group.id, 'duplicate', [group, ...children], edges, 'en');
+  const copyEdges = duplicate.edges.slice(edges.length);
+  assert.equal(copyEdges[0].sharedConditionId, copyEdges[1].sharedConditionId);
+  assert.notEqual(copyEdges[0].sharedConditionId, 'hub');
+  const reuse = cloneGroupSubtree(group.id, 'reuse', [group, ...children], edges, 'en');
+  const updated = reuse.edges.map(item => edges.some(edge => edge.id === item.id) ? { ...item, condition: 'Score >= 3' } : item);
+  const synced = propagateGroupDefinitionFrom(group.id, reuse.nodes, updated);
+  const syncedCopy = synced.edges.filter(item => !edges.some(edge => edge.id === item.id));
+  assert.equal(syncedCopy.length, 2);
+  assert.notEqual(syncedCopy[0].sharedConditionId, 'hub');
+  assert.equal(syncedCopy[0].sharedConditionId, syncedCopy[1].sharedConditionId);
+  assert.ok(syncedCopy.every(item => item.condition === 'Score >= 3'));
 });

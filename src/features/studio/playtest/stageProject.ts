@@ -250,7 +250,11 @@ export function projectBoardScenes(scenes: Scene[], nodes: BoardNode[], assets: 
       ?? cards.filter(node => node.kind === 'challenge' && node.promptInput?.actorAssetId !== node.promptInput?.obstacleAssetId)
         .map(node => assetById.get(node.promptInput?.actorAssetId ?? '')).find(asset => asset?.categoryId === 'characters')
       ?? cards.filter(node => node.kind !== 'dialogue' && node.kind !== 'challenge').flatMap(boundAssets).find(asset => asset.categoryId === 'characters');
-    const placements = scene.placements.map(item => item.kind === 'spawn' && !item.assetId && hero ? { ...item, assetId: hero.id } : item);
+    const placements = scene.placements.map(item => {
+      if (item.kind !== 'spawn' || item.assetId || !hero) return item;
+      const defaultSize = item.width === 30 && item.height === 30 ? { width: 42, height: 42 } : {};
+      return { ...item, ...defaultSize, assetId: hero.id };
+    });
     return {
       ...scene,
       theme: cards.filter(node => node.kind === 'narration' || node.kind === 'challenge')
