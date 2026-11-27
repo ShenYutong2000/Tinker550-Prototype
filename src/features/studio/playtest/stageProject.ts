@@ -1,5 +1,7 @@
 import type { AssetItem } from '../asset-library/assetLibraryModel';
-import { getAncestorGroupIds, getNodeAssetIds, type BoardNode, type SceneTheme } from '../design-board/studioModel';
+import type { Language } from '../../../shared/i18n';
+import { getAncestorGroupIds, getNodeAssetIds, type BoardNode, type CardParameterItem, type SceneTheme } from '../design-board/studioModel';
+import { createStateVariableId, type StateVariable } from '../properties/stateModel';
 import { hasCardContent, resolveSceneTheme } from './boardPlayEngine';
 import { cardPreviewBehavior } from './cardPreviewMotion';
 import type { SceneBackground } from './stageBackground';
@@ -13,6 +15,7 @@ export interface Placement extends Point {
   id: string;
   kind: StageKind;
   name: string;
+  nameSource?: 'asset' | 'custom';
   width: number;
   height: number;
   layer: number;
@@ -62,11 +65,20 @@ export function createScene(name: string, spawnName: string, heroAssetId?: strin
   return { id: makeId(), name, width: 1080, height: VIEW_HEIGHT, entrySpawnId: spawn.id, placements: [spawn] };
 }
 
-export function createLibraryPlacement(asset: AssetItem, scene: Pick<Scene, 'width' | 'height'>, world: Point, screen: Point): Placement {
+export function createLibraryPlacement(asset: AssetItem, scene: Pick<Scene, 'width' | 'height'>, world: Point, screen: Point, nodes: BoardNode[] = []): Placement {
+  const preset = asset.stagePreset;
+  if (preset && nodes.some(node => node.id === preset.challengeNodeId && node.kind === 'challenge')) {
+    return {
+      ...createPlacement('challenge', asset.name, world.x, world.y),
+      assetId: asset.id, nameSource: 'asset', nodeId: preset.challengeNodeId, boardCopy: true,
+      width: preset.width, height: preset.height, rotation: preset.rotation, collider: preset.collider,
+    };
+  }
   const kind = asset.categoryId === 'backgrounds' ? 'background' : asset.categoryId === 'interface' ? 'hud' : 'decoration';
   const { x, y } = kind === 'hud' ? screen : world;
   const item = createPlacement(kind, asset.name, x, y);
   item.assetId = asset.id;
+  item.nameSource = 'asset';
   delete item.hud;
   if (kind === 'background') {
     return { ...item, x: scene.width / 2, y: scene.height / 2, width: scene.width, height: scene.height, layer: -9 };
@@ -165,8 +177,94 @@ export function exposedParameters(nodes: BoardNode[], placement: Placement) {
   return nodes.find(node => node.id === placement.nodeId)?.fields.relatedParameters?.filter(parameter => parameter.exposeOnStage) ?? [];
 }
 
+export type StageParameterSource = 'instance' | 'asset' | 'rule';
+
+export type StageBoardTarget = {
+  nodeId?: string;
+  edgeId?: string;
+  stage?: StageBoardSelection;
+};
+
+export type StageBoardSelection = { sceneId: string; placementId: string; trial?: boolean; trialParameters?: Record<string, number> };
+
+export type StageBoardContext = {
+  name: string;
+  trial: boolean;
+  parameters: ({ id: string; name: string } & ReturnType<typeof resolveStageParameter>)[];
+};
+
+export function stageParameterSourceLabel(lang: Language, source: StageParameterSource) {
+  if (source === 'instance') return lang === 'zh' ? '仅此实例' : 'This instance';
+  if (source === 'asset') return lang === 'zh' ? '素材默认值' : 'Asset default';
+  return lang === 'zh' ? '规则默认值' : 'Rule default';
+}
+
+export function resolveStageParameter(parameter: CardParameterItem, placement: Placement, asset?: AssetItem) {
+  const property = asset?.properties?.find(item => item.stageParameterId === parameter.id
+    && item.type === 'number' && typeof item.initialValue === 'number');
+  const clamp = (value: number) => Math.min(parameter.max ?? Infinity, Math.max(parameter.min ?? -Infinity, value));
+  const defaultValue = clamp(Number(property?.initialValue ?? parameter.value));
+  const override = placement.parameters?.[parameter.id];
+  const defaultSource: 'asset' | 'rule' = property ? 'asset' : 'rule';
+  return {
+    value: override === undefined ? defaultValue : clamp(override),
+    source: (override === undefined ? defaultSource : 'instance') as StageParameterSource,
+    defaultValue, defaultSource, propertyId: property?.id, assetName: asset?.name,
+  };
+}
+
+export function createStageAssetVariant(source: AssetItem, placement: Placement, node: BoardNode, name: string): AssetItem {
+  const stageParameters = exposedParameters([node], placement);
+  const properties: StateVariable[] = (source.properties ?? []).map(property => ({
+    ...property, id: createStateVariableId(), options: property.options && [...property.options],
+    stageParameterId: property.type === 'number' && stageParameters.some(parameter => parameter.id === property.stageParameterId)
+      ? property.stageParameterId : undefined,
+  }));
+  for (const parameter of stageParameters) {
+    const value = resolveStageParameter(parameter, placement, source).value;
+    const existing = properties.find(property => property.stageParameterId === parameter.id);
+    if (existing) existing.initialValue = value;
+    else properties.push(createStageParameterProperty(parameter, properties, value));
+  }
+  const states = source.states.map(state => ({ ...state, id: makeId() }));
+  const activeIndex = source.states.findIndex(state => state.id === source.activeStateId);
+  return {
+    ...source, id: makeId(), name, properties, states, activeStateId: states[Math.max(0, activeIndex)].id,
+    stagePreset: {
+      challengeNodeId: node.id,
+      ruleAssetIds: [...new Set([source.id, ...(source.stagePreset?.ruleAssetIds ?? [])])],
+      width: placement.width, height: placement.height, rotation: placement.rotation, collider: placement.collider,
+    },
+  };
+}
+
+export function createStageParameterProperty(parameter: CardParameterItem, properties: StateVariable[], value = parameter.value): StateVariable {
+  let name = parameter.name;
+  let suffix = 2;
+  while (properties.some(item => item.name.trim().toLowerCase() === name.trim().toLowerCase())) {
+    name = parameter.name + ' ' + suffix++;
+  }
+  return {
+    id: createStateVariableId(), name, type: 'number',
+    initialValue: Math.min(parameter.max ?? Infinity, Math.max(parameter.min ?? -Infinity, value)),
+    stageParameterId: parameter.id, hasMin: parameter.min !== undefined, minValue: parameter.min,
+    hasMax: parameter.max !== undefined, maxValue: parameter.max,
+  };
+}
+
+export function applyStageAssetVariant(placement: Placement, asset: AssetItem): Partial<Placement> {
+  const parameters = { ...placement.parameters };
+  for (const property of asset.properties ?? []) {
+    if (property.stageParameterId && property.type === 'number') delete parameters[property.stageParameterId];
+  }
+  return { name: asset.name, nameSource: 'asset', assetId: asset.id, parameters };
+}
+
 export function patchScenePlacement(scene: Scene, id: string, patch: Partial<Placement>): Scene {
-  if (scene.placements.some(item => item.id === id)) {
+  const placement = scene.placements.find(item => item.id === id);
+  const before = placement ?? scene.boardOverrides?.[id];
+  if (before && (Object.keys(patch) as (keyof Placement)[]).every(key => Object.is(before[key], patch[key]))) return scene;
+  if (placement) {
     return { ...scene, placements: scene.placements.map(item => item.id === id ? { ...item, ...patch } : item) };
   }
   return { ...scene, boardOverrides: { ...scene.boardOverrides, [id]: { ...scene.boardOverrides?.[id], ...patch } } };
@@ -200,6 +298,14 @@ export function projectBoardScenes(scenes: Scene[], nodes: BoardNode[], assets: 
     const asset = assetById.get(id);
     return asset ? [asset] : [];
   });
+  const resolveName = (item: Placement): Placement => {
+    const asset = item.assetId && assetById.get(item.assetId);
+    if (!asset || !asset.name.trim() || item.nameSource === 'custom') return item;
+    // Saved variants used to store the asset name directly on the placement.
+    const legacyVariant = asset.stagePreset && (item.kind === 'challenge' || item.kind === 'decoration');
+    if (item.nameSource !== 'asset' && !legacyVariant) return item;
+    return item.name === asset.name && item.nameSource === 'asset' ? item : { ...item, name: asset.name, nameSource: 'asset' };
+  };
   return scenes.map((scene, index) => {
     const cards = nodes.filter(node => {
       if (!hasCardContent(node) || node.kind === 'group') return false;
@@ -211,10 +317,12 @@ export function projectBoardScenes(scenes: Scene[], nodes: BoardNode[], assets: 
     const generated: Placement[] = [];
     const add = (node: BoardNode, kind: StageKind, role: string, name: string, size: Pick<Placement, 'x' | 'y' | 'width' | 'height'>, assetId?: string, extra?: Partial<Placement>) => {
       const id = 'board:' + node.id + ':' + role;
+      const overrides = scene.boardOverrides?.[id];
       generated.push({
         id, kind, nodeId: node.id, name, assetId, ...size,
+        nameSource: assetId && overrides?.name === undefined ? 'asset' : undefined,
         layer: kind === 'background' ? -10 : 0, rotation: 0,
-        ...extra, ...scene.boardOverrides?.[id],
+        ...extra, ...overrides,
       });
     };
     let challengeIndex = 0;
@@ -260,7 +368,7 @@ export function projectBoardScenes(scenes: Scene[], nodes: BoardNode[], assets: 
       theme: cards.filter(node => node.kind === 'narration' || node.kind === 'challenge')
         .map(resolveSceneTheme).find(theme => theme !== 'neutral') ?? 'neutral',
       width: Math.max(scene.width, 175 + Math.max(0, challengeIndex - 1) * 68 + 35),
-      placements: [...placements, ...generated],
+      placements: [...placements, ...generated].map(resolveName),
     };
   });
 }

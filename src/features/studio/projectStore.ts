@@ -72,7 +72,17 @@ function isScene(value: unknown): value is Scene {
       && [item.x, item.y, item.width, item.height, item.rotation, item.layer].every(Number.isFinite))) return false;
 
   const background = scene.background;
-  if (background && (!['inherit', 'color', 'segments', 'tile'].includes(background.mode) || typeof background.color !== 'string')) return false;
+  if (background && (!['inherit', 'color', 'segments', 'tile', 'free'].includes(background.mode) || typeof background.color !== 'string')) return false;
+  if (background?.mode === 'free') {
+    return Array.isArray(background.elements) && background.elements.every(item => item
+      && typeof item.id === 'string' && [item.x, item.y, item.width, item.height].every(Number.isFinite)
+      && item.width > 0 && item.height > 0
+      && (item.opacity === undefined || Number.isFinite(item.opacity) && item.opacity >= 0 && item.opacity <= 1)
+      && (item.kind === 'image' ? typeof item.assetId === 'string'
+        && (item.feather === undefined || Number.isFinite(item.feather) && item.feather >= 0)
+        && (!item.crop?.image || [item.crop.image.x, item.crop.image.y, item.crop.image.width, item.crop.image.height].every(Number.isFinite))
+        : item.kind === 'color' && typeof item.color === 'string'));
+  }
   const segments = background?.segments;
   return segments === undefined || Array.isArray(segments) && segments.every(item => item
     && typeof item.id === 'string' && typeof item.assetId === 'string'
@@ -97,6 +107,14 @@ export function parseProject(text: string): ProjectData {
   }
   for (const asset of project.assets) {
     if (!asset || typeof asset.id !== 'string' || !Array.isArray(asset.states)) throw new Error('Invalid asset');
+    const preset = asset.stagePreset;
+    if (preset && (typeof preset.challengeNodeId !== 'string'
+      || !Array.isArray(preset.ruleAssetIds) || !preset.ruleAssetIds.every(id => typeof id === 'string')
+      || ![preset.width, preset.height, preset.rotation].every(Number.isFinite)
+      || preset.width <= 0 || preset.height <= 0
+      || preset.collider && ![preset.collider.width, preset.collider.height].every(size => Number.isFinite(size) && size > 0))) {
+      throw new Error('Invalid asset stage preset');
+    }
   }
   if (project.scenes !== undefined && (!Array.isArray(project.scenes) || !project.scenes.every(isScene))) {
     throw new Error('Invalid Canvas scene');

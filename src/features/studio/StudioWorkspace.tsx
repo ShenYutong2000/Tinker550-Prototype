@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -79,7 +80,8 @@ import { AssetsPanel, type AiPlacedNotice } from './asset-library/AssetsPanel';
 import { DesignBoard } from './design-board/DesignBoard';
 import { FloatingGuidance } from './guidance/FloatingGuidance';
 import { StageEditor } from './playtest/StageEditor';
-import { createScene, type Scene } from './playtest/stageProject';
+import { applyStageAssetVariant, createScene, createStageAssetVariant, exposedParameters, patchScenePlacement, projectBoardScenes, resolveStageParameter, type Placement, type Scene, type StageBoardSelection, type StageBoardTarget } from './playtest/stageProject';
+import { createStageHistory, stageHistoryReducer, type StageSceneUpdate } from './playtest/stageHistory';
 
 interface StudioWorkspaceProps {
   initialProject: ProjectData;
@@ -154,6 +156,7 @@ export function StudioWorkspace({
     () => initialLibraryRef.current!.unlockedCategories,
   );
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [stageAssetDraft, setStageAssetDraft] = useState<{ asset: AssetItem; sceneId: string; placementId: string; error?: string } | null>(null);
   const [assetEditorTab, setAssetEditorTab] = useState<'looks' | 'properties'>('looks');
   const [highlightPropertyId, setHighlightPropertyId] = useState<string | null>(null);
   const [aiNotice, setAiNotice] = useState<AiPlacedNotice | null>(null);
@@ -186,11 +189,8 @@ export function StudioWorkspace({
   const [playValues, setPlayValues] = useState<Record<string, StateVariableValue>>({});
   const [playValueEdit, setPlayValueEdit] = useState<{ variableId?: string; value?: StateVariableValue }>();
   const [stateManagerOpen, setStateManagerOpen] = useState(false);
-  const [boardFocusTarget, setBoardFocusTarget] = useState<{
-    nodeId?: string;
-    edgeId?: string;
-    nonce: number;
-  } | null>(null);
+  const [boardFocusTarget, setBoardFocusTarget] = useState<(Omit<StageBoardTarget, 'stage'> & { nonce: number }) | null>(null);
+  const [stageBoardSelection, setStageBoardSelection] = useState<StageBoardSelection>();
 
   const scopedVariables = useMemo(
     () => collectAllScopedVariables(globalVariables, assetItems, playValues),
@@ -201,7 +201,32 @@ export function StudioWorkspace({
   const [nodes, setNodes] = useState<BoardNode[]>(() => initialProject.nodes);
   const [edges, setEdges] = useState<BoardEdge[]>(() => initialProject.edges);
   const [comboFrames, setComboFrames] = useState<BoardComboFrame[]>(initialProject.comboFrames);
-  const [sceneDrafts, setSceneDrafts] = useState<Scene[]>(() => initialProject.scenes?.length ? initialProject.scenes : [createScene(lang === 'zh' ? '第一关' : 'Level 1', lang === 'zh' ? '玩家出生点' : 'Player spawn')]);
+  const [stageHistory, dispatchStageHistory] = useReducer(stageHistoryReducer, initialProject.scenes, initial => createStageHistory(
+    initial?.length ? initial : [createScene(lang === 'zh' ? '第一关' : 'Level 1', lang === 'zh' ? '玩家出生点' : 'Player spawn')],
+  ));
+  const sceneDrafts = stageHistory.scenes;
+  const setSceneDrafts = useCallback((sceneId: string, update: StageSceneUpdate, group?: symbol) => {
+    dispatchStageHistory({ type: 'edit', sceneId, update, group });
+  }, []);
+  const retainStageAnchors = useCallback((projected: Scene[]) => {
+    dispatchStageHistory({ type: 'retain-anchors', projected });
+  }, []);
+  const stageBoardContext = useMemo(() => {
+    const target = stageBoardSelection;
+    if (!target) return undefined;
+    const scene = projectBoardScenes(sceneDrafts, nodes, assetItems).find(item => item.id === target.sceneId);
+    const placement = scene?.placements.find(item => item.id === target.placementId);
+    if (!placement) return undefined;
+    const asset = assetItems.find(item => item.id === placement.assetId);
+    const inspected = target.trialParameters ? { ...placement, parameters: target.trialParameters } : placement;
+    return {
+      name: placement.name,
+      trial: Boolean(target.trial),
+      parameters: exposedParameters(nodes, placement).map(parameter => ({
+        id: parameter.id, name: parameter.name, ...resolveStageParameter(parameter, inspected, asset),
+      })),
+    };
+  }, [assetItems, stageBoardSelection, nodes, sceneDrafts]);
   const [saveStatus, setSaveStatus] = useState('');
   const [undoBoard, setUndoBoard] = useState<{nodes:BoardNode[];edges:BoardEdge[]} | null>(null);
   const projectSnapshot = useMemo<ProjectData>(() => ({version:1,id:initialProject.id,name:projectName,updatedAt:Date.now(),nodes,edges,comboFrames,scenes:sceneDrafts,assets:assetItems,folders:assetFolders,variables:globalVariables}),[initialProject.id,projectName,nodes,edges,comboFrames,sceneDrafts,assetItems,assetFolders,globalVariables]);
@@ -429,10 +454,56 @@ export function StudioWorkspace({
 
   const handleUpdateAsset = useCallback(
     (assetId: string, updater: (prev: AssetItem) => AssetItem) => {
+      if (stageAssetDraft?.asset.id === assetId) {
+        setStageAssetDraft(current => current?.asset.id === assetId ? { ...current, asset: updater(current.asset), error: undefined } : current);
+        return;
+      }
       setAssetItems((prev) => prev.map((item) => (item.id === assetId ? updater(item) : item)));
     },
-    [],
+    [stageAssetDraft?.asset.id],
   );
+
+  const handleStartStageAsset = (sceneId: string, placement: Placement) => {
+    const source = assetItems.find(asset => asset.id === placement.assetId);
+    const node = nodes.find(card => card.id === placement.nodeId && card.kind === 'challenge');
+    if (!source || !node) return;
+    const baseName = (placement.name.trim() || source.name) + (lang === 'zh' ? '（变体）' : ' Variant');
+    let name = baseName;
+    let suffix = 2;
+    while (assetItems.some(item => item.name.trim().toLowerCase() === name.toLowerCase())) {
+      name = baseName + ' ' + suffix++;
+    }
+    const asset = createStageAssetVariant(source, placement, node, name);
+    setStageAssetDraft({ asset, sceneId, placementId: placement.id });
+    setLeftOpen(true);
+    setStateManagerOpen(false);
+    setAssetEditorTab('properties');
+    setSelectedAssetId(asset.id);
+  };
+
+  const handleSaveStageAsset = () => {
+    if (!stageAssetDraft) return;
+    const { asset, sceneId, placementId } = stageAssetDraft;
+    const name = asset.name.trim();
+    if (!name) return;
+    if (assetItems.some(item => item.name.trim().toLowerCase() === name.toLowerCase())) {
+      setStageAssetDraft({ ...stageAssetDraft, error: lang === 'zh' ? '已有同名素材，请换一个名称。' : 'An asset already has this name. Choose another name.' });
+      return;
+    }
+    const placement = projectBoardScenes(sceneDrafts, nodes, assetItems)
+      .find(scene => scene.id === sceneId)?.placements.find(item => item.id === placementId);
+    if (!placement || !asset.stagePreset || placement.nodeId !== asset.stagePreset.challengeNodeId
+      || !nodes.some(node => node.id === placement.nodeId && node.kind === 'challenge')) {
+      setStageAssetDraft({ ...stageAssetDraft, error: lang === 'zh' ? '原舞台对象或挑战已找不到。请关闭后重新选择对象。' : 'The stage object or its challenge is unavailable. Close and select the object again.' });
+      return;
+    }
+    const { width, height, rotation, collider } = placement;
+    const saved = { ...asset, name, stagePreset: { ...asset.stagePreset, width, height, rotation, collider } };
+    setAssetItems(current => [...current, saved]);
+    setSceneDrafts(sceneId, current => current.map(scene => scene.id === sceneId
+      ? patchScenePlacement(scene, placementId, applyStageAssetVariant(placement, saved)) : scene));
+    setStageAssetDraft(null);
+  };
 
   const handleDeleteAsset = useCallback((assetId: string) => {
     setAssetItems((prev) => {
@@ -457,15 +528,9 @@ export function StudioWorkspace({
 
   const handleAddAssetProperty = useCallback(
     (assetId: string, variable: StateVariable) => {
-      setAssetItems((prev) =>
-        prev.map((item) =>
-          item.id === assetId
-            ? { ...item, properties: [...(item.properties ?? []), variable] }
-            : item,
-        ),
-      );
+      handleUpdateAsset(assetId, item => ({ ...item, properties: [...(item.properties ?? []), variable] }));
     },
-    [],
+    [handleUpdateAsset],
   );
 
   const handleUpdateScopedVariable = useCallback(
@@ -479,18 +544,9 @@ export function StudioWorkspace({
           prev.map((v) => (v.id === variable.id ? variable : v)),
         );
       } else if (assetId) {
-        setAssetItems((prev) =>
-          prev.map((item) =>
-            item.id === assetId
-              ? {
-                  ...item,
-                  properties: (item.properties ?? []).map((p) =>
-                    p.id === variable.id ? variable : p,
-                  ),
-                }
-              : item,
-          ),
-        );
+        handleUpdateAsset(assetId, item => ({
+          ...item, properties: (item.properties ?? []).map(property => property.id === variable.id ? variable : property),
+        }));
       }
       // Re-clamp existing play override if type or bounds changed
       setPlayValues((prev) => {
@@ -501,7 +557,7 @@ export function StudioWorkspace({
         };
       });
     },
-    [],
+    [handleUpdateAsset],
   );
 
   const handleMoveVariableScope = useCallback(
@@ -562,16 +618,9 @@ export function StudioWorkspace({
       if (scope === 'global') {
         setGlobalVariables((prev) => prev.filter((v) => v.id !== variableId));
       } else if (assetId) {
-        setAssetItems((prev) =>
-          prev.map((item) =>
-            item.id === assetId
-              ? {
-                  ...item,
-                  properties: (item.properties ?? []).filter((p) => p.id !== variableId),
-                }
-              : item,
-          ),
-        );
+        handleUpdateAsset(assetId, item => ({
+          ...item, properties: (item.properties ?? []).filter(property => property.id !== variableId),
+        }));
       }
       setPlayValues((prev) => {
         if (!(variableId in prev)) return prev;
@@ -580,7 +629,7 @@ export function StudioWorkspace({
         return next;
       });
     },
-    [],
+    [handleUpdateAsset],
   );
 
   const handleUpdatePlayValue = useCallback(
@@ -623,13 +672,14 @@ export function StudioWorkspace({
   }, []);
 
   const handleJumpToAssetProperty = useCallback(
-    (assetId: string, variableId: string) => {
+    (assetId: string, variableId?: string) => {
       setLeftOpen(true);
       setStateManagerOpen(false);
+      setStageAssetDraft(null);
       setSelectedAssetId(assetId);
       setAssetEditorTab('properties');
-      setHighlightPropertyId(variableId);
-      window.setTimeout(() => {
+      setHighlightPropertyId(variableId ?? null);
+      if (variableId) window.setTimeout(() => {
         setHighlightPropertyId((curr) => (curr === variableId ? null : curr));
       }, 2200);
     },
@@ -637,7 +687,7 @@ export function StudioWorkspace({
   );
 
   const handleLocateBoardReference = useCallback(
-    (target: { nodeId?: string; edgeId?: string }) => {
+    (target: StageBoardTarget) => {
       setStateManagerOpen(false);
       if (target.nodeId) {
         setNodes((prev) => {
@@ -655,7 +705,8 @@ export function StudioWorkspace({
           );
         });
       }
-      setBoardFocusTarget({ ...target, nonce: Date.now() });
+      setStageBoardSelection(target.stage);
+      setBoardFocusTarget({ nodeId: target.nodeId, edgeId: target.edgeId, nonce: Date.now() });
     },
     [],
   );
@@ -2031,6 +2082,7 @@ export function StudioWorkspace({
                 setStageAssetPick({ assetId: id });
                 return;
               }
+              setStageAssetDraft(null);
               setSelectedAssetId((prev) => {
                 const next = prev === id ? null : id;
                 if (next) {
@@ -2050,11 +2102,13 @@ export function StudioWorkspace({
 
           {/* Side Floating Asset Card Editor */}
           {(() => {
+            const draft = stageAssetDraft?.asset.id === selectedAssetId ? stageAssetDraft : null;
             const activeAsset =
-              assetItems.find((item) => item.id === selectedAssetId) ?? null;
+              draft?.asset ?? assetItems.find((item) => item.id === selectedAssetId) ?? null;
             if (!activeAsset) return null;
             return (
               <AssetEditorDrawer
+                key={activeAsset.id}
                 lang={lang}
                 asset={activeAsset}
                 audioUnlocked={false}
@@ -2071,8 +2125,12 @@ export function StudioWorkspace({
                 playValues={playValues}
                 leftOffsetPx={leftOpen ? leftWidth + 14 : 56}
                 scopedVariables={scopedVariables}
-            onChangeTab={setAssetEditorTab}
-                onClose={() => setSelectedAssetId(null)}
+                onChangeTab={setAssetEditorTab}
+                onClose={() => { setStageAssetDraft(null); setSelectedAssetId(null); }}
+                onSaveDraft={draft ? handleSaveStageAsset : undefined}
+                draftError={draft?.error}
+                stageParameters={activeAsset.stagePreset ? nodes.find(node => node.id === activeAsset.stagePreset?.challengeNodeId)
+                  ?.fields.relatedParameters?.filter(parameter => parameter.exposeOnStage) : undefined}
                 onUpdateAsset={handleUpdateAsset}
                 onDeleteAsset={handleDeleteAsset}
                 onAddProperty={handleAddAssetProperty}
@@ -2127,6 +2185,8 @@ export function StudioWorkspace({
               scopedVariables={scopedVariables}
               stateManagerOpen={stateManagerOpen}
               focusTarget={boardFocusTarget}
+              stageContext={stageBoardContext}
+              onDismissStageContext={() => setStageBoardSelection(undefined)}
               selectedNodeId={selectedNodeId}
               autoFocusNodeId={autoFocusNodeId}
               activePlayNodeIds={activePlayNodeIds}
@@ -2216,6 +2276,11 @@ export function StudioWorkspace({
             comboFrames={comboFrames}
             sceneDrafts={sceneDrafts}
             onScenesChange={setSceneDrafts}
+            onRetainAnchors={retainStageAnchors}
+            undoSceneId={stageHistory.past.at(-1)?.sceneId}
+            redoSceneId={stageHistory.future[0]?.sceneId}
+            onUndo={() => dispatchStageHistory({ type: 'undo' })}
+            onRedo={() => dispatchStageHistory({ type: 'redo' })}
             onPlayVariables={setPlayValues}
             onUpdatePlayValue={handleUpdatePlayValue}
             playValueEdit={playValueEdit}
@@ -2228,9 +2293,17 @@ export function StudioWorkspace({
             assetPick={stageAssetPick}
             onAssetPickChange={setStageAssetPick}
             onOpenLibrary={() => { setSelectedAssetId(null); setLeftOpen(true); }}
+            onOpenAsset={handleJumpToAssetProperty}
+            onSaveAsset={handleStartStageAsset}
             onPlacementCounts={setPlacementCounts}
             onToggle={() => { setStageAssetPick(null); setRightOpen((v) => !v); }}
             onLocate={handleLocateBoardReference}
+            onUpdateBoardTrial={(selection) => setStageBoardSelection(current => {
+              if (!current?.trial) return current;
+              if (!selection) return { sceneId: current.sceneId, placementId: current.placementId };
+              return current.sceneId === selection.sceneId && current.placementId === selection.placementId
+                ? { ...current, trialParameters: selection.trialParameters } : current;
+            })}
             onActive={handleActivePlayChange}
             onPlay={handleUserTestedInPlay}
         />

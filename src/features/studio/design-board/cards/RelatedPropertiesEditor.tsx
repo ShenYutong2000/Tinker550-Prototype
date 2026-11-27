@@ -233,6 +233,7 @@ export function RelatedPropertiesEditor({
   const b = COPY[lang].studio.board;
   const s = COPY[lang].studio.states;
 
+  const targets = useMemo(() => scopedVariables.filter(entry => !entry.variable.stageParameterId), [scopedVariables]);
   const numberTokens = useMemo(() => {
     const vars = scopedVariables
       .filter((v) => v.variable.type === 'number')
@@ -261,7 +262,7 @@ export function RelatedPropertiesEditor({
   };
 
   const addRule = () => {
-    const first = scopedVariables[0];
+    const first = targets[0];
     if (!first) return;
     onChange([...rules, defaultRuleForEntry(first)]);
   };
@@ -272,7 +273,7 @@ export function RelatedPropertiesEditor({
     updateRule(rule.id, { formula: next });
   };
 
-  if (scopedVariables.length === 0) {
+  if (targets.length === 0 && rules.length === 0) {
     return (
       <p onPointerDown={(e) => e.stopPropagation()} className="text-[11px] text-[#64748B] leading-snug">
         {b.propNoneAvailable}
@@ -283,7 +284,7 @@ export function RelatedPropertiesEditor({
   return (
     <div onPointerDown={(e) => e.stopPropagation()} className="space-y-2.5">
       {rules.map((rule) => {
-        const target = scopedVariables.find((v) => v.variable.id === rule.variableId);
+        const target = targets.find((v) => v.variable.id === rule.variableId);
         const varType = target?.variable.type;
 
         const opButtons: { op: OutcomePropertyOp; label: string; locked?: boolean }[] =
@@ -339,7 +340,7 @@ export function RelatedPropertiesEditor({
               <PropertyPicker
                 lang={lang}
                 selectedVariableId={rule.variableId}
-                scopedVariables={scopedVariables}
+                scopedVariables={targets}
                 onSelect={(entry) => replaceRuleTarget(rule.id, entry)}
               />
               <button

@@ -1,141 +1,155 @@
+import { Check, Image, Layers, Lock, Plus, Square, Unlock } from 'lucide-react';
 import type { Language } from '../../../shared/i18n';
 import type { AssetItem } from '../asset-library/assetLibraryModel';
-import { backgroundTransition, getBackgroundImage, type BackgroundBoundary, type BackgroundSegment, type SceneBackground } from './stageBackground';
+import { getBackgroundImage, type BackgroundColor, type BackgroundElement, type BackgroundImage, type FreeBackground } from './stageBackground';
 
-const colors = ['#dbeafe', '#dcfce7', '#fef3c7', '#fae8ff', '#1e293b'];
-const modes = ['inherit', 'color', 'segments'] as const;
+export type BackgroundTool =
+  | { kind: 'add' | 'images' }
+  | { kind: 'image'; assetId: string }
+  | { kind: 'color'; color: string }
+  | null;
 
-export type BackgroundTool = 'add' | 'replace' | 'frame' | null;
-
-interface StageBackgroundSettingsProps {
+interface SettingsProps {
   lang: Language;
-  background: SceneBackground;
   assets: AssetItem[];
-  segments: BackgroundSegment[];
-  segment?: BackgroundSegment;
-  boundary?: BackgroundBoundary;
+  background: FreeBackground;
   tool: BackgroundTool;
-  pendingAsset?: string;
-  notice: string;
-  onChange: (background: SceneBackground) => void;
+  notice?: 'loading' | 'unavailable';
   onTool: (tool: BackgroundTool) => void;
-  onAsset: (id: string) => void;
-  onPlaceInView: () => void;
-  onRemoveSegment: () => void;
-  onResetFrame: () => void;
-  onSaveFrame: () => void;
-  onSaveFrameAndAdd: () => void;
-  onCancelFrame: () => void;
-  onMoveSection: (id: string, x: number) => void;
-  onMoveBoundary: (boundary: BackgroundBoundary, x: number) => void;
-  onTransition: (id: string, width: number) => void;
+  onColor: (color: string) => void;
+  onDone: () => void;
 }
 
-export function StageBackgroundSettings({
-  lang, background, assets, segments, segment, boundary, tool, pendingAsset, notice, onChange, onTool, onAsset, onPlaceInView,
-  onRemoveSegment, onResetFrame, onSaveFrame, onSaveFrameAndAdd, onCancelFrame, onMoveSection, onMoveBoundary, onTransition,
-}: StageBackgroundSettingsProps) {
+export function StageBackgroundSettings({ lang, assets, background, tool, notice, onTool, onColor, onDone }: SettingsProps) {
   const l = (en: string, zh: string) => lang === 'zh' ? zh : en;
-  const modeLabels = [l('Follow Board', '跟随设计板'), l('Solid color', '纯色'), l('Background sections', '分段背景')];
-  const mode = background.mode === 'tile' ? 'segments' : background.mode;
   const images = assets.flatMap(asset => {
     if (asset.categoryId !== 'backgrounds') return [];
-    const state = getBackgroundImage(asset);
-    return state ? [{ asset, url: state.mediaUrl }] : [];
+    const slot = getBackgroundImage(asset);
+    return slot ? [{ asset, url: slot.mediaUrl }] : [];
   });
-  const assetName = (id: string) => assets.find(asset => asset.id === id)?.name ?? l('Missing background', '素材已不可用');
-  const left = segments.find(item => item.id === boundary?.leftId);
-  const right = segments.find(item => item.id === boundary?.rightId);
-  const maximumFade = left && right ? Math.min(left.end - left.start, right.end - right.start) : 0;
-  const fade = backgroundTransition(left, right);
-  const framing = tool === 'frame';
-  const chooseAsset = tool === 'add' || tool === 'replace' || !segments.length;
-
-  return <section id="stage-background-settings" className="stage-inline-panel" aria-label={l('Background settings', '背景设置')}>
-    <div className="stage-row" role="group" aria-label={l('Background type', '背景类型')}>
-      {modes.map((option, index) => (
-        <button key={option} type="button" aria-pressed={mode === option} disabled={framing}
-          onClick={() => onChange({ ...background, mode: option })}>
-          {modeLabels[index]}
-        </button>
-      ))}
-    </div>
-    {mode !== 'inherit' && <div className="stage-background-colors">
-      <label className="stage-color-picker">
-        {l('Base color', '底色')}
-        <input aria-label={l('Base color', '底色')} type="color" value={background.color} disabled={framing}
-          onChange={event => onChange({ ...background, color: event.target.value })} />
-        <code>{background.color}</code>
+  return <section id="stage-background-settings" className="stage-inline-panel stage-background-editor" aria-label={l('Edit background', '编辑背景')}>
+    <div className="stage-row stage-background-tools">
+      <label className="stage-background-color-button">{l('Base color', '底色')}
+        <input type="color" aria-label={l('Base color', '底色')} value={background.color} onInput={event => onColor(event.currentTarget.value)} />
       </label>
-      <div className="stage-row" role="group" aria-label={l('Preset colors', '预设颜色')}>
-        {colors.map(color => (
-          <button key={color} type="button" className="stage-color-swatch" style={{ backgroundColor: color }} disabled={framing}
-            aria-label={color} aria-pressed={background.color === color}
-            onClick={() => onChange({ ...background, color })} />
-        ))}
-      </div>
+      <button type="button" className="stage-add" aria-expanded={Boolean(tool)} onClick={() => onTool(tool ? null : { kind: 'add' })}>
+        <Plus size={15} aria-hidden="true" />{l('Add', '添加')}
+      </button>
+      <button type="button" className="stage-add stage-primary stage-background-done" onClick={onDone}>
+        <Check size={15} aria-hidden="true" />{l('Done', '完成')}
+      </button>
+    </div>
+
+    {tool?.kind === 'add' && <div className="stage-row">
+      <button type="button" className="stage-add" onClick={() => onTool({ kind: 'images' })}><Image size={14} />{l('Image', '图片')}</button>
+      <button type="button" className="stage-add" onClick={() => onTool({ kind: 'color', color: '#91b877' })}><Square size={14} />{l('Color block', '色块')}</button>
     </div>}
-    {mode === 'segments' && <>
-      {segments.length > 0 && !framing && <div className="stage-row">
-        <button type="button" aria-pressed={tool === 'add'} onClick={() => onTool(tool === 'add' ? null : 'add')}>
-          {l('Add background section', '＋ 添加背景段')}
-        </button>
-        {segment && <>
-          <strong title={assetName(segment.assetId)}>{assetName(segment.assetId)} · {segment.start}–{segment.end}</strong>
-          {segment.imagePlacement && <small>{l('Image locked', '取景已锁定')}</small>}
-          <button type="button" aria-pressed={tool === 'replace'} onClick={() => onTool(tool === 'replace' ? null : 'replace')}>{l('Replace image', '换素材')}</button>
-          <button type="button" onClick={() => onTool('frame')}>
-            {segment.imagePlacement ? l('Unlock and edit', '解锁并编辑') : l('Edit background image', '编辑背景图')}
-          </button>
-          <button type="button" onClick={onRemoveSegment}>{l('Remove section', '移除此段')}</button>
-        </>}
-      </div>}
-      {segment && !framing && tool === null && <div className="stage-row stage-background-boundary-controls">
-        <label>{l('Section start', '分段起点')} <input type="number" min="0" aria-label={l('Section start', '分段起点')} value={segment.start}
-          onChange={event => { if (event.target.value !== '') onMoveSection(segment.id, Number(event.target.value)); }} /></label>
-        <small>{l('Drag the whole section on the stage or map to move it. Drag its edges to adjust the seam.',
-          '在舞台或总览拖动整段可移动位置，拖动总览上的分段边缘可调整接缝。')}</small>
-      </div>}
-      {framing && segment && <div className="stage-object-details">
-        <div className="stage-row">
-          <strong>{assetName(segment.assetId)}</strong>
-          <button type="button" className="stage-primary" onClick={onSaveFrame}>{l('Save and lock', '保存并锁定')}</button>
-          <button type="button" onClick={onSaveFrameAndAdd}>{l('Save and add section', '保存并添加下一段')}</button>
-          <button type="button" onClick={onCancelFrame}>{l('Cancel', '取消')}</button>
-          <button type="button" onClick={onResetFrame}>{l('Fit to section', '适配分段')}</button>
-        </div>
-        <small>{l('Drag to adjust the image within this section. Drag a square corner to scale it.', '拖动可调整此段内的取景，拖动方形角点可等比例缩放。')}</small>
-      </div>}
-      {boundary && <div className="stage-row stage-background-boundary-controls">
-        <strong>{left && right ? l('Join', '接缝') : l('Section edge', '分段边界')} · {boundary.x}</strong>
-        <label>{l('Position', '位置')} <input type="number" aria-label={l('Boundary position', '边界位置')} value={boundary.x}
-          onChange={event => { if (event.target.value !== '') onMoveBoundary(boundary, Number(event.target.value)); }} /></label>
-        {left && right && <>
-          <button type="button" aria-pressed={fade === 0} onClick={() => onTransition(right.id, 0)}>{l('Hard cut', '直接拼接')}</button>
-          <button type="button" aria-pressed={fade > 0} onClick={() => onTransition(right.id, Math.min(80, maximumFade))}>{l('Crossfade', '渐变过渡')}</button>
-          {fade > 0 && <label>{l('Fade width', '过渡宽度')} <input type="number" min="1" max={maximumFade} value={fade}
-            aria-label={l('Fade width', '过渡宽度')}
-            onChange={event => { if (event.target.value !== '') onTransition(right.id, Math.min(maximumFade, Math.max(1, Math.round(Number(event.target.value))))); }} /></label>}
-        </>}
-      </div>}
-      {notice && <p className="stage-panel-hint" role="status">{notice}</p>}
-      {chooseAsset && <>
-        {pendingAsset ? <div className="stage-row">
-          <small>{l('Click the stage or map to place', '点击舞台或关卡总览放置')} {assetName(pendingAsset)}
-            {l('. Placing it on another section splits that section.', '。放在已有背景上可分割原段。')}</small>
-          <button type="button" onClick={onPlaceInView}>{l('Place in current view', '在当前视野放置')}</button>
-          <button type="button" onClick={() => onTool(null)}>{l('Cancel', '取消')}</button>
-        </div> : <small>{tool === 'replace' ? l('Choose a replacement image.', '选择替换素材。') : l('Choose an image for the new section.', '选择新背景段的素材。')}</small>}
-        {images.length ? <div className="stage-background-assets" role="group" aria-label={l('Background assets', '背景素材')}>
-          {images.map(({ asset, url }) => (
-            <button key={asset.id} type="button" aria-pressed={(pendingAsset ?? (tool === 'replace' ? segment?.assetId : undefined)) === asset.id}
-              onClick={() => onAsset(asset.id)}>
-              <img src={url} alt="" />
-              <span>{asset.name}</span>
-            </button>
-          ))}
-        </div> : <small>{l('Add a background image in My Game Assets.', '在左侧素材库添加一张背景图片。')}</small>}
-      </>}
+
+    {(tool?.kind === 'images' || tool?.kind === 'image') && <>
+      <div className="stage-row stage-background-placement-hint">
+        <p role="status">{tool.kind === 'image' ? l('Click the stage to place the image.', '点击舞台放置图片。') : l('Choose a background image.', '选择一张背景图片。')}</p>
+        <button type="button" onClick={() => onTool(null)}>{l('Cancel', '取消')}</button>
+      </div>
+      {images.length > 0 ? <div className="stage-background-assets" role="group" aria-label={l('Background images', '背景图片')}>
+        {images.map(({ asset, url }) => <button key={asset.id} type="button"
+          aria-pressed={tool.kind === 'image' && tool.assetId === asset.id}
+          onClick={() => onTool({ kind: 'image', assetId: asset.id })}>
+          <img src={url} alt="" /><span>{asset.name}</span>
+        </button>)}
+      </div> : <p className="stage-panel-hint">{l('Add a background image in the asset library first.', '先在左侧素材库添加一张背景图片。')}</p>}
     </>}
+
+    {tool?.kind === 'color' && <div className="stage-row stage-background-placement-hint">
+      <label className="stage-background-color-button">{l('Block color', '色块颜色')}
+        <input type="color" aria-label={l('Block color', '色块颜色')} value={tool.color}
+          onInput={event => onTool({ kind: 'color', color: event.currentTarget.value })} />
+      </label>
+      <p role="status">{l('Drag on the stage to draw a block.', '在舞台上拖出一个色块。')}</p>
+      <button type="button" onClick={() => onTool(null)}>{l('Cancel', '取消')}</button>
+    </div>}
+    {notice && <p role="status" className="stage-panel-hint">
+      {notice === 'loading' ? l('Loading the background image…', '正在载入背景图片…') : l('This background image could not be loaded.', '这张背景图片无法载入。')}
+    </p>}
   </section>;
+}
+
+export type BackgroundChange = Partial<Pick<BackgroundImage, 'x' | 'y' | 'width' | 'height' | 'locked' | 'opacity' | 'feather' | 'crop'> & Pick<BackgroundColor, 'color'>>;
+interface InspectorProps {
+  lang: Language;
+  assets: AssetItem[];
+  elements: BackgroundElement[];
+  selected?: BackgroundElement;
+  onSelect: (id: string) => void;
+  onChange: (change: BackgroundChange) => void;
+  onMoveLayer: (direction: -1 | 1) => void;
+  onRemove: () => void;
+  onShowFullImage: () => void;
+}
+
+export function BackgroundItemInspector({ lang, assets, elements, selected, onSelect, onChange, onMoveLayer, onRemove, onShowFullImage }: InspectorProps) {
+  const l = (en: string, zh: string) => lang === 'zh' ? zh : en;
+  const index = elements.findIndex(item => item.id === selected?.id);
+  const itemName = (item: BackgroundElement) => item.kind === 'color'
+    ? l('Color block', '色块') : assets.find(asset => asset.id === item.assetId)?.name ?? l('Missing image', '图片不可用');
+  return <aside className="stage-inspector stage-background-inspector" aria-label={l('Background element', '背景元素')}>
+    {selected ? <>
+      <div className="stage-row stage-background-element-heading">
+        <h3>{itemName(selected)}</h3>
+        <button type="button" className="stage-add" aria-pressed={Boolean(selected.locked)} onClick={() => onChange({ locked: !selected.locked })}>
+          {selected.locked ? <Unlock size={14} /> : <Lock size={14} />}
+          {selected.locked ? l('Unlock', '解锁') : l('Lock', '锁定')}
+        </button>
+      </div>
+      <div className="stage-background-dimensions">
+        {(['x', 'y', 'width', 'height'] as const).map((field, i) => {
+          const label = ['X', 'Y', l('Width', '宽'), l('Height', '高')][i];
+          return <label key={field}>{label}
+            <input type="number" aria-label={l('Background ', '背景') + label} step="any"
+              min={i >= 2 ? 8 : undefined} disabled={selected.locked} value={Math.round(selected[field] * 10) / 10}
+              onChange={event => {
+                if (event.currentTarget.value !== '') onChange({ [field]: i >= 2 ? Math.max(8, Number(event.currentTarget.value)) : Number(event.currentTarget.value) });
+              }} />
+          </label>;
+        })}
+      </div>
+      {selected.kind === 'color' && <label className="stage-background-color-button">{l('Color', '颜色')}
+        <input type="color" aria-label={l('Selected block color', '所选色块颜色')} value={selected.color}
+          onInput={event => onChange({ color: event.currentTarget.value })} />
+      </label>}
+    </> : <small>{l('Select a picture or color block on the stage.', '在舞台上选中一张图片或一个色块。')}</small>}
+    {elements.length > 0 && <details className="stage-background-layers">
+      <summary><Layers size={14} aria-hidden="true" />{l('Layers & blending', '层级与混合')}</summary>
+      <label>{l('Layer', '图层')}
+        <select aria-label={l('Background layer', '背景图层')} value={selected?.id ?? ''} onChange={event => onSelect(event.currentTarget.value)}>
+          <option value="" disabled>{l('Select a layer', '选择图层')}</option>
+          {[...elements].reverse().map((item, i) => <option key={item.id} value={item.id}>
+            {itemName(item)}{itemsWithSameName(elements, itemName(item), itemName) > 1 ? ' · ' + (elements.length - i) : ''}
+          </option>)}
+        </select>
+      </label>
+      {selected && <>
+        <div className="stage-row">
+          <button type="button" disabled={index === elements.length - 1} onClick={() => onMoveLayer(1)}>{l('Bring forward', '上移一层')}</button>
+          <button type="button" disabled={index === 0} onClick={() => onMoveLayer(-1)}>{l('Send backward', '下移一层')}</button>
+          {selected.kind === 'image' && selected.crop && <button type="button" disabled={selected.locked} onClick={onShowFullImage}>{l('Show full image', '显示完整图片')}</button>}
+          <button type="button" className="stage-background-remove" onClick={onRemove}>{l('Remove', '移除')}</button>
+        </div>
+        <label>{l('Opacity', '透明度')} <input type="number" aria-label={l('Background opacity', '背景透明度')} min="0" max="100" step="any"
+          value={Math.round((selected.opacity ?? 1) * 1000) / 10}
+          onChange={event => {
+            if (event.currentTarget.value !== '') onChange({ opacity: Math.max(0, Math.min(1, Number(event.currentTarget.value) / 100)) });
+          }} />%</label>
+        {selected.kind === 'image' && <label>{l('Left edge feather', '左边缘羽化')}
+          <input type="number" aria-label={l('Left edge feather', '左边缘羽化')} min="0" max={selected.width} step="any" value={selected.feather ?? 0}
+            onChange={event => {
+              if (event.currentTarget.value !== '') onChange({ feather: Math.max(0, Math.min(selected.width, Number(event.currentTarget.value))) });
+            }} />
+        </label>}
+      </>}
+    </details>}
+  </aside>;
+}
+
+function itemsWithSameName(items: BackgroundElement[], name: string, itemName: (item: BackgroundElement) => string) {
+  return items.filter(item => itemName(item) === name).length;
 }

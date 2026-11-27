@@ -81,6 +81,14 @@ export interface AssetItem {
   states: AssetStateSlot[]; // Always >= 1; multi-slot UI activates for characters & objects
   activeStateId: string;
   properties?: StateVariable[]; // Asset-level data properties (characters, objects, backgrounds)
+  stagePreset?: {
+    challengeNodeId: string;
+    ruleAssetIds: string[];
+    width: number;
+    height: number;
+    rotation: number;
+    collider?: { width: number; height: number };
+  };
   interfaceMode?: InterfaceMode; // Only used when categoryId === 'interface'
   typography?: InterfaceTypography;
   isAiCreated?: boolean;

@@ -95,7 +95,7 @@ export function StateManagerPanel({
   const eligibleAssets = useMemo(
     () =>
       assetItems
-        .filter((a) => assetCategorySupportsProperties(a.categoryId))
+        .filter((a) => assetCategorySupportsProperties(a.categoryId) || a.stagePreset)
         .map((a) => ({ id: a.id, name: a.name, categoryId: a.categoryId })),
     [assetItems],
   );
@@ -285,6 +285,9 @@ export function StateManagerPanel({
 
   const renderPlayModeEditor = (entry: ScopedStateVariable) => {
     const { variable, playValue, isDirty } = entry;
+    if (variable.stageParameterId) {
+      return <span className="text-xs text-[#475569]">{lang === 'zh' ? '素材默认值' : 'Asset default'}</span>;
+    }
 
     const showNumberSlider =
       variable.type === 'number' &&
@@ -631,7 +634,7 @@ export function StateManagerPanel({
           }
           initialVariable={modalState.mode === 'edit' ? modalState.entry?.variable : null}
           existingNames={existingNamesByScope[modalState.initialScopeKey] ?? []}
-          allowScopeSelect
+          allowScopeSelect={!modalState.entry?.variable.stageParameterId}
           initialScopeKey={modalState.initialScopeKey}
           assetOptions={eligibleAssets}
           existingNamesByScope={existingNamesByScope}
@@ -649,7 +652,7 @@ export function StateManagerPanel({
                 prev.scope === 'asset' && prev.assetId ? prev.assetId : 'global';
               const nextKey =
                 targetScope.scope === 'asset' ? targetScope.assetId : 'global';
-              if (prevKey === nextKey) {
+              if (prevKey === nextKey || prev.variable.stageParameterId) {
                 onUpdateVariable(prev.scope, prev.assetId, variable);
               } else {
                 onMoveVariableScope(

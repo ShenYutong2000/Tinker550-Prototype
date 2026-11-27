@@ -1,7 +1,7 @@
 import type { AssetItem } from '../asset-library/assetLibraryModel';
 import { buildCssFilterString, evaluateDynamicEffects, getOutcomeVisualEffects, getStaticOpacity, isHiddenByEffect, type RunningVisual } from '../asset-library/effects/visualEffectsModel';
-import { backgroundImageExtent, backgroundImagePlacement, backgroundSegments, getBackgroundImage, type BackgroundImageDraft, type BackgroundSegment } from './stageBackground';
-import { VIEW_HEIGHT, VIEW_WIDTH, type Scene } from './stageProject';
+import { backgroundImageBox, editableBackground, getBackgroundImage, type BackgroundImage, type BackgroundPreview } from './stageBackground';
+import type { Scene } from './stageProject';
 
 const fadeCanvases = new WeakMap<CanvasRenderingContext2D, HTMLCanvasElement>();
 
@@ -17,90 +17,126 @@ export function loadStageImage(url: string | undefined, images: Map<string, HTML
 }
 
 export function drawSceneBackground(
-  ctx: CanvasRenderingContext2D, scene: Scene, pan: number, zoom: number,
-  assets: AssetItem[], images: Map<string, HTMLImageElement>,
-  draft?: BackgroundImageDraft,
+  ctx: CanvasRenderingContext2D, scene: Scene, pan: number, visibleWidth: number, visibleHeight: number,
+  assets: AssetItem[], images: Map<string, HTMLImageElement>, preview?: BackgroundPreview,
   visuals?: Record<string, RunningVisual>, time = 0,
 ) {
-  const background = scene.background;
-  if (!background || background.mode === 'inherit') return;
-  const height = scene.height - 28;
-  const visibleHeight = Math.min(height, VIEW_HEIGHT / zoom);
-  const left = Math.max(0, pan);
-  const right = Math.min(scene.width, pan + VIEW_WIDTH / zoom);
+  const background = editableBackground(scene);
+  const width = Math.min(scene.width, pan + visibleWidth) - pan;
+  const height = Math.min(visibleHeight, scene.height);
+  if (width <= 0 || height <= 0) return;
   ctx.save();
-  ctx.fillStyle = background.color;
-  ctx.fillRect(left, 0, right - left, height);
-  if (background.mode === 'color') {
-    ctx.restore();
-    return;
+  ctx.beginPath();
+  ctx.rect(pan, 0, width, height);
+  ctx.clip();
+  if (!background.useSceneBackdrop) {
+    ctx.fillStyle = background.color;
+    ctx.fillRect(pan, 0, width, scene.height - 28);
   }
 
-  const segments = backgroundSegments(background, scene.width);
-  const drawSegment = (target: CanvasRenderingContext2D, segment: BackgroundSegment, start: number, end: number, clipStart: number, clipEnd: number) => {
-    if (clipEnd <= clipStart) return;
-    const asset = assets.find(item => item.id === segment.assetId && item.categoryId === 'backgrounds');
+  const draft = preview?.sceneId === scene.id ? preview.element : undefined;
+  const items = background.elements.map(item => item.id === draft?.id ? draft : item);
+  if (draft && !items.some(item => item.id === draft.id)) items.push(draft);
+  for (const item of items) {
+    if (!('rotation' in item && item.rotation) && (item.x + item.width <= pan || item.x >= pan + width
+      || item.y + item.height <= 0 || item.y >= height)) continue;
+    const alpha = (item.opacity ?? 1) * (preview?.placing && item === draft ? .65 : 1);
+    if (item.kind === 'color') {
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = item.color;
+      ctx.fillRect(item.x, item.y, item.width, item.height);
+      ctx.globalAlpha = 1;
+      continue;
+    }
+
+    const asset = assets.find(candidate => candidate.id === item.assetId);
     const slot = asset && getBackgroundImage(asset);
     const image = loadStageImage(slot?.mediaUrl, images);
-    const visual = visuals?.[segment.assetId];
+    const visual = visuals?.[item.assetId];
     const effects = getOutcomeVisualEffects(slot?.visualEffects, visual, time);
-    if (!image || isHiddenByEffect(effects)) return;
-    const box = draft?.sceneId === scene.id && draft.segmentId === segment.id && draft.assetId === segment.assetId
-      ? draft.image : backgroundImagePlacement(segment, start, end, height, image.naturalWidth, image.naturalHeight);
-    target.save();
-    target.beginPath();
-    target.rect(clipStart, 0, clipEnd - clipStart, visibleHeight);
-    target.clip();
-    target.globalAlpha = getStaticOpacity(effects);
-    target.filter = buildCssFilterString(effects) || 'none';
-    if (visual && effects !== slot?.visualEffects) {
-      const frame = evaluateDynamicEffects([visual.effect], Math.min(time - visual.start, visual.duration), false);
-      target.globalAlpha *= frame.opacityMul;
-      target.translate(box.x + box.width / 2 + frame.offsetX, box.y + box.height / 2 + frame.offsetY);
-      target.scale(frame.scale, frame.scale);
-      target.translate(-box.x - box.width / 2, -box.y - box.height / 2);
-    }
-    target.drawImage(image, box.x, box.y, box.width, box.height);
-    target.restore();
-  };
+    if (!image || isHiddenByEffect(effects)) continue;
+    const box = backgroundImageBox(item, image.naturalWidth, image.naturalHeight);
+    const draw = (target: CanvasRenderingContext2D) => {
+      target.save();
+      target.globalAlpha *= getStaticOpacity(effects);
+      target.filter = buildCssFilterString(effects) || 'none';
+      if (item.rotation) {
+        const cx = item.x + item.width / 2;
+        const cy = item.y + item.height / 2;
+        target.translate(cx, cy);
+        target.rotate(item.rotation * Math.PI / 180);
+        target.translate(-cx, -cy);
+      }
+      if (visual && effects !== slot?.visualEffects) {
+        const frame = evaluateDynamicEffects([visual.effect], Math.min(time - visual.start, visual.duration), false);
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        target.globalAlpha *= frame.opacityMul;
+        target.translate(cx + frame.offsetX, cy + frame.offsetY);
+        target.scale(frame.scale, frame.scale);
+        target.translate(-cx, -cy);
+      }
+      target.drawImage(image, box.x, box.y, box.width, box.height);
+      target.restore();
+    };
 
-  for (const [index, segment] of segments.entries()) {
-    const { start, end, incoming } = backgroundImageExtent(segments, index);
-    const fadeEnd = segment.start + incoming;
-    const clipStart = Math.max(start, left);
-    const clipEnd = Math.min(end, right);
-    if (clipEnd <= clipStart) continue;
-    drawSegment(ctx, segment, start, end, Math.max(fadeEnd, left), clipEnd);
-    const fadeRight = Math.min(fadeEnd, clipEnd);
-    if (!incoming || fadeRight <= clipStart) continue;
-
-    // Composite the incoming image and its base color together before applying the fade.
-    let canvas = fadeCanvases.get(ctx);
-    if (!canvas) {
-      canvas = document.createElement('canvas');
-      fadeCanvases.set(ctx, canvas);
+    const feather = Math.min(item.width, item.feather ?? 0);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    if (item.crop || feather > 0) {
+      ctx.beginPath();
+      ctx.rect(item.x + feather, item.y, item.width - feather, item.height);
+      ctx.clip();
     }
-    const transform = ctx.getTransform();
-    const fadeWidth = fadeRight - clipStart;
-    const pixelWidth = Math.max(1, Math.ceil(fadeWidth * transform.a));
-    const pixelHeight = Math.max(1, Math.ceil(visibleHeight * transform.d));
-    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-    const layer = canvas.getContext('2d');
-    if (!layer) continue;
-    const scale = pixelWidth / fadeWidth;
-    layer.setTransform(scale, 0, 0, pixelHeight / visibleHeight, -clipStart * scale, 0);
-    layer.globalCompositeOperation = 'source-over';
-    layer.fillStyle = background.color;
-    layer.fillRect(clipStart, 0, fadeWidth, visibleHeight);
-    drawSegment(layer, segment, start, end, clipStart, fadeRight);
-    const mask = layer.createLinearGradient(start, 0, fadeEnd, 0);
-    mask.addColorStop(0, '#0000');
-    mask.addColorStop(1, '#000');
-    layer.globalCompositeOperation = 'destination-in';
-    layer.fillStyle = mask;
-    layer.fillRect(clipStart, 0, fadeWidth, visibleHeight);
-    ctx.drawImage(canvas, clipStart, 0, fadeWidth, visibleHeight);
+    draw(ctx);
+    ctx.restore();
+    if (feather > 0) drawFeather(ctx, item, feather, pan, width, height, alpha, draw);
   }
+  ctx.restore();
+}
+
+function drawFeather(
+  ctx: CanvasRenderingContext2D, item: BackgroundImage, feather: number,
+  pan: number, visibleWidth: number, visibleHeight: number, alpha: number,
+  draw: (ctx: CanvasRenderingContext2D) => void,
+) {
+  const left = Math.max(pan, item.x);
+  const right = Math.min(pan + visibleWidth, item.x + feather);
+  const top = Math.max(0, item.y);
+  const bottom = Math.min(visibleHeight, item.y + item.height);
+  if (right <= left || bottom <= top) return;
+  let canvas = fadeCanvases.get(ctx);
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    fadeCanvases.set(ctx, canvas);
+  }
+  const transform = ctx.getTransform();
+  const width = right - left;
+  const height = bottom - top;
+  const pixelWidth = Math.max(1, Math.ceil(width * transform.a));
+  const pixelHeight = Math.max(1, Math.ceil(height * transform.d));
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+  const layer = canvas.getContext('2d');
+  if (!layer) return;
+  const scaleX = pixelWidth / width;
+  const scaleY = pixelHeight / height;
+  layer.setTransform(scaleX, 0, 0, scaleY, -left * scaleX, -top * scaleY);
+  layer.globalCompositeOperation = 'source-over';
+  layer.clearRect(left, top, width, height);
+  if (item.crop?.matte) {
+    layer.fillStyle = item.crop.matte;
+    layer.fillRect(left, top, width, height);
+  }
+  draw(layer);
+  const mask = layer.createLinearGradient(item.x, 0, item.x + feather, 0);
+  mask.addColorStop(0, '#0000');
+  mask.addColorStop(1, '#000');
+  layer.globalCompositeOperation = 'destination-in';
+  layer.fillStyle = mask;
+  layer.fillRect(left, top, width, height);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(canvas, left, top, width, height);
   ctx.restore();
 }

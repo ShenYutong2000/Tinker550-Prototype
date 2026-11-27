@@ -52,6 +52,8 @@ import {
   type StateVariableType,
   type StateVariableValue,
 } from '../properties/stateModel';
+import type { CardParameterItem } from '../design-board/studioModel';
+import { createStageParameterProperty } from '../playtest/stageProject';
 import { PropertyEditorModal } from '../properties/PropertyEditorModal';
 import { VisualEffectsEditor } from './effects/VisualEffectsEditor';
 import {
@@ -79,6 +81,9 @@ interface AssetEditorDrawerProps {
   onUpdateProperty: (assetId: string, variable: StateVariable) => void;
   onDeleteProperty: (assetId: string, variableId: string) => void;
   onOpenStateManager: () => void;
+  onSaveDraft?: () => void;
+  draftError?: string;
+  stageParameters?: CardParameterItem[];
 }
 
 const TEXT_SWATCHES = ['#14244B', '#2563EB', '#059669', '#D97706', '#E11D48', '#FFFFFF'];
@@ -117,6 +122,9 @@ export function AssetEditorDrawer({
   onUpdateProperty,
   onDeleteProperty,
   onOpenStateManager,
+  onSaveDraft,
+  draftError,
+  stageParameters,
 }: AssetEditorDrawerProps) {
   const t = COPY[lang].studio.assets;
   const ed = t.editor;
@@ -126,9 +134,10 @@ export function AssetEditorDrawer({
     FIXED_ASSET_CATEGORIES.find((c) => c.id === asset.categoryId) ??
     FIXED_ASSET_CATEGORIES[0];
 
-  const showPropertiesTab = categoryMeta.supportsProperties && propertiesUnlocked;
+  const showPropertiesTab = (categoryMeta.supportsProperties || Boolean(asset.stagePreset)) && propertiesUnlocked;
   const effectiveTab: 'looks' | 'properties' = showPropertiesTab ? activeTab : 'looks';
   const properties = asset.properties ?? [];
+  const availableStageParameters = stageParameters?.filter(parameter => !properties.some(property => property.stageParameterId === parameter.id)) ?? [];
 
   const activeStateIndex = Math.max(
     0,
@@ -436,6 +445,10 @@ export function AssetEditorDrawer({
 
         {/* Drawer Header: Title + Top Dual Tabs (Looks & Audio | Properties) */}
         <div className="px-4 py-3 border-b border-[#E2E8F0] space-y-2.5 shrink-0">
+          {onSaveDraft && <div>
+            <h2 className="text-sm font-bold text-[#14244B]">{lang === 'zh' ? '保存为新素材' : 'Save as new asset'}</h2>
+            <p className="text-xs text-slate-600 mt-1">{lang === 'zh' ? '确认后，选中的舞台对象会使用这个素材，并继续沿用原有规则。' : 'Save to use this asset on the selected stage object and keep its existing rule.'}</p>
+          </div>}
           <div className="flex items-center justify-between gap-2">
             <input
               type="text"
@@ -448,7 +461,7 @@ export function AssetEditorDrawer({
             />
 
             <div className="flex items-center gap-1 shrink-0">
-              <button
+              {!onSaveDraft && <button
                 type="button"
                 onClick={() => onDeleteAsset(asset.id)}
                 title={ed.deleteAsset}
@@ -456,7 +469,7 @@ export function AssetEditorDrawer({
                 className="w-8 h-8 rounded-lg text-[#64748B] hover:text-[#E11D48] hover:bg-[#FFF1F2] flex items-center justify-center transition-colors cursor-pointer"
               >
                 <Trash2 className="w-4 h-4" aria-hidden="true" />
-              </button>
+              </button>}
               <button
                 type="button"
                 onClick={onClose}
@@ -554,6 +567,21 @@ export function AssetEditorDrawer({
                 </button>
               </div>
 
+              {!!availableStageParameters.length && <label className="grid gap-1 rounded-lg border border-slate-200 bg-white p-2.5 text-xs text-[#14244B]">
+                {lang === 'zh' ? '添加玩法默认值' : 'Add a gameplay default'}
+                <select value="" className="w-full rounded border border-slate-300 px-2 py-1.5" onChange={event => {
+                  const parameter = availableStageParameters.find(item => item.id === event.target.value);
+                  if (!parameter) return;
+                  const variable = createStageParameterProperty(parameter, properties);
+                  setPropertyModal({ mode: 'add', variable });
+                }}>
+                  <option value="">{lang === 'zh' ? '选择设计板参数' : 'Select a board parameter'}</option>
+                  {availableStageParameters.map(parameter => <option key={parameter.id} value={parameter.id}>{parameter.name}</option>)}
+                </select>
+              </label>}
+              {asset.stagePreset && !stageParameters?.length && <p className="text-xs text-slate-600">
+                {lang === 'zh' ? '在 Design Board 的挑战卡上开放玩法参数后，就可以在这里为素材设置默认值。' : 'Expose a parameter on the Challenge card in Design Board to set its default for this asset.'}
+              </p>}
               {properties.length === 0 ? (
                 <div className="px-4 py-8 rounded-xl border border-dashed border-[#CBD5E1] bg-[#F8FAFC] text-center">
                   <p className="text-xs text-[#64748B]">{ed.emptyProperties}</p>
@@ -590,6 +618,9 @@ export function AssetEditorDrawer({
                             </div>
                             <div className="text-[11px] text-[#64748B] flex items-center gap-1.5 flex-wrap mt-0.5">
                               <span>{propertyTypeLabel(variable.type)}</span>
+                              {variable.stageParameterId && <span className="text-[#1D4ED8] font-semibold">
+                                {lang === 'zh' ? '舞台默认值' : 'Stage default'}
+                              </span>}
                               {rangeHint && (
                                 <>
                                   <span aria-hidden="true">·</span>
@@ -634,7 +665,7 @@ export function AssetEditorDrawer({
                         <div className="flex items-center justify-between gap-2 pt-1 border-t border-[#E2E8F0]/80 text-xs">
                           <div className="flex items-center gap-1.5 min-w-0">
                             <span className="text-[11px] text-[#64748B] shrink-0">
-                              {st.colInitial}:
+                              {variable.stageParameterId ? (lang === 'zh' ? '默认值' : 'Default') : st.colInitial}
                             </span>
                             <span className="font-mono font-bold tabular-nums text-[#14244B] truncate">
                               {formatVariableValue(variable, variable.initialValue, lang)}
@@ -660,14 +691,14 @@ export function AssetEditorDrawer({
                     );
                   })}
 
-                  <button
+                  {!onSaveDraft && <button
                     type="button"
                     onClick={onOpenStateManager}
                     className="w-full mt-2 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl border border-[#CBD5E1] bg-white hover:border-[#14244B] text-xs font-semibold text-[#14244B] transition-colors cursor-pointer"
                   >
                     <span>{ed.openInStateManager}</span>
                     <ArrowUpRight className="w-3.5 h-3.5" aria-hidden="true" />
-                  </button>
+                  </button>}
                 </div>
               )}
             </section>
@@ -1419,13 +1450,25 @@ export function AssetEditorDrawer({
             </div>
           )}
         </div>
+        {onSaveDraft && <div className="shrink-0 border-t border-[#E2E8F0] px-4 py-3">
+          {draftError && <p className="mb-2 text-xs text-red-700" role="alert">{draftError}</p>}
+          <div className="flex items-center justify-end gap-2">
+            <button type="button" onClick={onClose} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700">
+              {lang === 'zh' ? '取消' : 'Cancel'}
+            </button>
+            <button type="button" onClick={onSaveDraft} disabled={!asset.name.trim()}
+              className="rounded-lg bg-[#14244B] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">
+              {lang === 'zh' ? '保存并应用' : 'Save and apply'}
+            </button>
+          </div>
+        </div>}
       </div>
 
       {propertyModal && (
         <PropertyEditorModal
           lang={lang}
           scopeLabel={asset.name}
-          initialVariable={propertyModal.mode === 'edit' ? propertyModal.variable : null}
+          initialVariable={propertyModal.variable}
           existingNames={properties.map((p) => p.name)}
           onClose={() => setPropertyModal(null)}
           onSave={(variable) => {

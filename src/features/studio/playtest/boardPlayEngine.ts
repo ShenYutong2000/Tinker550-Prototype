@@ -66,8 +66,10 @@ export interface RuntimeEventRecord {
   targetInstanceId?: string;
   eventId: string;
   subjectAssetId?: string;
+  subjectRuleAssetIds?: string[];
   subjectRole?: 'hero' | 'hazard' | 'projectile' | 'timer';
   targetAssetId?: string;
+  targetRuleAssetIds?: string[];
   targetRole?: 'hero' | 'hazard' | 'projectile' | 'timer';
 }
 
@@ -282,15 +284,13 @@ function matchesConditionEntity(
   expectedKind: string | undefined,
   actualAssetId: string | undefined,
   actualRole: RuntimeEventRecord['subjectRole'] | undefined,
+  ruleAssetIds?: string[],
 ): boolean {
   if (!expectedId) return true;
   if (expectedKind === 'scene' && expectedId === 'timer') {
     return actualRole === 'timer';
   }
-  if (actualAssetId) {
-    return actualAssetId === expectedId;
-  }
-  return false;
+  return actualAssetId === expectedId || Boolean(ruleAssetIds?.includes(expectedId));
 }
 
 function evaluateEventClause(
@@ -336,6 +336,7 @@ function evaluateEventClause(
         clause.subjectKind,
         rec.subjectAssetId,
         rec.subjectRole,
+        rec.subjectRuleAssetIds,
       );
     if (!subjOk) continue;
 
@@ -346,6 +347,7 @@ function evaluateEventClause(
         clause.targetKind,
         rec.targetAssetId,
         rec.targetRole,
+        rec.targetRuleAssetIds,
       );
     if (tgtOk) return true;
   }

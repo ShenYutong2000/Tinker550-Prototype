@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cameraX, colliderBox, createLibraryPlacement, createPlacement, createScene, copyPlacements, overlaps, patchScenePlacement, placementBox, projectBoardScenes, resizeCollider, resizePlacement, retainChallengeAnchors, rotatePlacement, rotateStagePoint } from './stageProject.ts';
+import { applyStageAssetVariant, cameraX, colliderBox, createLibraryPlacement, createPlacement, createScene, createStageAssetVariant, copyPlacements, overlaps, patchScenePlacement, placementBox, projectBoardScenes, resizeCollider, resizePlacement, resolveStageParameter, retainChallengeAnchors, rotatePlacement, rotateStagePoint } from './stageProject.ts';
 import { activateStageEvent, advanceOverlay, beginSceneRules, clickStageObject, getStageActionControls, isActive, setStageEntityHidden, startScene, stageEditPose, stepScene, restoreSceneCheckpoint, syncRunScenes } from './sceneRuntime.ts';
 import { getOutcomeVisualEffects } from '../asset-library/effects/visualEffectsModel.ts';
 import { emptyProject, parseProject } from '../projectStore.ts';
 import { cloneGroupSubtree, propagateGroupDefinitionFrom } from '../design-board/studioModel.ts';
 import { cardPreviewBehavior, challengeMotion, challengeSpeed } from './cardPreviewMotion.ts';
-import { backgroundBoundaries, backgroundImageExtent, backgroundImagePlacement, backgroundRangeAt, backgroundRangeForDrop, backgroundRangeInView, backgroundSegments, backgroundTransition, dragBackgroundBoundary, insertBackgroundSegment, moveBackgroundSegment, resizeBackgroundImage } from './stageBackground.ts';
+import { backgroundImageBox, editableBackground, rectangleBetween, resizeBackgroundImage, snapBackgroundBox } from './stageBackground.ts';
+import { createStageHistory, stageHistoryReducer } from './stageHistory.ts';
 
 const node = (id, kind, fields = {}) => ({ id, kind, fields, title: id, note: '', parentId: null, manualFields: [], x: 0, y: 0 });
 const edge = (id, fromId, toId, event) => ({
@@ -18,68 +19,87 @@ const asset = (id, categoryId) => ({ id, categoryId, name: id, states: [], activ
 const meadow = { id: 'meadow', assetId: 'meadow', start: 0, end: 360, transition: 0 };
 const forest = { id: 'forest', assetId: 'forest', start: 360, end: 800, transition: 80, transitionFrom: 'meadow' };
 
-test('separate background assets occupy world ranges and share a movable boundary', () => {
-  assert.deepEqual(backgroundRangeAt([meadow], 1080, 367, 360), { start: 360, end: 720 });
-  assert.equal(backgroundRangeAt([meadow, forest], 1080, 500, 360), null);
-  const seam = backgroundBoundaries([meadow, forest]).find(item => item.x === 360);
-  const shifted = dragBackgroundBoundary([meadow, forest], seam, 1080, 419.6, 8);
-  assert.deepEqual(shifted.map(item => [item.assetId, item.start, item.end]), [['meadow', 0, 420], ['forest', 420, 800]]);
-  const limited = dragBackgroundBoundary(shifted, seam, 1080, 0, 8);
-  assert.equal(limited[0].end, 16);
-  assert.equal(limited[1].start, 16);
+test('stage history treats one drag as one edit and clears redo after a new change', () => {
+  const scene = createScene('Meadow', 'Spawn');
+  const coin = createPlacement('challenge', 'Coin', 120, 150);
+  scene.placements.push(coin);
+  let history = createStageHistory([scene]);
+  const drag = Symbol();
+  const edit = (id, patch, group) => {
+    history = stageHistoryReducer(history, {
+      type: 'edit', sceneId: scene.id, group,
+      update: scenes => scenes.map(item => patchScenePlacement(item, id, patch)),
+    });
+  };
+  edit(coin.id, { x: 140 }, drag);
+  edit(coin.id, { x: 160 }, drag);
+  assert.equal(history.past.length, 1);
+  history = stageHistoryReducer(history, { type: 'undo' });
+  assert.equal(history.scenes[0].placements[1].x, 120);
+  history = stageHistoryReducer(history, { type: 'redo' });
+  assert.equal(history.scenes[0].placements[1].x, 160);
+  history = stageHistoryReducer(history, { type: 'undo' });
+  edit(coin.id, { x: 120 });
+  assert.equal(history.future.length, 1);
+  edit(coin.id, { rotation: 25 });
+  assert.equal(history.future.length, 0);
+  assert.equal(history.scenes[0].placements[1].rotation, 25);
 });
 
-test('placing a background in the leftmost view starts at zero and the next image starts at the seam', () => {
-  assert.deepEqual(backgroundRangeInView([], 1080, 0, 360, 360), { start: 0, end: 360 });
-  assert.deepEqual(backgroundRangeInView([meadow], 1080, 0, 360, 360), { start: 360, end: 720 });
-  assert.deepEqual(backgroundRangeInView([], 1080, 420, 360, 360), { start: 420, end: 780 });
+test('automatic card anchors survive stage undo without consuming a history step', () => {
+  const scene = createScene('Meadow', 'Spawn');
+  const card = node('coin', 'challenge');
+  let history = createStageHistory([scene]);
+  history = stageHistoryReducer(history, {
+    type: 'edit', sceneId: scene.id,
+    update: scenes => scenes.map(item => ({ ...item, background: { mode: 'free', color: '#112233', elements: [] } })),
+  });
+  const projected = projectBoardScenes(history.scenes, [card], []);
+  const coin = projected[0].placements.find(item => item.nodeId === card.id);
+  history = stageHistoryReducer(history, { type: 'retain-anchors', projected });
+  assert.equal(history.past.length, 1);
+  history = stageHistoryReducer(history, { type: 'undo' });
+  assert.equal(history.scenes[0].background, undefined);
+  assert.deepEqual(history.scenes[0].boardOverrides[coin.id], { x: coin.x, y: coin.y });
+  history = stageHistoryReducer(history, { type: 'redo' });
+  assert.equal(history.scenes[0].background.color, '#112233');
+  assert.deepEqual(history.scenes[0].boardOverrides[coin.id], { x: coin.x, y: coin.y });
 });
 
-test('dropping a different image onto an occupied background splits it without changing the existing framing', () => {
-  const framing = { x: -25, y: -8, width: 1200, height: 270 };
-  const original = { ...meadow, end: 1080, imagePlacement: framing };
-  const range = backgroundRangeForDrop([original], 1080, 360, 360);
-  const other = { ...range, id: 'forest', assetId: 'forest', transition: 0 };
-  assert.deepEqual(insertBackgroundSegment([original], other, 'right-fragment'), [
-    { ...original, end: 360 }, other,
-    { ...original, id: 'right-fragment', start: 720, transitionFrom: undefined },
-  ]);
-  const neighbor = { ...forest, id: 'neighbor', start: 1080, end: 1440 };
-  const withNeighbor = insertBackgroundSegment([original, neighbor], other, 'right-fragment');
-  assert.equal(backgroundTransition(withNeighbor[2], withNeighbor[3]), neighbor.transition);
-  assert.deepEqual(backgroundRangeForDrop([meadow], 1080, 0, 360), { start: 0, end: 344 });
+test('legacy sections expose editable image elements with the same crop, lock and transition', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const imagePlacement = { x: -20, y: -9, width: 430, height: 270 };
+  scene.background = { mode: 'segments', color: '#ddeeff', segments: [{ ...meadow, imagePlacement }, forest] };
+  const converted = editableBackground(scene);
+  assert.equal(converted.color, '#ddeeff');
+  assert.deepEqual(converted.elements.map(({ x, width, feather }) => [x, width, feather]), [[0, 400, 0], [320, 480, 80]]);
+  assert.equal(converted.elements[0].locked, true);
+  assert.deepEqual(backgroundImageBox(converted.elements[0], 120, 70), imagePlacement);
+  assert.equal(converted.elements[1].crop.matte, '#ddeeff');
+  assert.equal(scene.background.mode, 'segments');
 });
 
-test('moving and reordering background sections preserves width and follows with locked framing', () => {
-  const framing = { x: 175, y: -15, width: 400, height: 270 };
-  const offset = { ...meadow, start: 180, end: 540, imagePlacement: framing };
-  assert.deepEqual(moveBackgroundSegment([offset], 'meadow', 1080, 4, 8), [
-    { ...offset, start: 0, end: 360, imagePlacement: { ...framing, x: -5 } },
-  ]);
-  const other = { ...forest, end: 720, transition: 0 };
-  const moved = moveBackgroundSegment([{ ...meadow, imagePlacement: { ...framing, x: -5 } }, other], 'meadow', 1080, 520);
-  assert.deepEqual(moved.map(({ id, start, end }) => [id, start, end]), [['forest', 0, 360], ['meadow', 360, 720]]);
-  assert.equal(moved[1].imagePlacement.x, 355);
+test('legacy full-map, inherited and solid-color backgrounds can all be edited', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const tiled = { ...scene, background: { mode: 'tile', color: '#fefefe', assetId: 'forest' } };
+  assert.deepEqual(editableBackground(tiled).elements.map(item => [item.assetId, item.x, item.width]), [['forest', 0, scene.width]]);
+  const solid = { ...scene, background: { mode: 'color', color: '#ab3426' } };
+  assert.deepEqual(editableBackground(solid), { mode: 'free', color: '#ab3426', elements: [] });
+  const inherited = { ...scene, placements: [...scene.placements,
+    { ...createPlacement('background', 'Forest art', 240, 100), assetId: 'forest', width: 200, height: 120, rotation: 3 }] };
+  const free = editableBackground(inherited);
+  assert.equal(free.useSceneBackdrop, true);
+  assert.deepEqual(free.elements.map(({ x, y, width, height, rotation }) => [x, y, width, height, rotation]), [[140, 40, 200, 120, 3]]);
 });
 
-test('background seams snap to an adjacent segment and fade only where sections touch', () => {
-  const offsetForest = { ...forest, start: 400 };
-  const separated = [meadow, offsetForest];
-  assert.equal(backgroundTransition(...separated), 0);
-  const edge = backgroundBoundaries(separated).find(item => item.leftId === meadow.id);
-  const joined = dragBackgroundBoundary(separated, edge, 1080, 396, 8);
-  assert.equal(joined[0].end, joined[1].start);
-  assert.equal(backgroundTransition(...joined), 80);
-  assert.deepEqual(backgroundImageExtent(joined, 0), { start: 0, end: 440, incoming: 0 });
-  assert.deepEqual(backgroundImageExtent(joined, 1), { start: 360, end: 800, incoming: 40 });
-});
-
-test('background framing covers its segment and legacy single images open as one editable section', () => {
-  assert.deepEqual(backgroundImagePlacement({ ...meadow, frame: { x: .5, y: .75 } }, 20, 350, 230, 400, 400),
-    { x: 20, y: -75, width: 330, height: 330 });
-  assert.deepEqual(backgroundSegments({ mode: 'tile', color: '#fff', assetId: 'forest' }, 1080), [
-    { id: 'original-background', assetId: 'forest', start: 0, end: 1080, transition: 0 },
-  ]);
+test('background placement snaps to map and neighboring edges without moving other layers', () => {
+  const scene = createScene('Forest', 'Spawn');
+  const a = { id: 'a', kind: 'image', assetId: 'field', x: 0, y: 0, width: 360, height: 222 };
+  const b = { id: 'b', kind: 'image', assetId: 'forest', x: 357, y: 3, width: 320, height: 222 };
+  assert.deepEqual(snapBackgroundBox(b, [a, b], scene, 6), { x: 360, y: 0 });
+  assert.deepEqual(snapBackgroundBox({ ...b, x: 301, y: 23 }, [a], scene, 6), { x: 301, y: 23 });
+  assert.deepEqual(rectangleBetween({ x: 90, y: 60 }, { x: 10, y: 15 }), { x: 10, y: 15, width: 80, height: 45 });
+  assert.equal(a.x, 0);
 });
 
 test('background corner resizing preserves the image aspect ratio and the opposite corner', () => {
@@ -91,16 +111,16 @@ test('background corner resizing preserves the image aspect ratio and the opposi
   assert.equal(tiny.height, 8);
 });
 
-test('moving a background seam or changing its fade preserves a saved image in world coordinates', () => {
-  const imagePlacement = { x: 17, y: -12, width: 340, height: 255 };
-  const saved = [{ ...meadow, imagePlacement }, forest];
-  const seam = backgroundBoundaries(saved).find(edge => edge.leftId === meadow.id && edge.rightId === forest.id);
-  const moved = dragBackgroundBoundary(saved, seam, 1080, 430, 0);
-  const crop = backgroundImageExtent(moved, 0);
-  assert.equal(moved[0].end, 430);
-  assert.equal(moved[1].start, 430);
-  assert.equal(crop.end, 470);
-  assert.deepEqual(backgroundImagePlacement(moved[0], crop.start, crop.end, 222, 400, 300), imagePlacement);
+test('layered background exports keep independent positions, opacity, feather and lock', () => {
+  const project = emptyProject('Map');
+  const scene = createScene('Map', 'Player');
+  scene.background = { mode: 'free', color: '#e1edcb', elements: [
+    { id: 'one', kind: 'image', assetId: 'meadow', x: -6, y: 0, width: 340, height: 222, locked: true },
+    { id: 'two', kind: 'image', assetId: 'forest', x: 303, y: 4, width: 400, height: 226, feather: 32 },
+    { id: 'three', kind: 'color', color: '#334455', x: 202, y: 25, width: 62, height: 51, opacity: .45 },
+  ] };
+  const restored = parseProject(JSON.stringify({ ...project, scenes: [scene] }));
+  assert.deepEqual(restored.scenes[0].background, scene.background);
 });
 
 test('hidden challenges ignore clicks and contacts and can trigger again when shown', () => {
@@ -291,6 +311,25 @@ test('changing Related Behavior keeps the original placement and mirrors the run
   assert.equal(anchor.y, original.y);
 });
 
+test('paused editing shows trial geometry while project updates preserve temporary fields', () => {
+  const draft = createScene('Meadow', 'Spawn');
+  const coin = { ...createPlacement('challenge', 'Coin', 175, 180), parameters: { reward: 1 } };
+  draft.placements.push(coin);
+  const run = startScene(draft, []);
+  const entity = run.entities.find(item => item.id === coin.id);
+  const patch = { x: 20, width: 58, parameters: { reward: 3 } };
+  Object.assign(entity, { ...patch, x: coin.x + patch.x, motionOffset: { x: patch.x, y: 0 }, collected: true });
+  const revised = patchScenePlacement(draft, coin.id, { x: 185, width: 36, height: 42, parameters: { reward: 2 } });
+  syncRunScenes(run, [draft], [revised], new Map([[coin.id, patch]]));
+  const live = run.entities.find(item => item.id === coin.id);
+  const authored = revised.placements.find(item => item.id === coin.id);
+  const projectPose = stageEditPose(authored, live, patch);
+  const trialPose = stageEditPose(authored, live, patch, true);
+  assert.deepEqual([projectPose.x, projectPose.width, projectPose.height, projectPose.parameters.reward], [185, 36, 42, 2]);
+  assert.deepEqual([trialPose.x, trialPose.width, trialPose.height, trialPose.parameters.reward], [205, 58, 42, 3]);
+  assert.equal(trialPose.collected, true);
+});
+
 test('placing a library asset leaves gameplay to the cards in edit and play', () => {
   const scene = createScene('Forest', 'Player');
   const star = asset('star', 'objects');
@@ -386,6 +425,105 @@ test('copies sharing a rule collect independently with per-instance rewards', ()
   const replay = startScene(scene, []);
   stepScene(replay, graph, input, .01);
   assert.equal(replay.score, 7);
+});
+
+test('a saved coin variant preserves placement and the original asset event while copies follow its default', () => {
+  const project = emptyProject('Coins');
+  const scene = createScene('Meadow', 'Spawn');
+  const reward = { id: 'reward', name: 'Reward', value: 1, min: 0, max: 10, exposeOnStage: true };
+  const coin = { ...asset('coin', 'objects'), folderId: null, activeStateId: 'look', states: [{ id: 'look' }] };
+  const challenge = { ...node('collect-coins', 'challenge', { challengePattern: 'collectible', relatedParameters: [reward] }), assetIds: [coin.id] };
+  const result = node('points', 'outcome', { stageScoreFormula: 'Reward' });
+  const collect = edge('collect', challenge.id, result.id, 'is_collected');
+  Object.assign(collect.conditionGroup.clauses[0], { subjectKind: 'asset', subjectAssetId: coin.id });
+
+  const [original] = projectBoardScenes([scene], [challenge, result], [coin])[0].placements.filter(item => item.kind === 'challenge');
+  assert.equal(original.assetId, coin.id);
+  const [edited] = copyPlacements([original], original, false, { x: 40, y: 0 });
+  Object.assign(edited, { x: 60, y: 175, width: 50, height: 45, rotation: 24, collider: { width: 34, height: 32 }, parameters: { reward: 2 } });
+  const bigCoin = createStageAssetVariant(coin, edited, challenge, 'Big Coin');
+  assert.equal(bigCoin.properties[0].initialValue, 2);
+  bigCoin.properties[0].initialValue = 3;
+  const placed = { ...edited, ...applyStageAssetVariant(edited, bigCoin) };
+  assert.deepEqual(placed.parameters, {});
+  assert.deepEqual([placed.x, placed.y, placed.width, placed.height, placed.rotation, placed.collider, placed.nodeId],
+    [60, 175, 50, 45, 24, edited.collider, challenge.id]);
+  const [copy] = copyPlacements([placed], placed, false, { x: 0, y: 0 });
+  const fromLibrary = createLibraryPlacement(bigCoin, scene, { x: 350, y: 175 }, { x: 0, y: 0 }, [challenge]);
+  assert.deepEqual([fromLibrary.kind, fromLibrary.nodeId, fromLibrary.width, fromLibrary.height, fromLibrary.rotation, fromLibrary.collider],
+    ['challenge', challenge.id, 50, 45, 24, edited.collider]);
+  assert.equal(createLibraryPlacement(bigCoin, scene, fromLibrary, fromLibrary).kind, 'decoration');
+  assert.equal(resolveStageParameter(reward, original, coin).value, 1);
+  assert.equal(resolveStageParameter(reward, copy, bigCoin).value, 3);
+  assert.equal(resolveStageParameter(reward, copy, bigCoin).source, 'asset');
+
+  scene.placements.push(placed, copy, fromLibrary);
+  const restored = parseProject(JSON.stringify({ ...project, nodes: [challenge, result], edges: [collect], assets: [coin, bigCoin], scenes: [scene] }));
+  const graph = {
+    nodes: restored.nodes, edges: restored.edges, assets: restored.assets,
+    scenes: projectBoardScenes(restored.scenes, restored.nodes, restored.assets),
+  };
+  assert.equal(graph.scenes[0].placements.filter(item => item.kind === 'challenge').length, 4);
+  const run = startScene(graph.scenes[0], []);
+  stepScene(run, graph, input, .01);
+  assert.equal(run.score, 6);
+  const verdict = run.verdicts[copy.id + ':collect'];
+  assert.deepEqual(verdict.parameters, [{ id: 'reward', name: 'Reward', value: 3, source: 'asset', assetName: 'Big Coin' }]);
+
+  const restoredBigCoin = graph.assets.find(item => item.id === bigCoin.id);
+  restoredBigCoin.properties[0].initialValue = 4;
+  assert.equal(resolveStageParameter(reward, copy, restoredBigCoin).value, 4);
+  assert.equal(resolveStageParameter(reward, { ...copy, parameters: { reward: 5 } }, restoredBigCoin).value, 5);
+  assert.equal(resolveStageParameter(reward, fromLibrary, restoredBigCoin).value, 4);
+  assert.equal(verdict.parameters[0].value, 3);
+  assert.equal(run.score, 6);
+  const replay = startScene(graph.scenes[0], []);
+  stepScene(replay, graph, input, .01);
+  assert.equal(replay.score, 8);
+
+  const propertyResult = {
+    ...result,
+    promptInput: { outcomeMode: 'property' },
+    fields: { relatedProperties: [{ id: 'score', variableId: 'Points', op: 'formula', formula: 'Points + Reward' }] },
+  };
+  const propertyRun = startScene(graph.scenes[0], [numberEntry('Points')]);
+  stepScene(propertyRun, { ...graph, nodes: [challenge, propertyResult] }, input, .01);
+  assert.equal(propertyRun.variables[0].playValue, 8);
+  assert.deepEqual(propertyRun.verdicts[copy.id + ':collect'].propertyChanges,
+    [{ id: 'Points', name: 'Points', before: 4, after: 8 }]);
+});
+
+test('renaming a saved asset updates its placed and copied names while retaining a custom name', () => {
+  const coin = { ...asset('coin', 'objects'), name: 'Coin' };
+  const challenge = { ...node('collect', 'challenge'), assetIds: [coin.id] };
+  const scene = createScene('Meadow', 'Spawn');
+  const original = projectBoardScenes([scene], [challenge], [coin])[0].placements.find(item => item.kind === 'challenge');
+  const bigCoin = {
+    ...coin, id: 'big-coin', name: 'Big Coin',
+    stagePreset: { challengeNodeId: challenge.id, ruleAssetIds: [coin.id], width: 48, height: 48, rotation: 0 },
+  };
+  const patch = applyStageAssetVariant(original, bigCoin);
+  assert.equal(patch.nameSource, 'asset');
+  // An existing project can already contain the stale label saved by a previous version.
+  const legacyScene = patchScenePlacement(scene, original.id, { ...patch, nameSource: undefined });
+  const placed = createLibraryPlacement(bigCoin, scene, { x: 220, y: 175 }, { x: 0, y: 0 }, [challenge]);
+  const [copy] = copyPlacements([placed], placed, false, { x: 40, y: 0 });
+  const [custom] = copyPlacements([placed], { ...placed, name: 'Bridge reward', nameSource: 'custom' }, false, { x: 80, y: 0 });
+  legacyScene.placements.push(placed, { ...copy, nameSource: undefined }, custom);
+
+  const before = projectBoardScenes([legacyScene], [challenge], [coin, bigCoin])[0];
+  const updated = { ...bigCoin, name: 'Golden Medal' };
+  const imported = parseProject(JSON.stringify({ ...emptyProject('Coins'), nodes: [challenge], assets: [coin, updated], scenes: [legacyScene] }));
+  const [after] = projectBoardScenes(imported.scenes, imported.nodes, imported.assets);
+  const displayName = id => after.placements.find(item => item.id === id)?.name;
+  assert.deepEqual([original.id, placed.id, copy.id, custom.id].map(displayName),
+    ['Golden Medal', 'Golden Medal', 'Golden Medal', 'Bridge reward']);
+  const run = startScene(before, []);
+  syncRunScenes(run, [before], [after]);
+  const activeCopy = run.entities.find(item => item.id === copy.id);
+  assert.equal(activeCopy.name, 'Golden Medal');
+  assert.deepEqual([activeCopy.x, activeCopy.y, activeCopy.width, activeCopy.assetId, activeCopy.nodeId],
+    [copy.x, copy.y, copy.width, bigCoin.id, challenge.id]);
 });
 
 test('a trigger area activates its linked challenge and a scene exit preserves score', () => {

@@ -97,6 +97,9 @@ export function RelatedParametersEditor({
                   <input type="checkbox" checked={Boolean(param.exposeOnStage)} onChange={e => updateParam(param.id, { exposeOnStage: e.target.checked })} />
                   {lang === 'zh' ? '在舞台实例上开放' : 'Expose on stage instances'}
                 </label>
+                {param.exposeOnStage && <p className="text-[10px] text-[#64748B]">
+                  {lang === 'zh' ? '这里设置规则默认值。素材和个别实例可以有自己的取值。' : 'This is the rule default. Assets and individual instances can supply their own values.'}
+                </p>}
                 <div className="flex items-center gap-2 px-0.5">
                   <input
                     type="range"

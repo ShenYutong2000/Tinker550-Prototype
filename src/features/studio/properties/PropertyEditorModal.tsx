@@ -234,6 +234,7 @@ export function PropertyEditorModal({
       name: trimmedName,
       type,
       initialValue: finalInitial,
+      stageParameterId: type === 'number' ? initialVariable?.stageParameterId : undefined,
       hasMin: finalHasMin,
       minValue: finalMin,
       hasMax: finalHasMax,
@@ -341,11 +342,12 @@ export function PropertyEditorModal({
                 <button
                   key={vt}
                   type="button"
+                  disabled={Boolean(initialVariable?.stageParameterId) && vt !== 'number'}
                   onClick={() => {
                     setType(vt);
                     setError(null);
                   }}
-                  className={`py-1.5 px-1 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                  className={`py-1.5 px-1 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 disabled:cursor-default ${
                     type === vt
                       ? 'bg-white text-[#14244B] shadow-xs'
                       : 'text-[#64748B] hover:text-[#14244B]'
@@ -428,7 +430,7 @@ export function PropertyEditorModal({
               htmlFor="prop-initial-input"
               className="text-xs font-semibold text-[#334155] text-right"
             >
-              {s.fieldInitial}
+              {initialVariable?.stageParameterId ? (lang === 'zh' ? '素材默认值' : 'Asset default') : s.fieldInitial}
             </label>
 
             {type === 'number' && (
@@ -502,7 +504,7 @@ export function PropertyEditorModal({
           </div>
 
           {/* Number-only Optional Min & Max Checkboxes (revealed ONLY when ticked!) */}
-          {type === 'number' && (
+          {type === 'number' && !initialVariable?.stageParameterId && (
             <div className="grid grid-cols-[106px_1fr] items-start gap-3">
               <span aria-hidden="true" />
               <div className="space-y-2 pt-0.5">

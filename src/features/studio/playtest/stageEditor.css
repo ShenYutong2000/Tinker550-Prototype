@@ -24,6 +24,12 @@
   border-top: 1px solid #e2e8f0;
   padding-top: 10px;
 }
+.stage-editor .stage-edit-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
 .stage-editor .stage-section-title {
   font-size: 14px;
   font-weight: 750;
@@ -71,36 +77,7 @@
   border-radius: 10px;
   background: #f8fafc;
 }
-.stage-editor .stage-check,
-.stage-editor .stage-background-colors,
-.stage-editor .stage-color-picker {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-.stage-editor .stage-background-colors {
-  gap: 10px 14px;
-}
-.stage-editor .stage-color-picker input {
-  width: 29px;
-  height: 25px;
-  padding: 2px;
-  cursor: pointer;
-}
-.stage-editor .stage-color-picker code {
-  font-size: 11px;
-  color: #475569;
-}
-.stage-editor button.stage-color-swatch {
-  width: 21px;
-  height: 21px;
-  padding: 0;
-}
-.stage-editor button.stage-color-swatch[aria-pressed=true] {
-  outline: 2px solid #2867ba;
-  outline-offset: 1px;
-}
+.stage-editor .stage-check{display:flex;align-items:center;gap:7px}
 .stage-editor .stage-panel-hint {
   margin: 0;
   color: #475569;
@@ -191,103 +168,6 @@
   opacity: 0;
   pointer-events: none;
 }
-.stage-editor .stage-background-track-row {
-  display: grid;
-  gap: 4px;
-}
-.stage-editor .stage-background-track {
-  position: relative;
-  height: 41px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  touch-action: none;
-}
-.stage-editor .stage-background-track[data-placing=true] {
-  cursor: crosshair;
-}
-.stage-editor .stage-background-section-wrap {
-  display: contents;
-}
-.stage-editor button.stage-background-section {
-  position: absolute;
-  inset-block: 2px;
-  padding: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: left;
-  background: #dbeafe;
-  border-radius: 4px;
-  border-color: #7c9fc2;
-  cursor: grab;
-}
-.stage-editor .stage-background-track[data-placing=true] button { cursor: crosshair; }
-.stage-editor button.stage-background-section[aria-pressed=true] {
-  border: 2px solid #1d4ed8;
-}
-.stage-editor .stage-background-section img {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  pointer-events: none;
-}
-.stage-editor .stage-background-section span {
-  position: relative;
-  display: block;
-  padding: 2px 7px;
-  overflow: hidden;
-  color: white;
-  text-overflow: ellipsis;
-  background: #14244bcc;
-  font-size: 11px;
-  line-height: 1.3;
-  pointer-events: none;
-}
-.stage-editor button.stage-background-boundary {
-  position: absolute;
-  z-index: 2;
-  top: 0;
-  bottom: 0;
-  width: 14px;
-  padding: 0;
-  transform: translateX(-50%);
-  border: 0;
-  background: transparent;
-  cursor: ew-resize;
-}
-.stage-editor .stage-background-boundary::after {
-  content: "";
-  position: absolute;
-  inset: 6px 5px;
-  border-radius: 2px;
-  background: #f8fafc;
-  outline: 1px solid #475569;
-}
-.stage-editor .stage-background-boundary[aria-pressed=true]::after,
-.stage-editor .stage-background-boundary:hover::after {
-  background: #c7ddff;
-  outline-color: #1d4ed8;
-}
-.stage-editor .stage-background-ghost,
-.stage-editor .stage-background-fade {
-  position: absolute;
-  inset-block: 1px;
-  pointer-events: none;
-}
-.stage-editor .stage-background-ghost {
-  border: 2px dashed #3973bc;
-  border-radius: 4px;
-  background: #8cbdfa50;
-}
-.stage-editor .stage-background-fade {
-  background: linear-gradient(90deg, transparent, #fff8, transparent);
-  border-inline: 1px dashed #f8fafc;
-}
-.stage-editor .stage-background-boundary-controls input {
-  width: 64px;
-}
 .stage-editor .stage-popover {
   position: absolute;
   top: calc(100% + 6px);
@@ -374,3 +254,70 @@
   width: min(100%, 800px);
   align-self: center;
 }
+.stage-editor .stage-background-editor {
+  background: #f8fafc;
+  gap: 8px;
+}
+.stage-editor .stage-background-editor button.stage-background-done {
+  margin-inline-start: auto;
+  background: #14244b;
+  border-color: #14244b;
+  color: #fff;
+}
+.stage-editor .stage-background-editor button.stage-background-done:hover { background: #253e6e; }
+.stage-editor .stage-background-color-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #334155;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.stage-editor .stage-background-color-button input[type=color] {
+  width: 26px;
+  height: 25px;
+  padding: 2px;
+  cursor: pointer;
+}
+.stage-editor .stage-background-placement-hint {
+  align-items: center;
+  color: #475569;
+}
+.stage-editor .stage-background-placement-hint p { flex: 1 1 125px; }
+.stage-editor .stage-background-assets button[aria-pressed=true] { border-color: #2563eb; }
+.stage-editor .stage-background-element-heading { justify-content: space-between; }
+.stage-editor .stage-background-element-heading h3 { overflow-wrap: anywhere; }
+.stage-editor .stage-background-dimensions {
+  display: grid;
+  grid-template-columns: repeat(4,minmax(0,1fr));
+  gap: 5px;
+}
+.stage-editor .stage-background-dimensions label {
+  display: grid;
+  gap: 3px;
+  color: #475569;
+}
+.stage-editor .stage-background-dimensions input { width: 100%; }
+.stage-editor .stage-background-layers {
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+.stage-editor .stage-background-layers summary { cursor: pointer; color: #334155; }
+.stage-editor .stage-background-layers summary svg {
+  display: inline-block;
+  margin-inline: 3px 5px;
+  vertical-align: text-bottom;
+}
+.stage-editor .stage-background-layers > * + * { margin-top: 6px; }
+.stage-editor .stage-background-layers label {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.stage-editor .stage-background-layers label input { width: 55px; }
+.stage-editor .stage-background-layers select { flex: 1; min-width: 0; }
+.stage-editor .stage-background-remove { color: #b91c1c; }
+.stage-editor .stage-map-rail:has(.stage-map-background) { height: 37px; }
+.stage-editor .stage-map-rail canvas.stage-map-background { position: absolute; inset: 0; pointer-events: none; }

@@ -1,10 +1,11 @@
 import type { RunningVisual } from '../asset-library/effects/visualEffectsModel';
+import type { AssetItem } from '../asset-library/assetLibraryModel';
 import { areActionsInSameComboFrame, getAncestorGroupIds, getComboFramesForAction, isDescendantOf, resolveEdgeType, type BoardComboFrame, type BoardEdge, type BoardNode } from '../design-board/studioModel';
 import { getSimulatedEventKey } from '../design-board/arrowConditionModel';
-import { applyOutcomePropertyRule, clampNumberValue, evaluateNumberFormula, type ScopedStateVariable } from '../properties/stateModel';
+import { applyOutcomePropertyRule, clampNumberValue, evaluateNumberFormula, type ScopedStateVariable, type StateVariableValue } from '../properties/stateModel';
 import { computeLoopEdgeIds, evaluateEdgeCondition, evaluateGroupAvailability, findStartNodeId, getGroupLocalRoots, getPlayableNodes, INITIAL_PLAY_STATS, resolveActionConfig, resolveOutcomeConfig, resolvePlaybackSettings, type RuntimeEventRecord } from './boardPlayEngine';
 import { cardPreviewBehavior, cardPreviewTimeLimit, challengeMotion, challengeSpeed } from './cardPreviewMotion';
-import { cameraX, overlaps, type Placement, type Scene } from './stageProject';
+import { cameraX, exposedParameters, overlaps, resolveStageParameter, type Placement, type Scene, type StageParameterSource } from './stageProject';
 
 export interface StageVerdict {
   edgeId: string;
@@ -15,6 +16,8 @@ export interface StageVerdict {
   clauses: { id: string; passed: boolean; actual?: string | number | boolean }[];
   scoreBefore: number;
   scoreAfter: number;
+  parameters?: { id: string; name: string; value: number; source: StageParameterSource; assetName?: string }[];
+  propertyChanges?: { id: string; name: string; before: StateVariableValue; after: StateVariableValue }[];
 }
 
 export type StageEntity = Placement & { collected?: boolean; open?: boolean; hiddenSince?: number; motionOffset?: { x: number; y: number }; spin?: -1 | 0 | 1 };
@@ -71,7 +74,7 @@ export type StageInput = {
   released?: Set<string>;
   actionId?: string;
 };
-type Graph = { nodes: BoardNode[]; edges: BoardEdge[]; scenes: Scene[]; comboFrames?: BoardComboFrame[] };
+type Graph = { nodes: BoardNode[]; edges: BoardEdge[]; scenes: Scene[]; comboFrames?: BoardComboFrame[]; assets?: AssetItem[] };
 
 export function setStageEntityHidden(run: StageRun, item: StageEntity, hidden: boolean | undefined) {
   item.isHidden = hidden;
@@ -86,8 +89,9 @@ export function setStageEntityHidden(run: StageRun, item: StageEntity, hidden: b
   }
 }
 
-export function stageEditPose(placement: Placement, active?: StageEntity, trialOffset?: Pick<Partial<Placement>, 'x' | 'y'>): StageEntity {
+export function stageEditPose(placement: Placement, active?: StageEntity, trialOffset?: Pick<Partial<Placement>, 'x' | 'y'>, trialEditing = false): StageEntity {
   if (!active) return placement;
+  if (trialEditing) return active;
   return {
     ...placement,
     x: active.x - (trialOffset?.x ?? 0), y: active.y - (trialOffset?.y ?? 0),
@@ -142,7 +146,7 @@ export function restoreSceneCheckpoint(snapshot: StageRun, scenes: Scene[], node
   return restored;
 }
 
-export function syncRunScenes(run: StageRun, previous: Scene[], next: Scene[]) {
+export function syncRunScenes(run: StageRun, previous: Scene[], next: Scene[], trial?: ReadonlyMap<string, Partial<Placement>>) {
   const reconcile = (id: string, entities: Entity[]) => {
     const before = new Map(previous.find(scene => scene.id === id)?.placements.map(item => [item.id, item]));
     const active = new Map(entities.map(item => [item.id, item]));
@@ -156,8 +160,9 @@ export function syncRunScenes(run: StageRun, previous: Scene[], next: Scene[]) {
         return added;
       }
       const change: Entity = { ...entity };
+      const trialPatch = id === run.sceneId ? trial?.get(placement.id) : undefined;
       for (const key of Object.keys({ ...old, ...placement }) as (keyof Placement)[]) {
-        if (key === 'x' || key === 'y' || Object.is(old[key], placement[key])) continue;
+        if (key === 'x' || key === 'y' || trialPatch && Object.hasOwn(trialPatch, key) || Object.is(old[key], placement[key])) continue;
         Object.assign(change, { [key]: structuredClone(placement[key]) });
       }
       change.x += placement.x - old.x;
@@ -181,12 +186,13 @@ function setOverlay(run: StageRun, node: BoardNode) {
   run.overlayTime = run.time;
 }
 
-function symbols(graph: Pick<Graph, 'nodes'>, object?: Placement) {
+function symbols(graph: Pick<Graph, 'nodes' | 'assets'>, object?: Placement) {
   const source = graph.nodes.find(node => node.id === object?.nodeId);
+  const asset = graph.assets?.find(item => item.id === object?.assetId);
   const nodes = source ? [source, ...graph.nodes.filter(node => node !== source)] : graph.nodes;
   const parameters = nodes.flatMap(node => node.fields.relatedParameters?.map(parameter => ({
     key: parameter.name,
-    value: node.id === source?.id && parameter.exposeOnStage ? object?.parameters?.[parameter.id] ?? parameter.value : parameter.value,
+    value: object && node.id === source?.id && parameter.exposeOnStage ? resolveStageParameter(parameter, object, asset).value : parameter.value,
     source: 'parameter' as const,
   })) ?? []);
   if (object) parameters.unshift(
@@ -196,18 +202,29 @@ function symbols(graph: Pick<Graph, 'nodes'>, object?: Placement) {
   return parameters;
 }
 
-export function calculateStageReward(node: BoardNode, nodes: BoardNode[], variables: ScopedStateVariable[], object?: Placement) {
+export function calculateStageReward(node: BoardNode, nodes: BoardNode[], variables: ScopedStateVariable[], object?: Placement, assets?: AssetItem[]) {
   const formula = node.fields.stageScoreFormula?.trim();
-  const result = formula ? evaluateNumberFormula(formula, variables, symbols({ nodes }, object)) : undefined;
+  const result = formula ? evaluateNumberFormula(formula, variables, symbols({ nodes, assets }, object)) : undefined;
   return { formula, value: result?.ok ? result.value : resolveOutcomeConfig(node).scoreDelta, valid: !result || result.ok };
+}
+
+function stageEventContext(events: RuntimeEventRecord[], assets?: AssetItem[]) {
+  const ruleIds = (id?: string) => id ? assets?.find(asset => asset.id === id)?.stagePreset?.ruleAssetIds : undefined;
+  return {
+    eventRecords: events.map(event => ({
+      ...event, subjectRuleAssetIds: ruleIds(event.subjectAssetId), targetRuleAssetIds: ruleIds(event.targetAssetId),
+    })),
+    runtimeEvents: new Set(events.map(event => event.eventId)),
+  };
 }
 
 function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity | undefined, events: RuntimeEventRecord[], record = true) {
   const scene = graph.scenes.find(item => item.id === run.sceneId);
   const hero = scene?.placements.find(item => item.id === scene.entrySpawnId);
+  const asset = object && graph.assets?.find(item => item.id === object.assetId);
   const customFlags = Object.fromEntries(run.flags.map(flag => [flag, true]));
   const context = {
-    eventRecords: events, runtimeEvents: new Set(events.map(event => event.eventId)),
+    ...stageEventContext(events, graph.assets),
     simulatedEvents: customFlags, numericParameters: symbols(graph, object), heroAssetId: hero?.assetId, hazardAssetId: object?.assetId,
   };
   const stats = { score: run.score, hp: run.hp };
@@ -220,6 +237,10 @@ function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity |
       passed: evaluateEdgeCondition('', stats, customFlags, run.variables, { combinator: 'AND', clauses: [clause] }, context).passed,
     })) ?? [],
     scoreBefore: run.score, scoreAfter: run.score,
+    parameters: object && exposedParameters(graph.nodes, object).map(parameter => {
+      const { value, source, assetName } = resolveStageParameter(parameter, object, asset);
+      return { id: parameter.id, name: parameter.name, value, source, assetName };
+    }),
   };
   if (record) run.verdicts[(object?.id ?? '') + ':' + edge.id] = verdict;
   return verdict;
@@ -228,7 +249,7 @@ function evaluate(run: StageRun, edge: BoardEdge, graph: Graph, object: Entity |
 function canEnterGroup(run: StageRun, graph: Graph, group: BoardNode, events: RuntimeEventRecord[] = []) {
   const flags = Object.fromEntries(run.flags.map(flag => [flag, true]));
   return evaluateGroupAvailability(group, graph.nodes, { score: run.score, hp: run.hp }, flags, run.variables, {
-    eventRecords: events, runtimeEvents: new Set(events.map(event => event.eventId)),
+    ...stageEventContext(events, graph.assets),
     simulatedEvents: flags, numericParameters: symbols(graph),
   }).passed;
 }
@@ -303,7 +324,11 @@ function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Enti
         }
         if (!run.pendingOutcomes.some(item => item.nodeId === node.id && item.objectId === object?.id)) {
           const duration = Math.max(0.016, visual.duration);
-          run.visualOutcomes[visual.assetId] = { effect: visual.effect, start: run.time, duration, restore: visual.restore };
+          const effect = { effect: visual.effect, start: run.time, duration, restore: visual.restore };
+          run.visualOutcomes[visual.assetId] = effect;
+          for (const asset of graph.assets ?? []) {
+            if (asset.stagePreset?.ruleAssetIds.includes(visual.assetId)) run.visualOutcomes[asset.id] = effect;
+          }
           run.pendingOutcomes.push({ nodeId: node.id, sceneId: run.sceneId, objectId: object?.id, until: run.time + duration });
         }
         continue;
@@ -316,23 +341,30 @@ function follow(run: StageRun, nodeId: string | null, graph: Graph, object: Enti
         run.message = { key: 'outcome', at: run.time };
         continue;
       }
-      if (mode === 'property' && rule && (!run.variables.some(entry => entry.variable.id === rule.variableId)
+      if (mode === 'property' && rule && (!run.variables.some(entry => entry.variable.id === rule.variableId && !entry.variable.stageParameterId)
         || rule.op === 'formula' && !rule.formula?.trim())) {
         run.message = { key: 'formula', at: run.time };
         continue;
       }
       const params = symbols(graph, object);
-      const reward = calculateStageReward(node, graph.nodes, run.variables, object);
+      const reward = calculateStageReward(node, graph.nodes, run.variables, object, graph.assets);
       const scoreDelta = mode === 'property' && !reward.formula ? 0 : reward.value;
       const hpDelta = mode === 'property' ? 0 : outcome.hpDelta;
       run.score = Math.max(0, run.score + scoreDelta);
       run.hp = Math.max(0, run.hp + hpDelta);
       for (const rule of rules) {
         const entry = run.variables.find(variable => variable.variable.id === rule.variableId);
-        if (entry) entry.playValue = applyOutcomePropertyRule(rule, entry, run.variables, params);
+        if (!entry || entry.variable.stageParameterId) continue;
+        const before = entry.playValue;
+        entry.playValue = applyOutcomePropertyRule(rule, entry, run.variables, params);
+        if (entry.playValue !== before) {
+          (verdict.propertyChanges ??= []).push({
+            id: entry.variable.id, name: entry.fullKey, before, after: entry.playValue,
+          });
+        }
       }
       for (const entry of run.variables) {
-        if (entry.variable.type !== 'number' || rules.some(rule => rule.variableId === entry.variable.id)) continue;
+        if (entry.variable.type !== 'number' || entry.variable.stageParameterId || rules.some(rule => rule.variableId === entry.variable.id)) continue;
         const name = entry.variable.name;
         const delta = /血量|血|生命|体力|\bhp\b|health|life/i.test(name) ? hpDelta
           : /分数|得分|积分|星星|金币|\bscore\b|point|\bpts\b|star|coin/i.test(name) ? scoreDelta : 0;

@@ -81,6 +81,7 @@ import { ArrowConditionBuilder } from './ArrowConditionBuilder';
 import { GroupInfoModal } from './GroupInfoModal';
 import { GroupDirectoryPanel } from './GroupDirectoryPanel';
 import { CardExpandedPanel } from './cards/CardExpandedPanel';
+import { stageParameterSourceLabel, type StageBoardContext } from '../playtest/stageProject';
 import { CardPromptFront } from './cards/CardPromptFront';
 
 interface DesignBoardProps {
@@ -92,6 +93,8 @@ interface DesignBoardProps {
   scopedVariables: ScopedStateVariable[];
   stateManagerOpen: boolean;
   focusTarget: { nodeId?: string; edgeId?: string; nonce: number } | null;
+  stageContext?: StageBoardContext;
+  onDismissStageContext: () => void;
   selectedNodeId: string | null;
   autoFocusNodeId: string | null;
   activePlayNodeIds: string[];
@@ -462,6 +465,8 @@ export function DesignBoard({
   scopedVariables,
   stateManagerOpen,
   focusTarget,
+  stageContext,
+  onDismissStageContext,
   selectedNodeId,
   autoFocusNodeId,
   activePlayNodeIds,
@@ -726,6 +731,11 @@ export function DesignBoard({
     () => collectNumericBoardParameters(nodes),
     [nodes],
   );
+  const numericStageParameters = useMemo(() => stageContext
+    ? [
+      ...stageContext.parameters.map(parameter => ({ key: parameter.name, value: parameter.value, source: 'parameter' as const })),
+      ...numericBoardParameters,
+    ] : numericBoardParameters, [numericBoardParameters, stageContext]);
   const groupDefCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const n of nodes) {
@@ -2715,7 +2725,7 @@ export function DesignBoard({
                   node={node}
                   assetItems={assetItems}
                   scopedVariables={scopedVariables}
-                  numericParameters={numericBoardParameters}
+                  numericParameters={focusTarget?.nodeId === node.id ? numericStageParameters : numericBoardParameters}
                   onUpdateNode={onUpdateNode}
                   onUpdateNodeField={onUpdateNodeField}
                   onResetAutoFields={onResetNodeAutoFields}
@@ -2930,6 +2940,29 @@ export function DesignBoard({
             : 'cursor-grab'
       }`}
     >
+      {stageContext && (focusTarget?.edgeId || focusTarget?.nodeId === selectedNodeId) && (
+        <aside aria-label={lang === 'zh' ? '舞台实例参数' : 'Stage instance parameters'}
+          className="absolute bottom-20 left-4 z-30 w-64 max-w-[calc(100%-2rem)] cursor-default rounded-xl border border-slate-200 bg-white p-3 text-xs text-[#14244B] shadow-lg"
+          onPointerDown={event => event.stopPropagation()}>
+          <div className="mb-1 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[#64748B]">{stageContext.trial
+                ? lang === 'zh' ? '暂停检查 · 当前取值' : 'Pause inspection · Current values'
+                : lang === 'zh' ? '舞台选中的实例' : 'Selected stage instance'}</p>
+              <h3 className="truncate font-semibold" title={stageContext.name}>{stageContext.name}</h3>
+            </div>
+            <button type="button" aria-label={lang === 'zh' ? '关闭实例信息' : 'Close instance details'}
+              className="rounded px-1.5 text-lg leading-5 text-slate-500 hover:bg-slate-100" onClick={onDismissStageContext}>×</button>
+          </div>
+          {stageContext.parameters.length > 0 && <dl className="max-h-36 space-y-1.5 overflow-y-auto border-t border-slate-100 pt-1.5">
+            {stageContext.parameters.map(parameter => <div key={parameter.id} className="flex items-baseline justify-between gap-2">
+              <dt className="break-words">{parameter.name}</dt>
+              <dd className="text-right"><strong>{parameter.value}</strong>
+                <span className="ml-1 text-[#64748B]">{stageParameterSourceLabel(lang, parameter.source)}</span></dd>
+            </div>)}
+          </dl>}
+        </aside>
+      )}
       {/* Blank Canvas Centered Zero-State */}
       {nodes.length === 0 && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-6 pt-16">
@@ -3799,7 +3832,7 @@ export function DesignBoard({
               nodes={nodes}
               assetItems={assetItems}
               scopedVariables={scopedVariables}
-              numericParameters={numericBoardParameters}
+              numericParameters={focusTarget?.edgeId === editingEdgeId ? numericStageParameters : numericBoardParameters}
               siblingDonorEdges={siblingDonorEdges}
               anchorX={anchorX}
               anchorY={anchorY}

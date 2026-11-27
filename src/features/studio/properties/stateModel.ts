@@ -11,6 +11,7 @@ export interface StateVariable {
   name: string;
   type: StateVariableType;
   initialValue: StateVariableValue;
+  stageParameterId?: string;
   // Number-only optional range constraints (enabled only when checkbox is ticked)
   hasMin?: boolean;
   minValue?: number;
@@ -124,11 +125,11 @@ export function collectAllScopedVariables(
   }
 
   for (const asset of assetItems) {
-    if (!assetCategorySupportsProperties(asset.categoryId)) continue;
+    if (!assetCategorySupportsProperties(asset.categoryId) && !asset.stagePreset) continue;
     const props = asset.properties ?? [];
     for (const variable of props) {
       const rawPlay =
-        variable.id in playValues ? playValues[variable.id] : variable.initialValue;
+        !variable.stageParameterId && variable.id in playValues ? playValues[variable.id] : variable.initialValue;
       const playValue = coerceVariableValue(variable, rawPlay);
       result.push({
         variable,
