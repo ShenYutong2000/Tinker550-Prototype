@@ -10,7 +10,7 @@ import { coerceVariableValue, type ScopedStateVariable, type StateVariableValue 
 import { detectUsedStats, extractCustomFlagConditions, getPlayableNodes, resolvePlaybackSettings, resolveSubtitlePosition } from './boardPlayEngine';
 import { drawChallengeEntity, drawStageBackdrop } from './cardPreviewDrawing';
 import { cardPreviewBehavior, cardPreviewTimeLimit, challengeMotion, challengeSpeed } from './cardPreviewMotion';
-import { activateStageEvent, advanceOverlay, beginSceneRules, calculateStageReward, clickStageObject, focusStageChapter, isActive, restoreSceneCheckpoint, sceneCamera, setStageEntityHidden, stageEditPose, startScene, stepScene, syncRunScenes, syncStageRules, type StageEntity, type StageRun } from './sceneRuntime';
+import { activateStageEvent, advanceOverlay, beginSceneRules, calculateStageReward, clickStageObject, focusStageChapter, isActive, removeStageTrialOffset, restoreSceneCheckpoint, revertStageObjectTrial, sceneCamera, setStageEntityHidden, stageEditPose, startScene, stepScene, syncRunScenes, syncStageRules, type StageEntity, type StageRun } from './sceneRuntime';
 import { anchoredPosition, colliderBox, COLLIDER_SIDES, copyPlacements, createLibraryPlacement, createScene, exposedParameters, makeId, patchScenePlacement, placementBox, projectBoardScenes, RESIZE_CORNERS, resizeCollider, resizePlacement, resolveStageParameter, rotatePlacement, rotateStagePoint, stageParameterSourceLabel, VIEW_HEIGHT, VIEW_WIDTH, type ColliderSide, type Placement, type Point, type ResizeCorner, type Scene, type StageBoardSelection, type StageBoardTarget, type StageKind } from './stageProject';
 import type { StageSceneUpdate } from './stageHistory';
 import { BackgroundItemInspector, StageBackgroundSettings, type BackgroundChange, type BackgroundTool } from './StageBackgroundSettings';
@@ -333,17 +333,28 @@ export function StageEditor(props: StageEditorProps) {
     });
     redraw(value => value + 1);
   };
+  const revertSelectedTrial = () => {
+    const active = run.current;
+    if (!active || !selected || !trialSelection || !editingRunScene) return;
+    const change = trial.current.get(selected.id);
+    if (!change) return;
+    revertStageObjectTrial(active, trialSelection, selected, change);
+    trial.current.delete(selected.id);
+    if (Object.hasOwn(change, 'parameters')) {
+      props.onUpdateBoardTrial({ sceneId: active.sceneId, placementId: selected.id });
+    }
+    if (!screenObject(selected.kind) && (trialSelection.x < pan || trialSelection.x > pan + VIEW_WIDTH / zoom)) {
+      setPan(Math.min(maxPan(scene, zoom), Math.max(0, trialSelection.x - VIEW_WIDTH / (2 * zoom))));
+    }
+    viewport.current?.focus({ preventScroll: true });
+    redraw(value => value + 1);
+  };
   const commitTrial = () => {
     const changes = new Map(trial.current);
     const activeScene = playScene.id;
     for (const entity of run.current?.entities ?? []) {
       const change = changes.get(entity.id);
-      if (!change) continue;
-      for (const axis of ['x', 'y'] as const) {
-        const delta = change[axis] ?? 0;
-        if (entity.motionOffset) entity.motionOffset[axis] -= delta;
-        entity[axis] -= delta;
-      }
+      if (change) removeStageTrialOffset(entity, change);
     }
     setScenes(activeScene, current => current.map(item => item.id === activeScene
       ? [...changes].reduce((updated, [id, patch]) => {
@@ -1172,6 +1183,9 @@ export function StageEditor(props: StageEditorProps) {
               }
             }} />{l('Edit this run only', '仅本局试调')}
           </label>
+          {trialSelection && trial.current.has(trialSelection.id) && <button type="button" onClick={revertSelectedTrial}>
+            {l('Discard this object’s trial edits', '撤销这个对象的试调')}
+          </button>}
           {editingRunScene && trial.current.size > 0 && <button type="button" onClick={commitTrial}>{l('Apply trial edits to project', '应用本局修改到项目')}</button>}
         </div>}
         {trialEditing && !editingRunScene && <small>{l('Return to the paused scene to continue trial edits.', '切回已暂停的场景即可继续试调。')}</small>}

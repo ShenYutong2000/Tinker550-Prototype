@@ -5,7 +5,7 @@ import { getSimulatedEventKey } from '../design-board/arrowConditionModel';
 import { applyOutcomePropertyRule, clampNumberValue, evaluateNumberFormula, type ScopedStateVariable, type StateVariableValue } from '../properties/stateModel';
 import { computeLoopEdgeIds, evaluateEdgeCondition, evaluateGroupAvailability, findStartNodeId, getGroupLocalRoots, getPlayableNodes, INITIAL_PLAY_STATS, resolveActionConfig, resolveOutcomeConfig, resolvePlaybackSettings, type RuntimeEventRecord } from './boardPlayEngine';
 import { cardPreviewBehavior, cardPreviewTimeLimit, challengeMotion, challengeSpeed } from './cardPreviewMotion';
-import { cameraX, exposedParameters, overlaps, resolveStageParameter, type Placement, type Scene, type StageParameterSource } from './stageProject';
+import { cameraX, exposedParameters, overlaps, resolveStageParameter, type Placement, type Point, type Scene, type StageParameterSource } from './stageProject';
 
 export interface StageVerdict {
   edgeId: string;
@@ -97,6 +97,25 @@ export function stageEditPose(placement: Placement, active?: StageEntity, trialO
     x: active.x - (trialOffset?.x ?? 0), y: active.y - (trialOffset?.y ?? 0),
     spin: active.spin, collected: active.collected, open: active.open,
   };
+}
+
+export function removeStageTrialOffset(entity: StageEntity, trial: Partial<Point>) {
+  for (const axis of ['x', 'y'] as const) {
+    const delta = trial[axis] ?? 0;
+    entity[axis] -= delta;
+    if (entity.motionOffset) entity.motionOffset[axis] -= delta;
+  }
+}
+
+export function revertStageObjectTrial(run: StageRun, entity: StageEntity, placement: Placement, trial: Partial<Placement>) {
+  removeStageTrialOffset(entity, trial);
+  for (const key of Object.keys(trial) as (keyof Placement)[]) {
+    if (key === 'x' || key === 'y' || key === 'isHidden') continue;
+    Object.assign(entity, { [key]: structuredClone(placement[key]) });
+  }
+  if (Object.hasOwn(trial, 'isHidden') && entity.isHidden !== placement.isHidden) {
+    setStageEntityHidden(run, entity, placement.isHidden);
+  }
 }
 
 export function startScene(scene: Scene, variables: ScopedStateVariable[], previous?: StageRun): StageRun {

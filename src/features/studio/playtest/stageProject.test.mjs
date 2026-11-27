@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyStageAssetVariant, cameraX, colliderBox, createLibraryPlacement, createPlacement, createScene, createStageAssetVariant, copyPlacements, overlaps, patchScenePlacement, placementBox, projectBoardScenes, resizeCollider, resizePlacement, resolveStageParameter, retainChallengeAnchors, rotatePlacement, rotateStagePoint } from './stageProject.ts';
-import { activateStageEvent, advanceOverlay, beginSceneRules, clickStageObject, getStageActionControls, isActive, setStageEntityHidden, startScene, stageEditPose, stepScene, restoreSceneCheckpoint, syncRunScenes } from './sceneRuntime.ts';
+import { activateStageEvent, advanceOverlay, beginSceneRules, clickStageObject, getStageActionControls, isActive, revertStageObjectTrial, setStageEntityHidden, startScene, stageEditPose, stepScene, restoreSceneCheckpoint, syncRunScenes } from './sceneRuntime.ts';
 import { getOutcomeVisualEffects } from '../asset-library/effects/visualEffectsModel.ts';
 import { emptyProject, parseProject } from '../projectStore.ts';
 import { cloneGroupSubtree, propagateGroupDefinitionFrom } from '../design-board/studioModel.ts';
@@ -328,6 +328,38 @@ test('paused editing shows trial geometry while project updates preserve tempora
   assert.deepEqual([projectPose.x, projectPose.width, projectPose.height, projectPose.parameters.reward], [185, 36, 42, 2]);
   assert.deepEqual([trialPose.x, trialPose.width, trialPose.height, trialPose.parameters.reward], [205, 58, 42, 3]);
   assert.equal(trialPose.collected, true);
+});
+
+test('discarding trial edits restores one placement without rewinding the run or another object', () => {
+  const scene = createScene('Meadow', 'Spawn');
+  const coin = { ...createPlacement('challenge', 'Coin', 175, 180), collider: { width: 24, height: 22 }, parameters: { reward: 1 } };
+  const otherCoin = createPlacement('challenge', 'Coin', 220, 180);
+  scene.placements.push(coin, otherCoin);
+  const run = startScene(scene, []);
+  const first = run.entities.find(item => item.id === coin.id);
+  const second = run.entities.find(item => item.id === otherCoin.id);
+  run.time = 2;
+  run.score = 7;
+  first.collected = true;
+  first.spin = 1;
+  first.x = 216;
+  first.y = 196;
+  first.motionOffset = { x: 20, y: 13 };
+  first.width = 58;
+  first.collider = undefined;
+  first.parameters = { reward: 3 };
+  second.width = 64;
+  setStageEntityHidden(run, first, true);
+
+  revertStageObjectTrial(run, first, coin, { x: 20, y: 13, width: 58, collider: undefined, parameters: { reward: 3 }, isHidden: true });
+  assert.deepEqual([first.x, first.y, first.width, first.collider, first.parameters, first.isHidden],
+    [196, 183, coin.width, coin.collider, coin.parameters, undefined]);
+  assert.deepEqual(first.motionOffset, { x: 0, y: 0 });
+  assert.equal(first.hiddenSince, undefined);
+  assert.equal(first.collected, true);
+  assert.equal(first.spin, 1);
+  assert.equal(second.width, 64);
+  assert.deepEqual([run.time, run.score], [2, 7]);
 });
 
 test('placing a library asset leaves gameplay to the cards in edit and play', () => {
